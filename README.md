@@ -12,7 +12,7 @@ Moved here from `workers/reader/` in `librarykaiju/w3bz1n3`.
 - `migrations/` — upgrades for an existing database. Run each new one once, before deploying the code that needs it.
 - `extension/` — a tiny browser extension that opens the reader in every new tab.
 - `docs/setup.md` — full setup, updating and usage guide.
-- `docs/fix-later.md` — tracked bugs and feature requests.
+- Fix-later list (bugs and feature requests): `content/_docs/Reader Fix Later.md` in librarykaiju/w3bz1n3, so it syncs to Obsidian.
 - `docs/build-your-own.md` — notes for anyone building their own version.
 
 ## Deploy
