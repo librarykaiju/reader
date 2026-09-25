@@ -1,0 +1,29 @@
+name = "reader"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+# A private feed and ebook reader at https://reader.brandonj.ink (add that as
+# a Custom Domain on the Worker). Everything under /api/ needs READER_TOKEN.
+
+# The live "reader" database. A fresh one (`npx wrangler d1 create reader`,
+# then put its id here) gets its tables from schema.sql:
+#   npx wrangler d1 execute reader --remote --file schema.sql
+# Upgrades to an existing one are in migrations/, run before deploying.
+[[d1_databases]]
+binding = "DB"
+database_name = "reader"
+database_id = "0001e946-d815-406b-8d8e-b8863b8dc2db"
+
+# Create with `npx wrangler r2 bucket create reader-books`. Private: books are
+# only ever served through the Worker, never from a public bucket URL.
+[[r2_buckets]]
+binding = "BOOKS"
+bucket_name = "reader-books"
+
+# Secret (not stored here) -- set with `npx wrangler secret put READER_TOKEN`:
+#   READER_TOKEN  -- any long random string; the page asks for it once per
+#                    device and sends it as a Bearer token
+#
+# Dev only (put it in .dev.vars, never in production):
+#   ALLOW_PRIVATE_FETCH = "1"  -- lets /api/fetch reach localhost/private IPs
+#                                 so local test fixtures can be read
