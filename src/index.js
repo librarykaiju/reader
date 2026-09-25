@@ -3111,7 +3111,7 @@ function tagBar(view) {
 	// Channel tags show only in Edit, so they can still be renamed or deleted.
 	var list = state.tags.filter(function (t) { return state.editFeeds || !isChannelTag(t.id) || sameId(state.tag, t.id); })
 		.map(function (t) { return { id: t.id, name: t.name, cls: tagColor(t.id) }; });
-	if (state.feeds.some(function (f) { return !f.tags.length; })) list.push({ id: 0, name: "Untagged", cls: "untagged" });
+	if (newsFeeds().some(function (f) { return !f.tags.length; })) list.push({ id: 0, name: "Untagged", cls: "untagged" });
 	li.classList.toggle("filtering", state.tag != null);
 	box.setAttribute("aria-label", "Tags");
 	list.forEach(function (x) {
@@ -3179,6 +3179,12 @@ function listQuery(feed, tag) {
 	return q.length ? "?" + q.join("&") : "";
 }
 function listHash(view, feed, tag) { return "#/" + view + listQuery(feed, tag); }
+// The feeds the news tabs list. Podcast and video channels live under
+// Podcasts and Videos, so they show here only in Edit (to rename, retag or
+// remove them) or while one is open.
+function newsFeeds() {
+	return state.feeds.filter(function (f) { return state.editFeeds || !isMediaFeed(f) || sameId(state.feed, f.id); });
+}
 // All feeds, or the ones with the tag being viewed; one flat list, A-Z.
 function renderFeeds() {
 	var ul = $("feeds"), view = LIST_VIEWS[state.view] ? state.view : "unread";
@@ -3193,10 +3199,10 @@ function renderFeeds() {
 	ul.append(all);
 	if (state.tags.length) ul.append(tagBar(view));
 
-	var shown = state.tag == null ? state.feeds : state.feeds.filter(function (f) { return hasTag(f, state.tag); });
+	var feeds = newsFeeds(), shown = state.tag == null ? feeds : feeds.filter(function (f) { return hasTag(f, state.tag); });
 	shown.forEach(function (f) { ul.append(feedRow(f, view)); });
 	if (state.tag != null && !shown.length) ul.append(h("li", "hint", state.tag ? "No feeds have this tag." : "Every feed has a tag."));
-	$("feedCount").textContent = state.feeds.length ? "(" + state.feeds.length + ")" : "";
+	$("feedCount").textContent = feeds.length ? "(" + feeds.length + ")" : "";
 	show($("newTag"), state.editFeeds);
 	$("editFeeds").textContent = state.editFeeds ? "Done" : "Edit";
 	if (!state.feeds.length) $("feedsBox").open = true;
