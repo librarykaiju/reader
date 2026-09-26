@@ -48,6 +48,10 @@
 //                                  (reread: fill the details again from a .txt's YAML header)
 //                                  (position null = start over)
 //   DELETE /api/books/:id          also deletes the file from R2
+//   GET    /api/books/:id/highlights -> {"highlights": [...]} in the order they come in the book
+//   POST   /api/books/:id/highlights {start_pos, end_pos, text, note?} -> {"highlight"}
+//   PATCH  /api/highlights/:id     {note?, start_pos?, end_pos?} (note null or "" = no note)
+//   DELETE /api/highlights/:id
 //
 // Email (Cloudflare Email Routing -> "Send to a Worker" -> this Worker):
 //   each message sent to the routed address (news@brandonj.ink, say) becomes
@@ -189,6 +193,15 @@ async function api(request, env, url) {
 	if ((id = matchId(p, "/api/books/"))) {
 		if (m === "PATCH") return updateBook(request, env, id);
 		if (m === "DELETE") return deleteBook(env, id);
+	}
+	const hl = p.match(/^\/api\/books\/(\d+)\/highlights$/);
+	if (hl) {
+		if (m === "GET") return listHighlights(env, toId(hl[1]));
+		if (m === "POST") return addHighlight(request, env, toId(hl[1]));
+	}
+	if ((id = matchId(p, "/api/highlights/"))) {
+		if (m === "PATCH") return updateHighlight(request, env, id);
+		if (m === "DELETE") return deleteHighlight(env, id);
 	}
 	return null;
 }
@@ -1480,6 +1493,79 @@ async function deleteBook(env, id) {
 	return json({ ok: true });
 }
 
+// Highlights in .txt books (migration 0007). Positions count characters in
+// the text after any YAML header, as the page splits it; the page does the
+// matching, the server only keeps them.
+const HIGHLIGHT_COLUMNS = "id, book_id, start_pos, end_pos, text, note, created_at, updated_at";
+const MAX_HIGHLIGHT_CHARS = 20000;
+const MAX_NOTE_CHARS = 10000;
+
+function highlightSpan(body) {
+	const a = body.start_pos, b = body.end_pos;
+	if (!Number.isSafeInteger(a) || !Number.isSafeInteger(b) || a < 0 || b <= a) throw new HttpError(400, "start_pos and end_pos must be positions, start before end");
+	return [a, b];
+}
+function noteOf(v) {
+	if (v === null || v === undefined) return null;
+	if (typeof v !== "string") throw new HttpError(400, "note must be text");
+	if (v.length > MAX_NOTE_CHARS) throw new HttpError(413, "That note is too long");
+	return v.trim() || null;
+}
+
+async function listHighlights(env, bookId) {
+	const { results } = await env.DB.prepare(
+		`SELECT ${HIGHLIGHT_COLUMNS} FROM highlights WHERE book_id = ? ORDER BY start_pos, id`,
+	)
+		.bind(bookId)
+		.all();
+	return json({ highlights: results });
+}
+
+async function addHighlight(request, env, bookId) {
+	const body = await readJSON(request);
+	const [a, b] = highlightSpan(body);
+	if (typeof body.text !== "string" || !body.text.trim()) throw new HttpError(400, "text is needed");
+	if (body.text.length > MAX_HIGHLIGHT_CHARS) throw new HttpError(413, "That highlight is too long");
+	const book = await getBook(env, bookId);
+	if (/\.(pdf|cbz)$/i.test(book.filename)) throw new HttpError(400, "Highlights are for .txt books");
+	const now = Date.now();
+	const highlight = await env.DB.prepare(
+		`INSERT INTO highlights (book_id, start_pos, end_pos, text, note, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING ${HIGHLIGHT_COLUMNS}`,
+	)
+		.bind(bookId, a, b, body.text, noteOf(body.note), now, now)
+		.first();
+	return json({ highlight });
+}
+
+async function updateHighlight(request, env, id) {
+	const body = await readJSON(request);
+	const sets = [];
+	const params = [];
+	if (body.note !== undefined) {
+		sets.push("note = ?");
+		params.push(noteOf(body.note));
+	}
+	if (body.start_pos !== undefined || body.end_pos !== undefined) {
+		sets.push("start_pos = ?", "end_pos = ?");
+		params.push(...highlightSpan(body));
+	}
+	if (!sets.length) throw new HttpError(400, "Nothing to change");
+	const highlight = await env.DB.prepare(
+		`UPDATE highlights SET ${sets.join(", ")}, updated_at = ? WHERE id = ? RETURNING ${HIGHLIGHT_COLUMNS}`,
+	)
+		.bind(...params, Date.now(), id)
+		.first();
+	if (!highlight) throw new HttpError(404, "No such highlight");
+	return json({ highlight });
+}
+
+async function deleteHighlight(env, id) {
+	const del = await env.DB.prepare("DELETE FROM highlights WHERE id = ?").bind(id).run();
+	if (!del.meta.changes) throw new HttpError(404, "No such highlight");
+	return json({ ok: true });
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 
@@ -1634,7 +1720,7 @@ const PAGE = String.raw`<!doctype html>
 <style nonce="__NONCE__">
 	:root {
 		--bg: #fbfaf7; --fg: #1d1c1a; --muted: #6d6a64; --line: #e4e1da; --card: #ffffff; --sel: #ecefe9;
-		--accent: #2f5fd0; --on-accent: #fff; --dot: #2f5fd0; --bad: #b3261e; --pdf-page: #ffffff;
+		--accent: #2f5fd0; --on-accent: #fff; --dot: #2f5fd0; --bad: #b3261e; --pdf-page: #ffffff; --hl: #fbe38a; --hl-edge: #e0b400;
 		--ok: #17663a; --ok-bg: #dcf0e2;
 		--serif: ui-serif, "New York", "Iowan Old Style", Charter, Georgia, serif;
 		--sans: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", sans-serif;
@@ -1644,20 +1730,20 @@ const PAGE = String.raw`<!doctype html>
 	@media (prefers-color-scheme: dark) {
 		:root:not([data-theme]) {
 			--bg: #141414; --fg: #e7e4de; --muted: #9b978f; --line: #2d2c2a; --card: #1c1c1b; --sel: #2a2a28;
-			--accent: #8fb0ff; --on-accent: #10131a; --dot: #8fb0ff; --bad: #ff8a80; --pdf-page: #1f1f1f;
+			--accent: #8fb0ff; --on-accent: #10131a; --dot: #8fb0ff; --bad: #ff8a80; --pdf-page: #1f1f1f; --hl: #5c4a12; --hl-edge: #b8930f;
 			--ok: #8fdcaa; --ok-bg: #1d3526;
 			color-scheme: dark;
 		}
 	}
 	:root[data-theme=dark] {
 		--bg: #141414; --fg: #e7e4de; --muted: #9b978f; --line: #2d2c2a; --card: #1c1c1b; --sel: #2a2a28;
-		--accent: #8fb0ff; --on-accent: #10131a; --dot: #8fb0ff; --bad: #ff8a80; --pdf-page: #1f1f1f;
+		--accent: #8fb0ff; --on-accent: #10131a; --dot: #8fb0ff; --bad: #ff8a80; --pdf-page: #1f1f1f; --hl: #5c4a12; --hl-edge: #b8930f;
 		--ok: #8fdcaa; --ok-bg: #1d3526;
 		color-scheme: dark;
 	}
 	:root[data-theme=sepia] {
 		--bg: #f4ecd8; --fg: #3b3024; --muted: #7b6c58; --line: #e2d6bb; --card: #f9f2e2; --sel: #eadfc4;
-		--accent: #8a4b14; --on-accent: #fff; --dot: #a0551a; --bad: #a3261e; --pdf-page: #f4ecd8;
+		--accent: #8a4b14; --on-accent: #fff; --dot: #a0551a; --bad: #a3261e; --pdf-page: #f4ecd8; --hl: #f0d27a; --hl-edge: #c49a1c;
 		--ok: #3f5a12; --ok-bg: #dfe3bd;
 		color-scheme: light;
 	}
@@ -1711,6 +1797,22 @@ const PAGE = String.raw`<!doctype html>
 	.seg button + button { border-left: 1px solid var(--line); }
 	.seg button[aria-pressed=true] { background: var(--sel); font-weight: 600; }
 	.menu { display: grid; gap: 8px; }
+	.txt mark.hl { background: var(--hl); color: inherit; border-radius: 2px; cursor: pointer; }
+	.txt mark.hl.noted { text-decoration: underline dotted; text-decoration-thickness: 2px; text-underline-offset: 3px; }
+	.hlbar { position: fixed; z-index: 16; left: 50%; transform: translateX(-50%); bottom: calc(16px + env(safe-area-inset-bottom)); display: flex; gap: 8px;
+		background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 8px; box-shadow: 0 6px 20px rgba(0,0,0,.18); font-family: var(--sans); }
+	body.has-pbar .hlbar { bottom: calc(106px + env(safe-area-inset-bottom)); }
+	.hlpop { font-family: var(--sans); width: min(400px, calc(100vw - 32px)); max-height: calc(100vh - 90px - env(safe-area-inset-top)); overflow: auto; }
+	.hlquote { margin: 0 0 10px; padding: 2px 0 2px 10px; border-left: 3px solid var(--hl-edge); font: 15px/1.45 var(--serif); white-space: pre-line; overflow-wrap: anywhere; }
+	.hlpop textarea { width: 100%; box-sizing: border-box; font: 15px/1.4 var(--sans); padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); resize: vertical; }
+	.hlrow { display: flex; gap: 8px; margin-top: 10px; }
+	.hlrow span { flex: 1; }
+	.hlitems { list-style: none; margin: 0; padding: 0; }
+	.hlitems li + li { border-top: 1px solid var(--line); }
+	.hlgo { display: grid; gap: 4px; width: 100%; text-align: left; background: none; border: 0; padding: 10px 0; color: inherit; cursor: pointer; font: inherit; }
+	.hlq { font: 15px/1.4 var(--serif); display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; line-clamp: 4; overflow: hidden; border-left: 3px solid var(--hl-edge); padding-left: 8px; }
+	.hln { font-size: 14px; }
+	.hlm { font-size: 13px; color: var(--bad); }
 	.seg .val { flex: 0 0 56px; display: grid; place-items: center; font-variant-numeric: tabular-nums; border-left: 1px solid var(--line); border-right: 1px solid var(--line); font-size: 14px; }
 
 	.wrap { max-width: 1100px; margin: 0 auto; padding: 0 16px 64px; }
@@ -1876,6 +1978,9 @@ const PAGE = String.raw`<!doctype html>
 	.cbzpage { width: 100%; min-height: 40vh; display: flex; align-items: center; justify-content: center; cursor: pointer; touch-action: pan-y pinch-zoom; }
 	.cbzpage img { display: block; width: 100%; height: var(--cbz-h, 80vh); object-fit: contain; }
 	.cbz.fitw .cbzpage img { height: auto; max-width: 1100px; }
+	.cbz.guided .cbzpage { position: relative; height: var(--cbz-h, 80vh); overflow: hidden; touch-action: pan-y; }
+	.cbz.guided .cbzpage img { position: absolute; left: 0; top: 0; max-width: none; object-fit: fill; transform-origin: 0 0; transition: transform .3s ease; }
+	@media (prefers-reduced-motion: reduce) { .cbz.guided .cbzpage img { transition: none; } }
 	.cbzbar { display: flex; align-items: center; gap: 10px; width: 100%; max-width: 640px; padding: 10px 16px 0; font-family: var(--sans); }
 	.cbzbar input { flex: 1; min-width: 0; }
 	.loading { color: var(--muted); text-align: center; padding: 40px 16px; font-family: var(--sans); }
@@ -1970,6 +2075,8 @@ const PAGE = String.raw`<!doctype html>
 <div id="bookMenu" class="pop" hidden>
 	<h2>This book</h2>
 	<div class="menu">
+		<button id="bmHighlights" class="btn" type="button" hidden>Highlights</button>
+		<button id="bmGuided" class="btn" type="button" hidden aria-pressed="false">Guided view</button>
 		<button id="bmFinish" class="btn" type="button">Mark finished</button>
 		<button id="bmRestart" class="btn" type="button">Start over</button>
 		<button id="bmDownload" class="btn" type="button">Download for offline</button>
@@ -2091,6 +2198,32 @@ const PAGE = String.raw`<!doctype html>
 		<button id="pClose" class="btn ghost" type="button" aria-label="Close player">&times;</button>
 	</div>
 	<audio id="pAudio" preload="metadata"></audio>
+</div>
+<div id="hlBar" class="hlbar" hidden>
+	<button id="hlAdd" class="btn primary" type="button">Highlight</button>
+	<button id="hlNote" class="btn" type="button">Add note</button>
+</div>
+<div id="hlPop" class="pop hlpop" role="dialog" aria-label="Highlight" hidden>
+	<h2>Highlight</h2>
+	<blockquote id="hlQuote" class="hlquote"></blockquote>
+	<label class="vh" for="hlNoteText">Note</label>
+	<textarea id="hlNoteText" rows="4" placeholder="Add a note"></textarea>
+	<div class="hlrow">
+		<button id="hlDelete" class="btn danger" type="button">Delete</button>
+		<span></span>
+		<button id="hlClose" class="btn ghost" type="button">Cancel</button>
+		<button id="hlSave" class="btn primary" type="button">Save</button>
+	</div>
+</div>
+<div id="hlList" class="pop hlpop" role="dialog" aria-label="Highlights" hidden>
+	<h2>Highlights</h2>
+	<ul id="hlItems" class="hlitems"></ul>
+	<p id="hlEmpty" class="hint" hidden></p>
+	<div class="hlrow">
+		<button id="hlExport" class="btn" type="button">Export Markdown</button>
+		<span></span>
+		<button id="hlListClose" class="btn ghost" type="button">Close</button>
+	</div>
 </div>
 <div id="toast" class="toast" role="status" hidden></div>
 </div>
@@ -5056,6 +5189,12 @@ function reachedEnd(sess) {
 function renderBookMenu() {
 	var b = session && session.book;
 	if (!b) return;
+	var n = session.hl ? session.hl.list.length : 0;
+	show($("bmHighlights"), b.type === "txt");
+	$("bmHighlights").textContent = n ? "Highlights (" + n + ")" : "Highlights";
+	show($("bmGuided"), b.type === "cbz");
+	$("bmGuided").textContent = "Guided view: " + (guidedOn() ? "on" : "off");
+	$("bmGuided").setAttribute("aria-pressed", String(guidedOn()));
 	$("bmFinish").textContent = b.finished_at ? "Mark unfinished" : "Mark finished";
 	var p = bookDl[b.id];
 	$("bmDownload").textContent = p ? "Downloading… " + dlLabel(p) : bookDownloads[b.id] ? "Remove download" : "Download for offline";
@@ -5178,6 +5317,7 @@ async function openTxt(sess, pos) {
 		checkEnd(sess, chunks[chunks.length - 1].lastElementChild);
 	};
 	sess.track = track;
+	hlStart(sess);
 	restoreTxt(sess, pos.f || 0);
 	listen(sess, window, "scroll", onScrollFrame(track), { passive: true });
 	listen(sess, window, "resize", onScrollFrame(function () { estimateChunks(t); }));
@@ -5225,6 +5365,325 @@ function restoreTxt(sess, f) {
 		return window.scrollY + r.top + within * r.height - headerBottom();
 	}, sess.track);
 }
+
+// ---------- highlights and notes (.txt books)
+// Select some text and a bar at the bottom offers Highlight or Add note; tap
+// a highlight to see, change or delete its note. Each one is kept by its
+// character positions in the text (after any YAML header) plus the words
+// themselves, so if a re-uploaded file moved them the words are looked for
+// again. The book's highlights are kept on this device too, so they show
+// offline; ones made or changed offline wait in hlPending and go up when the
+// book is next opened with a connection.
+
+var hlPending = readJSON("readerHlPending") || [];
+function hlKey(id) { return "readerHl:" + id; }
+function saveHlPending() { store("readerHlPending", hlPending.length ? JSON.stringify(hlPending) : null); }
+function cacheHl(sess) { store(hlKey(sess.id), JSON.stringify(sess.hl.list)); }
+function hlSorted(list) { return list.slice().sort(function (a, b) { return a.start_pos - b.start_pos || a.id - b.id; }); }
+function fullText(t) { return t.full || (t.full = t.paras.join("\n")); }
+function paraAt(t, pos) {
+	var lo = 0, hi = t.paras.length - 1;
+	while (lo < hi) { var mid = (lo + hi + 1) >> 1; if (t.starts[mid] <= pos) lo = mid; else hi = mid - 1; }
+	return lo;
+}
+function paraEl(t, i) { return t.chunks[Math.floor(i / CHUNK)].children[i % CHUNK]; }
+
+async function hlStart(sess) {
+	sess.hl = { list: readJSON(hlKey(sess.id)) || [], marked: [] };
+	hlRender(sess);
+	hlWire(sess);
+	if (state.libOffline) return;
+	try {
+		await flushHl();
+		var data = await apiJSON("/api/books/" + sess.id + "/highlights");
+		if (!sess.alive) return;
+		// Ones still waiting to go up (offline edits that failed) stay as they are here.
+		var waiting = hlPending.filter(function (op) { return op.book === sess.id; }).map(function (op) { return op.id; });
+		var mine = sess.hl.list.filter(function (x) { return waiting.indexOf(x.id) >= 0; });
+		sess.hl.list = data.highlights.filter(function (x) { return waiting.indexOf(x.id) < 0; }).concat(mine);
+		cacheHl(sess);
+		hlRender(sess);
+	} catch (e) { if (e.message === UNAUTH) return; }
+}
+// Where each highlight is now: its saved spot if the words are still there,
+// else the nearest place the words turn up (saved for next time), else
+// nowhere (listed, but not shown in the text).
+function hlLocate(sess, x) {
+	var t = sess.txt, full = fullText(t);
+	x.missing = false;
+	if (full.slice(x.start_pos, x.end_pos) === x.text) return true;
+	var before = full.lastIndexOf(x.text, x.start_pos), after = full.indexOf(x.text, x.start_pos);
+	var at = before < 0 ? after : after < 0 ? before : x.start_pos - before <= after - x.start_pos ? before : after;
+	if (at < 0) { x.missing = true; return false; }
+	x.start_pos = at;
+	x.end_pos = at + x.text.length;
+	if (x.id > 0) api("/api/highlights/" + x.id, { method: "PATCH", json: { start_pos: x.start_pos, end_pos: x.end_pos } }).catch(function () {});
+	cacheHl(sess);
+	return true;
+}
+// Rebuild the paragraphs that carry highlights (and the ones that did).
+function hlRender(sess) {
+	var t = sess.txt, hl = sess.hl;
+	if (!t || !hl) return;
+	var byPara = {};
+	hlSorted(hl.list).forEach(function (x) {
+		if (!hlLocate(sess, x)) return;
+		for (var i = paraAt(t, x.start_pos); i < t.paras.length && t.starts[i] < x.end_pos; i++) (byPara[i] = byPara[i] || []).push(x);
+	});
+	var redo = hl.marked.concat(Object.keys(byPara).map(Number));
+	hl.marked = Object.keys(byPara).map(Number);
+	redo.forEach(function (i) { hlPara(t, i, byPara[i] || []); });
+}
+function hlPara(t, i, marks) {
+	var p = paraEl(t, i), text = t.paras[i], base = t.starts[i];
+	if (!p) return;
+	p.textContent = "";
+	if (!marks.length) { p.textContent = text; return; }
+	var cuts = [0, text.length];
+	marks.forEach(function (x) { cuts.push(clamp(x.start_pos - base, 0, text.length), clamp(x.end_pos - base, 0, text.length)); });
+	cuts = cuts.filter(function (c, k) { return cuts.indexOf(c) === k; }).sort(function (a, b) { return a - b; });
+	for (var k = 0; k < cuts.length - 1; k++) {
+		var a = cuts[k], b = cuts[k + 1], piece = text.slice(a, b), on = null;
+		marks.forEach(function (x) { if (x.start_pos - base <= a && x.end_pos - base >= b) on = x; });
+		if (!on) { p.append(piece); continue; }
+		var m = h("mark", "hl" + (on.note ? " noted" : ""), piece);
+		m.dataset.h = on.id;
+		p.append(m);
+	}
+}
+
+// A point in the selection as a position in the text.
+function hlPoint(t, node, offset) {
+	var el = node.nodeType === 1 ? node : node.parentNode;
+	if (el.classList && el.classList.contains("chunk")) {
+		var kids = el.children;
+		if (offset < kids.length) { node = kids[offset]; offset = 0; el = node; }
+		else { node = kids[kids.length - 1]; offset = node.childNodes.length; el = node; }
+	}
+	var p = el.closest && el.closest(".txt p");
+	if (!p) return null;
+	var ci = t.chunks.indexOf(p.parentNode), k = [].indexOf.call(p.parentNode.children, p);
+	if (ci < 0 || k < 0) return null;
+	var r = document.createRange();
+	r.setStart(p, 0);
+	r.setEnd(node, offset);
+	return t.starts[ci * CHUNK + k] + r.toString().length;
+}
+function hlSelection(sess) {
+	var t = sess.txt, sel = window.getSelection();
+	if (!t || !sel || !sel.rangeCount || sel.isCollapsed) return null;
+	var r = sel.getRangeAt(0), body = $("bookBody");
+	if (!body.contains(r.startContainer) || !body.contains(r.endContainer)) return null;
+	var a = hlPoint(t, r.startContainer, r.startOffset), b = hlPoint(t, r.endContainer, r.endOffset);
+	if (a == null || b == null || b <= a) return null;
+	var full = fullText(t);
+	while (a < b && /\s/.test(full[a])) a++;
+	while (b > a && /\s/.test(full[b - 1])) b--;
+	if (b <= a || b - a > 20000) return null;
+	return { start_pos: a, end_pos: b, text: full.slice(a, b) };
+}
+function hlWire(sess) {
+	var bar = $("hlBar"), hideTimer = null;
+	sess.cleanup.push(function () { show(bar, false); showHlPop(false); showHlList(false); });
+	listen(sess, document, "selectionchange", function () {
+		var s = hlSelection(sess);
+		if (s) { clearTimeout(hideTimer); sess.hl.sel = s; show(bar, true); return; }
+		// Tapping the bar can clear the selection a moment before the tap lands.
+		clearTimeout(hideTimer);
+		hideTimer = setTimeout(function () { sess.hl.sel = null; show(bar, false); }, 400);
+	});
+	listen(sess, $("bookBody"), "click", function (e) {
+		var m = e.target.closest && e.target.closest("mark.hl");
+		var sel = window.getSelection();
+		if (!m || (sel && !sel.isCollapsed)) return;
+		var x = hlFind(sess, Number(m.dataset.h));
+		if (!x) return;
+		e.stopPropagation();
+		openHlPop(sess, x, false);
+	});
+}
+function hlFind(sess, id) { return sess.hl.list.filter(function (x) { return x.id === id; })[0] || null; }
+// The bar's buttons keep the selection (a tap would otherwise clear it).
+["hlAdd", "hlNote"].forEach(function (id) {
+	$(id).addEventListener("pointerdown", function (e) { e.preventDefault(); });
+	$(id).addEventListener("mousedown", function (e) { e.preventDefault(); });
+});
+$("hlAdd").addEventListener("click", function (e) { e.stopPropagation(); hlCreate(false); });
+$("hlNote").addEventListener("click", function (e) { e.stopPropagation(); hlCreate(true); });
+function hlCreate(withNote) {
+	var sess = session;
+	if (!sess || !sess.hl || !sess.hl.sel) return;
+	var s = sess.hl.sel, x = { id: -Date.now(), book_id: sess.id, start_pos: s.start_pos, end_pos: s.end_pos, text: s.text, note: null,
+		created_at: Date.now(), updated_at: Date.now() };
+	sess.hl.sel = null;
+	var sel = window.getSelection();
+	if (sel) sel.removeAllRanges();
+	show($("hlBar"), false);
+	sess.hl.list.push(x);
+	cacheHl(sess);
+	hlRender(sess);
+	hlSend(sess, { op: "add", book: sess.id, id: x.id, start_pos: x.start_pos, end_pos: x.end_pos, text: x.text, note: null });
+	if (withNote) openHlPop(sess, x, true);
+}
+// Send a change now; offline (or if it fails), keep it for later.
+function hlSend(sess, op) {
+	hlPending.push(op);
+	saveHlPending();
+	flushHl().then(function () { if (sess.alive) { cacheHl(sess); hlRender(sess); } }, function () {});
+}
+var hlFlushing = null;
+function flushHl() {
+	if (hlFlushing) return hlFlushing;
+	var run = hlFlushing = (async function () {
+		await pause();
+		while (hlPending.length) {
+			var op = hlPending[0];
+			try {
+				if (op.op === "add") {
+					var d = await apiJSON("/api/books/" + op.book + "/highlights", { method: "POST",
+						json: { start_pos: op.start_pos, end_pos: op.end_pos, text: op.text, note: op.note } });
+					hlRenumber(op.book, op.id, d.highlight.id);
+				} else if (op.id < 0) {
+					// Its "add" was refused, so there's nothing to change.
+				} else if (op.op === "note") {
+					await apiJSON("/api/highlights/" + op.id, { method: "PATCH", json: { note: op.note } });
+				} else if (op.op === "delete") {
+					await apiJSON("/api/highlights/" + op.id, { method: "DELETE" }).catch(function (e) { if (!/No such/.test(e.message)) throw e; });
+				}
+			} catch (e) {
+				if (e.message === UNAUTH || isOffline(e)) throw e;
+				// Refused for good (the book's gone, say): drop it.
+				toast("A highlight couldn't be saved: " + e.message);
+			}
+			hlPending.shift();
+			saveHlPending();
+		}
+	})();
+	run.then(done, done);
+	function done() { if (hlFlushing === run) hlFlushing = null; }
+	return run;
+}
+// A highlight made offline has a stand-in id until the server gives it one.
+function hlRenumber(book, from, to) {
+	hlPending.forEach(function (op) { if (op.book === book && op.id === from) op.id = to; });
+	var list = session && session.id === book ? session.hl.list : readJSON(hlKey(book)) || [];
+	list.forEach(function (x) { if (x.id === from) x.id = to; });
+	if (session && session.id === book) { cacheHl(session); hlRender(session); } else store(hlKey(book), JSON.stringify(list));
+}
+window.addEventListener("online", function () { if (hlPending.length && token()) flushHl().catch(function () {}); });
+
+// The panel for one highlight: its words, its note, Delete.
+var hlPop = { x: null };
+function showHlPop(on) { show($("hlPop"), on); if (!on) hlPop.x = null; }
+function openHlPop(sess, x, focus) {
+	showHlList(false);
+	openBookMenu(false);
+	hlPop.x = x;
+	var q = x.text.length > 400 ? x.text.slice(0, 400) + "…" : x.text;
+	$("hlQuote").textContent = q;
+	$("hlNoteText").value = x.note || "";
+	show($("hlPop"), true);
+	if (focus) $("hlNoteText").focus();
+}
+$("hlSave").addEventListener("click", function () {
+	var sess = session, x = hlPop.x;
+	if (!sess || !x) return;
+	var note = $("hlNoteText").value.trim() || null;
+	showHlPop(false);
+	if (note === (x.note || null)) return;
+	x.note = note;
+	x.updated_at = Date.now();
+	cacheHl(sess);
+	hlRender(sess);
+	hlSend(sess, { op: "note", book: sess.id, id: x.id, note: note });
+});
+$("hlDelete").addEventListener("click", function () {
+	var sess = session, x = hlPop.x;
+	if (!sess || !x) return;
+	if (x.note && !confirm("Delete this highlight and its note?")) return;
+	showHlPop(false);
+	hlRemove(sess, x);
+});
+$("hlClose").addEventListener("click", function () { showHlPop(false); });
+function hlRemove(sess, x) {
+	sess.hl.list = sess.hl.list.filter(function (y) { return y !== x; });
+	cacheHl(sess);
+	hlRender(sess);
+	if (x.id < 0) {
+		// Never went up: forget its waiting "add" and edits instead.
+		hlPending = hlPending.filter(function (op) { return op.id !== x.id; });
+		saveHlPending();
+		return;
+	}
+	hlSend(sess, { op: "delete", book: sess.id, id: x.id });
+}
+
+// The list of a book's highlights, from the book menu: tap one to go there.
+function showHlList(on) { show($("hlList"), on); }
+function openHlList() {
+	var sess = session;
+	if (!sess || !sess.hl) return;
+	openBookMenu(false);
+	showHlPop(false);
+	var ul = $("hlItems"), list = hlSorted(sess.hl.list);
+	ul.textContent = "";
+	list.forEach(function (x) {
+		var li = h("li"), go = h("button", "hlgo");
+		go.type = "button";
+		go.append(h("span", "hlq", x.text));
+		if (x.note) go.append(h("span", "hln", x.note));
+		if (x.missing) go.append(h("span", "hlm", "Not found in this version of the file."));
+		go.addEventListener("click", function () { showHlList(false); if (!x.missing) hlJump(sess, x); });
+		li.append(go);
+		ul.append(li);
+	});
+	$("hlEmpty").textContent = "No highlights yet. Select some text to add one.";
+	show($("hlEmpty"), !list.length);
+	show($("hlExport"), !!list.length);
+	showHlList(true);
+}
+function hlJump(sess, x) {
+	var t = sess.txt, i = paraAt(t, x.start_pos), p = paraEl(t, i);
+	aim(sess, function () {
+		var m = p.querySelector("mark[data-h='" + x.id + "']") || p;
+		return window.scrollY + m.getBoundingClientRect().top - headerBottom() - window.innerHeight * 0.25;
+	}, sess.track);
+	setTimeout(function () { if (sess.alive && sess.track) sess.track(); }, 400);
+}
+// Markdown, for pasting into Obsidian (or anywhere): the words as quotes,
+// notes under them.
+function hlMarkdown(sess) {
+	var b = sess.book, out = ["# " + b.title, ""];
+	if (b.author) out.push("*" + b.author + "*", "");
+	hlSorted(sess.hl.list).forEach(function (x) {
+		out.push(x.text.split("\n").map(function (l) { return "> " + l; }).join("\n"), "");
+		if (x.note) out.push(x.note, "");
+		out.push("---", "");
+	});
+	return out.join("\n");
+}
+$("hlExport").addEventListener("click", async function () {
+	var sess = session;
+	if (!sess) return;
+	var md = hlMarkdown(sess), name = (sess.book.title || "Highlights").replace(/[\\/:*?"<>|]+/g, " ").trim() + " highlights.md";
+	var file = typeof File === "function" ? new File([md], name, { type: "text/markdown" }) : null;
+	if (file && navigator.canShare && navigator.canShare({ files: [file] })) {
+		try { await navigator.share({ files: [file], title: name }); return; } catch (e) { if (e.name === "AbortError") return; }
+	}
+	var a = h("a");
+	a.href = URL.createObjectURL(new Blob([md], { type: "text/markdown" }));
+	a.download = name;
+	document.body.append(a);
+	a.click();
+	a.remove();
+	setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+});
+$("hlListClose").addEventListener("click", function () { showHlList(false); });
+$("bmHighlights").addEventListener("click", function (e) { e.stopPropagation(); openHlList(); });
+document.addEventListener("click", function (e) {
+	if (!$("hlPop").hidden && !$("hlPop").contains(e.target)) showHlPop(false);
+	if (!$("hlList").hidden && !$("hlList").contains(e.target)) showHlList(false);
+});
 
 // ---------- .pdf reader (pdf.js, loaded only when a PDF is opened)
 
@@ -5401,6 +5860,72 @@ async function zipEntryBlob(u8, e) {
 	var out = await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"))).arrayBuffer();
 	return new Blob([out], { type: e.type });
 }
+// Guided view: panel by panel. Comic files carry no panel data, so the
+// panels are found here: the page's margin color (white or black) is taken
+// as the gutter color, then the page is cut along rows, then columns, that
+// are all gutter, over and over (an "XY cut"). That finds classic grids with
+// clean gutters; splash pages, bleeds and overlapping or borderless panels
+// find one panel or a mess, and those pages are shown whole.
+var GUIDED_KEY = "readerComicGuided";
+function guidedOn() { return read(GUIDED_KEY) === "on"; }
+function findPanels(img) {
+	var nw = img.naturalWidth, nh = img.naturalHeight;
+	if (!nw || !nh) return null;
+	var sc = Math.min(1, 480 / Math.max(nw, nh)), w = Math.max(1, Math.round(nw * sc)), hgt = Math.max(1, Math.round(nh * sc));
+	var cv = document.createElement("canvas");
+	cv.width = w; cv.height = hgt;
+	var cx = cv.getContext("2d", { willReadFrequently: true });
+	cx.drawImage(img, 0, 0, w, hgt);
+	var px;
+	try { px = cx.getImageData(0, 0, w, hgt).data; } catch (e) { return null; }
+	var g = new Uint8Array(w * hgt);
+	for (var i = 0, j = 0; i < g.length; i++, j += 4) g[i] = (px[j] * 299 + px[j + 1] * 587 + px[j + 2] * 114) / 1000;
+	// Gutter color from the page's outer edge.
+	var sum = 0, cnt = 0;
+	for (var x = 0; x < w; x++) { sum += g[x] + g[(hgt - 1) * w + x]; cnt += 2; }
+	for (var y = 0; y < hgt; y++) { sum += g[y * w] + g[y * w + w - 1]; cnt += 2; }
+	var bg = sum / cnt;
+	if (bg > 60 && bg < 195) return null;
+	var white = bg >= 195;
+	var gut = function (v) { return white ? v > 215 : v < 45; };
+	var rowClear = function (y, x0, x1) {
+		var bad = 0, allow = Math.max(1, (x1 - x0) * 0.012);
+		for (var x = x0; x < x1; x++) if (!gut(g[y * w + x]) && ++bad > allow) return false;
+		return true;
+	};
+	var colClear = function (x, y0, y1) {
+		var bad = 0, allow = Math.max(1, (y1 - y0) * 0.012);
+		for (var y = y0; y < y1; y++) if (!gut(g[y * w + x]) && ++bad > allow) return false;
+		return true;
+	};
+	// Runs of not-gutter along one direction, gutters at least minGap thick.
+	var runs = function (from, to, clear) {
+		var out = [], start = -1, gap = 0, minGap = 2;
+		for (var k = from; k < to; k++) {
+			if (clear(k)) { gap++; if (start >= 0 && gap >= minGap) { out.push([start, k - gap + 1]); start = -1; } }
+			else { if (start < 0) start = k; gap = 0; }
+		}
+		if (start >= 0) out.push([start, to - (gap < minGap ? 0 : gap)]);
+		return out;
+	};
+	var minW = w * 0.08, minH = hgt * 0.05;
+	var cut = function (r, depth) {
+		var ys = runs(r.y, r.y + r.h, function (y) { return rowClear(y, r.x, r.x + r.w); })
+			.filter(function (s) { return s[1] - s[0] >= minH; });
+		if (!ys.length) return [];
+		if (ys.length > 1 && depth < 6) return [].concat.apply([], ys.map(function (s) { return cut({ x: r.x, y: s[0], w: r.w, h: s[1] - s[0] }, depth + 1); }));
+		var y0 = ys[0][0], y1 = ys[0][1];
+		var xs = runs(r.x, r.x + r.w, function (x) { return colClear(x, y0, y1); })
+			.filter(function (s) { return s[1] - s[0] >= minW; });
+		if (!xs.length) return [];
+		if (xs.length > 1 && depth < 6) return [].concat.apply([], xs.map(function (s) { return cut({ x: s[0], y: y0, w: s[1] - s[0], h: y1 - y0 }, depth + 1); }));
+		return [{ x: xs[0][0], y: y0, w: xs[0][1] - xs[0][0], h: y1 - y0 }];
+	};
+	var found = cut({ x: 0, y: 0, w: w, h: hgt }, 0);
+	var area = found.reduce(function (a, r) { return a + r.w * r.h; }, 0);
+	if (found.length < 2 || found.length > 16 || area < w * hgt * 0.4) return null;
+	return found.map(function (r) { return { x: r.x / w, y: r.y / hgt, w: r.w / w, h: r.h / hgt }; });
+}
 async function openCbz(sess, pos) {
 	var res = await bookFileRes(sess.book);
 	var buf = await res.arrayBuffer();
@@ -5409,11 +5934,11 @@ async function openCbz(sess, pos) {
 	if (!n) throw new Error("No page images in this comic.");
 	var body = $("bookBody");
 	body.textContent = "";
-	body.className = "cbz" + (read("readerComicFit") === "width" ? " fitw" : "");
+	body.className = "cbz" + (read("readerComicFit") === "width" ? " fitw" : "") + (guidedOn() ? " guided" : "");
 	var box = h("div", "cbzpage"), img = h("img");
 	img.alt = "";
 	box.append(img);
-	var prev = button("‹", "btn", function () { go(cur - 1, true); }), next = button("›", "btn", function () { go(cur + 1, true); });
+	var prev = button("‹", "btn", function () { step(-1); }), next = button("›", "btn", function () { step(1); });
 	prev.setAttribute("aria-label", "Previous page");
 	next.setAttribute("aria-label", "Next page");
 	var slider = h("input");
@@ -5426,6 +5951,9 @@ async function openCbz(sess, pos) {
 	bar.append(prev, slider, next);
 	body.append(box, bar);
 	var urls = {}, cur = 0;
+	// Guided view: the panels of the page showing (null: shown whole), which
+	// one is on screen, and whether a middle tap pulled back to the page.
+	var g = { panels: null, at: 0, whole: false, found: {} };
 	function url(i) {
 		if (!urls[i]) urls[i] = zipEntryBlob(u8, pages[i - 1]).then(function (b) { return URL.createObjectURL(b); });
 		return urls[i];
@@ -5439,7 +5967,7 @@ async function openCbz(sess, pos) {
 	}
 	// byReader: a turn the reader made (saved, and can mark the comic finished),
 	// not the saved place being put back.
-	async function go(i, byReader) {
+	async function go(i, byReader, last) {
 		i = clamp(i, 1, n);
 		if (i === cur) return;
 		cur = i;
@@ -5455,24 +5983,72 @@ async function openCbz(sess, pos) {
 		try {
 			var src = await url(i);
 			if (!sess.alive || cur !== i) return;
+			if (guidedOn()) img.style.visibility = "hidden";
 			img.src = src;
 			img.alt = "Page " + i;
 			if (byReader) window.scrollTo(0, 0);
+			if (guidedOn()) await guide(i, last);
 		} catch (e) {
 			if (sess.alive && cur === i) toast("Couldn't show page " + i + ": " + e.message);
 		}
 	}
-	sess.cbz = { n: n, go: go };
+	// Next or previous: a panel in guided view (a page past the first or
+	// last one), else a page.
+	function step(dir) {
+		if (guidedOn() && g.panels && !g.whole) {
+			var k = g.at + dir;
+			if (k >= 0 && k < g.panels.length) { g.at = k; place(); return; }
+		}
+		if (guidedOn() && g.whole && g.panels) { g.whole = false; if (dir < 0) { place(); return; } }
+		go(cur + dir, true, dir < 0);
+	}
+	async function guide(i, last) {
+		if (!img.complete || !img.naturalWidth) {
+			await new Promise(function (res) { img.onload = img.onerror = function () { img.onload = img.onerror = null; res(); }; });
+		}
+		if (!sess.alive || cur !== i) return;
+		if (!(i in g.found)) g.found[i] = findPanels(img);
+		g.panels = g.found[i];
+		g.at = g.panels && last ? g.panels.length - 1 : 0;
+		g.whole = false;
+		place();
+		img.style.visibility = "";
+	}
+	// Fit the panel (or the page) to the frame, centered, with a little room.
+	function place() {
+		if (!guidedOn() || !img.naturalWidth) { img.style.transform = ""; img.style.width = ""; img.style.height = ""; return; }
+		var W = box.clientWidth, H = box.clientHeight, nw = img.naturalWidth, nh = img.naturalHeight;
+		var r = g.panels && !g.whole ? g.panels[g.at] : { x: 0, y: 0, w: 1, h: 1 };
+		var pad = g.panels && !g.whole ? 0.012 : 0;
+		var rx = Math.max(0, r.x - pad), ry = Math.max(0, r.y - pad), rw = Math.min(1 - rx, r.w + pad * 2), rh = Math.min(1 - ry, r.h + pad * 2);
+		var s = Math.min(W / (rw * nw), H / (rh * nh));
+		var tx = W / 2 - (rx + rw / 2) * nw * s, ty = H / 2 - (ry + rh / 2) * nh * s;
+		img.style.width = nw + "px";
+		img.style.height = nh + "px";
+		img.style.transform = "translate(" + tx + "px," + ty + "px) scale(" + s + ")";
+		$("progress").textContent = cur + " / " + n + (g.panels && !g.whole ? " · " + (g.at + 1) + "/" + g.panels.length : "");
+	}
+	function setGuided(on) {
+		store(GUIDED_KEY, on ? "on" : null);
+		body.classList.toggle("guided", on);
+		g.found = {};
+		g.whole = false;
+		if (on) guide(cur, false); else { g.panels = null; place(); $("progress").textContent = cur + " / " + n; }
+	}
+	sess.cbz = { n: n, go: go, setGuided: setGuided };
 	function fit() { body.style.setProperty("--cbz-h", Math.max(200, window.innerHeight - headerBottom() - bar.offsetHeight - 24) + "px"); }
 	fit();
-	listen(sess, window, "resize", onScrollFrame(fit));
+	listen(sess, window, "resize", onScrollFrame(function () { fit(); place(); }));
 	// Tap the left or right side to turn; the middle switches between the
 	// whole page on screen and page width (scroll down for the rest).
 	listen(sess, box, "click", function (e) {
 		var x = e.clientX / window.innerWidth;
-		if (x < 0.35) go(cur - 1, true);
-		else if (x > 0.65) go(cur + 1, true);
-		else {
+		if (x < 0.35) step(-1);
+		else if (x > 0.65) step(1);
+		else if (guidedOn()) {
+			// In guided view the middle pulls back to the whole page, and back in.
+			if (g.panels) { g.whole = !g.whole; place(); }
+		} else {
 			var w = body.classList.toggle("fitw");
 			store("readerComicFit", w ? "width" : null);
 		}
@@ -5488,7 +6064,7 @@ async function openCbz(sess, pos) {
 		swipe = null;
 		if (!quick || Math.abs(dx) < 50 || Math.abs(dx) < 2 * Math.abs(dy)) return;
 		e.preventDefault();
-		go(cur + (dx < 0 ? 1 : -1), true);
+		step(dx < 0 ? 1 : -1);
 	});
 	listen(sess, box, "touchcancel", function () { swipe = null; }, { passive: true });
 	listen(sess, document, "keydown", function (e) {
@@ -5496,7 +6072,7 @@ async function openCbz(sess, pos) {
 		var dir = e.key === "ArrowRight" || e.key === "j" || e.key === "PageDown" ? 1 : e.key === "ArrowLeft" || e.key === "k" || e.key === "PageUp" ? -1 : 0;
 		if (!dir) return;
 		e.preventDefault();
-		go(cur + dir, true);
+		step(dir);
 	});
 	sess.cleanup.push(function () { Object.keys(urls).forEach(function (k) { urls[k].then(URL.revokeObjectURL, function () {}); }); });
 	await go(pos.page || 1, false);
@@ -5531,6 +6107,12 @@ $("bmFinish").addEventListener("click", async function () {
 	} catch (e) { fail(e); }
 });
 $("bmRestart").addEventListener("click", restartBook);
+$("bmGuided").addEventListener("click", function () {
+	var on = !guidedOn();
+	openBookMenu(false);
+	if (session && session.cbz) session.cbz.setGuided(on); else store(GUIDED_KEY, on ? "on" : null);
+	toast(on ? "Guided view on. Tap the middle to see the whole page." : "Guided view off.");
+});
 $("bmDownload").addEventListener("click", function () { if (session) toggleBookDownload(session.book); });
 $("bmDelete").addEventListener("click", async function () {
 	var sess = session;

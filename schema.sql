@@ -130,3 +130,20 @@ CREATE TABLE IF NOT EXISTS book_tag_links (
 );
 
 CREATE INDEX IF NOT EXISTS book_tag_links_by_tag ON book_tag_links (tag_id);
+
+-- Highlights in .txt books: a stretch of the text by character position
+-- (into the text after any YAML header), the words themselves (so a
+-- re-uploaded file can be searched for them if the positions moved), and
+-- an optional note.
+CREATE TABLE IF NOT EXISTS highlights (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	book_id INTEGER NOT NULL REFERENCES books (id) ON DELETE CASCADE,
+	start_pos INTEGER NOT NULL,
+	end_pos INTEGER NOT NULL,
+	text TEXT NOT NULL,
+	note TEXT,
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS highlights_by_book ON highlights (book_id, start_pos);
