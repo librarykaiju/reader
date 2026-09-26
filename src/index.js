@@ -32,9 +32,12 @@
 //                                  newest first -> {"items", "next"} (tag=0: untagged feeds);
 //                                  Unread and All list a story once, with its other items in related
 //   POST   /api/items              {feed_id, items: [...]} -- one feed's refresh
+//                                  (podcasts/videos: each with notes, a short plain-text preview of its show notes)
 //   GET    /api/items/:id          one item, with its content
 //   PATCH  /api/items/:id          {read?, saved?, content?, media_pos?, media_len?} (read covers its whole story)
 //   POST   /api/items/mark-read    {feed?, tag?}
+//   GET    /api/continue           -> {"episode", "book"}: the newest podcast episode part-way
+//                                  through, and the last opened book not finished (either may be null)
 //   GET    /api/media?url=         a podcast episode's file, streamed through for
 //                                  downloading (podcast hosts rarely allow CORS)
 //   GET    /api/books              -> {"books": [...each with tags: [book tag ids]]}
@@ -171,6 +174,7 @@ async function api(request, env, url) {
 		if (m === "POST") return addItems(request, env);
 	}
 	if (p === "/api/items/mark-read" && m === "POST") return markRead(request, env);
+	if (p === "/api/continue" && m === "GET") return continueCards(env);
 	if ((id = matchId(p, "/api/items/"))) {
 		if (m === "GET") return getItem(env, id);
 		if (m === "PATCH") return updateItem(request, env, id);
@@ -606,13 +610,16 @@ async function listItems(env, url) {
 	// view, with the story's other items under it (related).
 	const grouped = view === "unread" || view === "all";
 	if (!grouped) {
+		// Episodes carry the start of their show notes, for the list.
+		const media = view === "podcasts" || view === "videos";
 		const { results } = await env.DB.prepare(
-			`SELECT ${ITEM_LIST_COLUMNS} FROM items i JOIN feeds f ON f.id = i.feed_id
+			`SELECT ${ITEM_LIST_COLUMNS}${media ? ", substr(i.content, 1, 6000) AS notes" : ""} FROM items i JOIN feeds f ON f.id = i.feed_id
 			WHERE ${where.join(" AND ")}
 			ORDER BY COALESCE(i.published_at, i.created_at) DESC, i.id DESC LIMIT ?`,
 		)
 			.bind(...params, limit + 1)
 			.all();
+		if (media) for (const it of results) it.notes = notesPreview(it.notes);
 		return itemPage(results, limit);
 	}
 	const cursor = before ? where.pop() : null;
@@ -646,6 +653,47 @@ async function listItems(env, url) {
 	}
 	for (const it of results) delete it.rn;
 	return itemPage(results, limit);
+}
+
+// Show notes as a few hundred characters of plain text: tags dropped,
+// paragraphs run together, the common entities turned back into characters.
+const ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", hellip: "…", mdash: "—", ndash: "–",
+	rsquo: "’", lsquo: "‘", rdquo: "”", ldquo: "“" };
+function notesPreview(html, max = 600) {
+	if (!html) return null;
+	const text = html
+		.replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, " ")
+		.replace(/<\/?(p|br|div|li|ul|ol|h\d|blockquote|tr|td)\b[^>]*>/gi, " ")
+		.replace(/<[^>]*>?/g, "")
+		.replace(/&(#x[\da-f]+|#\d+|[a-z]+);/gi, (m, e) => {
+			if (e[0] !== "#") return ENTITIES[e.toLowerCase()] ?? m;
+			const n = e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : Number(e.slice(1));
+			return n > 0 && n < 0x110000 ? String.fromCodePoint(n) : " ";
+		})
+		.replace(/\s+/g, " ")
+		.trim();
+	if (!text) return null;
+	if (text.length <= max) return text;
+	const cut = text.slice(0, max), space = cut.lastIndexOf(" ");
+	return (space > max * 0.7 ? cut.slice(0, space) : cut) + "…";
+}
+
+// The cards atop Unread and All. Nothing records when an episode was last
+// played, so it's the newest one part-way through (the page prefers the one
+// last played on this device).
+async function continueCards(env) {
+	const [episode, book] = await Promise.all([
+		env.DB.prepare(
+			`SELECT ${ITEM_LIST_COLUMNS} FROM items i JOIN feeds f ON f.id = i.feed_id
+			WHERE ${VIEWS.podcasts} AND i.media_pos > 5 AND i.media_len > 60 AND i.media_pos < i.media_len - 30
+			ORDER BY COALESCE(i.published_at, i.created_at) DESC, i.id DESC LIMIT 1`,
+		).first(),
+		env.DB.prepare(
+			`SELECT ${BOOK_COLUMNS} FROM books WHERE finished_at IS NULL AND last_opened_at IS NOT NULL
+			ORDER BY last_opened_at DESC, id DESC LIMIT 1`,
+		).first(),
+	]);
+	return json({ episode: episode || null, book: book || null });
 }
 
 function itemPage(results, limit) {
@@ -1581,7 +1629,7 @@ const PAGE = String.raw`<!doctype html>
 <meta name="apple-mobile-web-app-title" content="Reader">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#fbfaf7">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f5fd0'/%3E%3Cpath d='M9 8h9a5 5 0 0 1 0 10h-9zM9 18v7' stroke='white' stroke-width='3' fill='none'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f5fd0'/%3E%3Cpath d='M10 25V8h7a5 5 0 0 1 0 10h-7M16 18l6.5 7' stroke='white' stroke-width='3' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E">
 <title>Reader</title>
 <style nonce="__NONCE__">
 	:root {
@@ -1833,7 +1881,19 @@ const PAGE = String.raw`<!doctype html>
 	.loading { color: var(--muted); text-align: center; padding: 40px 16px; font-family: var(--sans); }
 
 	/* Podcasts: the episode list, the box atop an episode, the player bar. */
-	.eps li { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--line); }
+	.eps li { display: flex; flex-wrap: wrap; align-items: center; column-gap: 8px; border-bottom: 1px solid var(--line); }
+	.eps .mark { position: static; width: 40px; height: 40px; }
+	.eps .read .mark { color: var(--accent); }
+	.eps .notes { flex: 1 0 100%; margin: -6px 0 0; padding: 0 0 12px 22px; border: 0; background: none; color: var(--muted); font: 14px/1.4 var(--sans);
+		text-align: left; cursor: pointer; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
+	.eps .notes.open { display: block; -webkit-line-clamp: none; line-clamp: none; }
+	.cont { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin: 16px 0 0; }
+	.ccard { display: grid; gap: 2px; min-width: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card);
+		color: inherit; text-decoration: none; text-align: left; font: 15px/1.35 var(--sans); cursor: pointer; }
+	.ccard .cl { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--accent); }
+	.ccard .ct, .ccard .cm { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+	.ccard .ct { font-weight: 600; }
+	.ccard .cm { font-size: 13px; color: var(--muted); }
 	.eps li > a { flex: 1; min-width: 0; border-bottom: 0; }
 	.eps .ep-btns { display: flex; gap: 6px; flex: none; }
 	.eps .ep-btns .btn { min-width: 44px; font-variant-numeric: tabular-nums; }
@@ -1941,6 +2001,7 @@ const PAGE = String.raw`<!doctype html>
 		</details>
 	</aside>
 	<div>
+		<div id="cont" class="cont" hidden></div>
 		<div class="listhead">
 			<h2 id="listTitle">Unread</h2>
 			<button id="markAll" class="btn ghost small" type="button">Mark all read</button>
@@ -3527,6 +3588,7 @@ async function showList(r, prev) {
 	renderTabs(r.name);
 	renderFeeds();
 	fillTagSelect();
+	loadContinue();
 	var back = prev && prev.name === "item" && state.listKey === listKeyNow();
 	if (back && !state.stale) {
 		renderItems();
@@ -3536,6 +3598,61 @@ async function showList(r, prev) {
 	if (!back) { window.scrollTo(0, 0); state.items = []; }
 	await loadItems(false);
 	if (back) window.scrollTo(0, state.listScroll);
+}
+// Continue listening / Continue reading, atop Unread and All (not a feed or
+// tag): the episode part-way through (the one last played on this device if
+// it is, else the server's pick) and the last opened book not finished.
+var contData = null;
+function contShown() { return (state.view === "unread" || state.view === "all") && state.feed == null && state.tag == null; }
+async function loadContinue() {
+	renderContinue();
+	if (!contShown()) return;
+	try { contData = await apiJSON("/api/continue"); } catch (e) { if (e.message === UNAUTH) return; }
+	renderContinue();
+}
+function contEpisode() {
+	var mine = player.ep && isAudio(player.ep) ? player.ep : null;
+	if (mine && epPos(mine) > 5 && !epPlayed(mine)) return mine;
+	var ep = contData && contData.episode ? epFields(contData.episode) : null;
+	return ep && !epPlayed(ep) && !(mine && mine.id === ep.id) ? ep : null;
+}
+function contBook() {
+	var b = contData && contData.book;
+	if (!b) return null;
+	var mine = (state.books || []).filter(function (x) { return x.id === b.id; })[0];
+	b = mine || Object.assign({}, b);
+	if (!mine) applyPending([b], false);
+	return b.finished_at ? null : b;
+}
+function contCard(tag, label, title, meta, pct) {
+	var c = h(tag, "ccard"), bar = h("div", "bar-prog"), fill = h("span");
+	fill.style.width = Math.max(0, Math.min(100, pct)) + "%";
+	bar.append(fill);
+	c.append(h("span", "cl", label), h("span", "ct", title), h("span", "cm", meta), bar);
+	return c;
+}
+function renderContinue() {
+	var box = $("cont");
+	box.textContent = "";
+	if (!contShown()) { show(box, false); return; }
+	var ep = contEpisode(), b = contBook();
+	if (ep) {
+		var len = epLen(ep), c = contCard("button", "Continue listening", ep.title,
+			[ep.feed_title, epStatus(ep)].filter(Boolean).join(" · "), len ? epPos(ep) / len * 100 : 0);
+		c.type = "button";
+		c.setAttribute("aria-label", "Continue listening: " + ep.title);
+		c.addEventListener("click", function () { playEpisode(ep, true).then(renderContinue).catch(fail); });
+		box.append(c);
+	}
+	if (b) {
+		var pos = parsePos(b.position), pct = pos && pos.f ? Math.round(pos.f * 100) : 0;
+		var where = pos && b.type !== "txt" && pos.page ? "p. " + pos.page + (pos.pages ? " of " + pos.pages : "") : pct ? pct + "%" : "";
+		var a = contCard("a", "Continue reading", b.title, [b.author, where].filter(Boolean).join(" · "), pct);
+		a.href = "#/book/" + b.id;
+		a.setAttribute("aria-label", "Continue reading: " + b.title);
+		box.append(a);
+	}
+	show(box, !!(ep || b));
 }
 function goBack() {
 	if (state.fromList) history.back();
@@ -3749,7 +3866,8 @@ function isHosted(ep) { return /^video\/x-(youtube|twitch|vimeo)$/.test(ep.media
 function inTab(ep) { return state.epKind === "videos" ? !isAudio(ep) : isAudio(ep); }
 function epFields(it) {
 	return { id: it.id, feed_id: it.feed_id, feed_title: it.feed_title || "", title: it.title || "Untitled", media_url: it.media_url,
-		media_type: it.media_type || "audio/mpeg", media_pos: it.media_pos, media_len: it.media_len, published_at: it.published_at, created_at: it.created_at };
+		media_type: it.media_type || "audio/mpeg", media_pos: it.media_pos, media_len: it.media_len, published_at: it.published_at, created_at: it.created_at,
+		notes: it.notes || null };
 }
 function saveDownloads() { store("readerDownloads", JSON.stringify(downloads)); }
 // The furthest point reached on this device or saved on the item.
@@ -3849,7 +3967,9 @@ function renderEpisodes() {
 		var btns = h("div", "ep-btns");
 		btns.append(playButton(ep, true));
 		if (!isHosted(ep)) btns.append(downloadButton(ep, true));
+		btns.append(playedButton(ep));
 		li.append(a, btns);
+		if (ep.notes) li.append(notesButton(ep.notes));
 		ul.append(li);
 	});
 	$("epEmpty").textContent = state.epDownloadedOnly ? "Nothing downloaded on this device."
@@ -3862,6 +3982,55 @@ function renderEpisodes() {
 	show($("epNote"), state.epOffline && !!state.episodes.length);
 	$("epFilter").setAttribute("aria-pressed", String(!!state.epDownloadedOnly));
 	$("epFilter").classList.toggle("on", !!state.epDownloadedOnly);
+}
+// The start of the show notes under the title, two lines until tapped.
+function notesButton(text) {
+	var b = h("button", "notes", text);
+	b.type = "button";
+	b.setAttribute("aria-expanded", "false");
+	b.addEventListener("click", function () {
+		var open = b.classList.toggle("open");
+		b.setAttribute("aria-expanded", String(open));
+	});
+	return b;
+}
+// The checkmark beside an episode: played or not, without listening. Played
+// means the spot is at the end; an episode never started has no length yet,
+// so it gets a stand-in of one second, replaced once it's played for real.
+function playedButton(ep) {
+	var b = h("button", "mark");
+	b.type = "button";
+	b.dataset.played = ep.id;
+	b.innerHTML = CHECK_SVG;
+	paintPlayed(b, ep);
+	b.addEventListener("click", function (e) { e.preventDefault(); setPlayed(ep, !epPlayed(ep)); });
+	return b;
+}
+function paintPlayed(b, ep) {
+	var on = epPlayed(ep);
+	b.setAttribute("aria-label", (on ? "Mark unplayed: " : "Mark played: ") + ep.title);
+	b.title = on ? "Mark unplayed" : "Mark played";
+}
+function setPlayed(ep, on) {
+	var len = epLen(ep), audio = $("pAudio"), mine = player.ep && player.ep.id === ep.id && audio.src;
+	var real = len >= 60 ? len : null;
+	var pos = on ? real || 1 : 0, patch = { media_pos: pos };
+	if (on && !real) patch.media_len = 1;
+	if (!on && len && !real) patch.media_len = null;
+	if (on) patch.read = 1;
+	if (mine) { audio.pause(); player.savedAt = Date.now(); }
+	positions[ep.id] = pos;
+	store("readerPositions", JSON.stringify(positions));
+	[ep, findListed(ep.id), downloads[ep.id], player.ep && player.ep.id === ep.id ? player.ep : null].forEach(function (x) {
+		if (!x) return;
+		x.media_pos = pos;
+		if ("media_len" in patch) x.media_len = patch.media_len;
+	});
+	if (downloads[ep.id]) saveDownloads();
+	// The bar's own save on pause would put the old spot back.
+	if (mine) { try { audio.currentTime = on && real ? real : 0; } catch (e) {} }
+	repaintEpisode(ep.id);
+	api("/api/items/" + ep.id, { method: "PATCH", json: patch, keepalive: true }).catch(fail);
 }
 function playButton(ep, small) {
 	var b = h("button", "btn" + (small ? " small" : " primary"));
@@ -3907,6 +4076,8 @@ function repaintEpisode(id) {
 	document.querySelectorAll("#episodes li[data-id='" + id + "'] .m").forEach(function (m) {
 		m.textContent = [ep.feed_title, ago(ep.published_at || ep.created_at), epStatus(ep)].filter(Boolean).join(" · ");
 	});
+	document.querySelectorAll("#episodes li[data-id='" + id + "']").forEach(function (li) { li.classList.toggle("read", epPlayed(ep)); });
+	document.querySelectorAll("[data-played='" + id + "']").forEach(function (b) { paintPlayed(b, ep); });
 	var when = document.querySelector("#aEpisode .when");
 	if (when && state.item && state.item.id === id) when.textContent = epStatus(ep);
 }
