@@ -1908,6 +1908,17 @@ const PAGE = String.raw`<!doctype html>
 	.itemnav { display: flex; gap: 8px; margin-top: 32px; padding-top: 16px; border-top: 1px solid var(--line); font-family: var(--sans); }
 	.itemnav .btn { flex: 1; }
 	.itemnav .btn:disabled { visibility: hidden; }
+	/* Desktop: the arrows float at the screen's sides, level with the middle
+	   of the window, so the next item is one click away wherever you are. */
+	@media (min-width: 1000px) and (hover: hover) and (pointer: fine) {
+		.itemnav { border-top: 0; margin: 0; padding: 0; }
+		.itemnav .btn { position: fixed; top: 50%; transform: translateY(-50%); z-index: 5; width: 52px; height: 52px; padding: 0;
+			border-radius: 50%; font-size: 22px; box-shadow: 0 4px 14px rgba(0,0,0,.12); opacity: .75; transition: opacity .15s; }
+		.itemnav .btn:hover, .itemnav .btn:focus-visible { opacity: 1; }
+		#aPrev { left: max(16px, calc(50vw - 480px)); }
+		#aNext { right: max(16px, calc(50vw - 480px)); }
+		.itemnav .lbl { display: none; }
+	}
 	.prose { overflow-wrap: break-word; }
 	.prose a { overflow-wrap: anywhere; }
 	.prose a:not([href]) { color: inherit; }
@@ -2133,8 +2144,8 @@ const PAGE = String.raw`<!doctype html>
 		<div id="aBody" class="prose"></div>
 		<button id="aFull" class="btn wide" type="button" hidden>Load full article</button>
 		<nav id="aNav" class="itemnav" aria-label="Other items" hidden>
-			<button id="aPrev" class="btn" type="button">&#8592; Previous</button>
-			<button id="aNext" class="btn" type="button">Next &#8594;</button>
+			<button id="aPrev" class="btn" type="button" aria-label="Previous">&#8592;<span class="lbl"> Previous</span></button>
+			<button id="aNext" class="btn" type="button" aria-label="Next"><span class="lbl">Next </span>&#8594;</button>
 		</nav>
 	</article>
 </section>
