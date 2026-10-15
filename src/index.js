@@ -7706,6 +7706,7 @@ async function openCbz(sess, pos) {
 	listen(sess, box, "touchcancel", function () { swipe = null; }, { passive: true });
 	listen(sess, document, "keydown", function (e) {
 		if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || !$("bookMenu").hidden || !$("settings").hidden) return;
+		if (e.target.closest && e.target.closest("input, textarea, select, [contenteditable]")) return;
 		var dir = e.key === "ArrowRight" || e.key === "j" || e.key === "PageDown" ? 1 : e.key === "ArrowLeft" || e.key === "k" || e.key === "PageUp" ? -1 : 0;
 		if (!dir) return;
 		e.preventDefault();
