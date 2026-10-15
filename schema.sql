@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS books (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	title TEXT NOT NULL,
 	filename TEXT NOT NULL,
-	-- A .cbz comic is saved as 'pdf'; its file name marks it (BOOK_TYPE in src/index.js).
+	-- A .cbz comic or an .epub is saved as 'pdf'; its file name marks it (BOOK_TYPE in src/index.js).
 	type TEXT NOT NULL CHECK (type IN ('txt', 'pdf')),
 	size INTEGER NOT NULL,
 	r2_key TEXT NOT NULL UNIQUE,

@@ -1,6 +1,6 @@
 # Reader Setup
 
-A private feed and ebook reader at `reader.brandonj.ink`. Add a website by URL and it finds the site's feed. If the site has no feed, it watches the page for new article links instead. Upload `.txt` and `.pdf` books, and `.cbz` comics, to read in the browser. Feeds and books each get their own colored tags you can filter by, and books can be downloaded to read offline. It has Light, Dark, Sepia and Auto themes.
+A private feed and ebook reader at `reader.brandonj.ink`. Add a website by URL and it finds the site's feed. If the site has no feed, it watches the page for new article links instead. Upload `.txt`, `.pdf` and DRM-free `.epub` books, and `.cbz` comics, to read in the browser. Feeds and books each get their own colored tags you can filter by, and books can be downloaded to read offline. It has Light, Dark, Sepia and Auto themes.
 
 Everything runs on one Cloudflare Worker, a D1 database (feeds, tags, articles, books, reading positions) and a private R2 bucket (book files). The code is in the `librarykaiju/reader` repo. It all fits in the free tiers. Newsletters can also be emailed straight in (Part 6). Only you can use it: every request needs your token.
 
@@ -221,10 +221,11 @@ A migration that already ran stops with an error such as "duplicate column name"
 - YouTube, Twitch and Vimeo videos play in their own player, which has its own speed setting. They can't be downloaded, because those sites don't hand out the file.
 
 **Books**
-- **Library** → **Upload**. The menu next to it puts a tag on the new books (it starts on the tag you're looking at; **New tag…** makes one). `.txt`, `.pdf` or `.cbz`, up to 95 MB each. A comic opens one page at a time: swipe or tap the sides to turn, tap the middle to switch between whole page and page width. CBR comics need converting to CBZ first.
+- **Library** → **Upload**. The menu next to it puts a tag on the new books (it starts on the tag you're looking at; **New tag…** makes one). `.txt`, `.pdf`, `.epub` or `.cbz`, up to 95 MB each. A comic opens one page at a time: swipe or tap the sides to turn, tap the middle to switch between whole page and page width. CBR comics need converting to CBZ first.
 - The reader remembers your place in each book across devices.
+- **EPUBs** read like a `.txt`: one long scroll in the reader's font, size and theme, with the book's italics, bold, headings and pictures kept and its own fonts and layout left out. **⋯** → **Contents** lists the chapters (the one you're in is marked), and links inside the book, such as footnotes, jump to their place. Highlights and notes work the same as in a `.txt`. The title, author and series come from the EPUB itself when you upload it; renaming the book afterwards sticks. Only DRM-free EPUBs open: a store copy with copy protection (Apple Books, Kobo, Google Play, Adobe) is turned away at upload with a message saying so.
 - Plain-text books with hard line breaks every ~70 characters (like Project Gutenberg files) are joined back into normal paragraphs.
-- **Finished:** a book gets a **Finished** badge in the Library when you reach the end. For a `.txt` that's when the last line is on screen. For a PDF it's when the bottom of the last page is on screen. Scrolling back doesn't remove it.
+- **Finished:** a book gets a **Finished** badge in the Library when you reach the end. For a `.txt` or `.epub` that's when the last line is on screen (an EPUB's end is its last chapter, not notes kept after it). For a PDF it's when the bottom of the last page is on screen. Scrolling back doesn't remove it.
 - To set or clear it by hand, open the book → **⋯** → **Mark finished** or **Mark unfinished**. It's also in **Edit** on the book's row.
 - **Deleting:** open the book → **⋯** → **Delete book**, or **Edit** → **Delete** on its row. The book and its file are removed for good, from every device, along with this device's download of it.
 - **Start over:** **⋯** → **Start over** (or **Edit** → **Start over**) takes you back to the beginning and clears your saved place. A finished book keeps its badge.

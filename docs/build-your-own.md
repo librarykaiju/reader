@@ -26,7 +26,7 @@ One Cloudflare Worker serves everything: the page, the API and the email handler
 |---|---|---|
 | App and API | Worker | Page, API routes, feed fetching, email handler |
 | Database | D1 (SQLite) | Feeds, items, tags, reading positions, books' metadata |
-| Files | R2 bucket (private) | Uploaded .txt and .pdf books |
+| Files | R2 bucket (private) | Uploaded .txt, .pdf, .epub and .cbz books |
 | Newsletters | Email Routing | Forwards `news@yourdomain` into the Worker |
 | Login | Worker secret | One long random token, sent as a Bearer header |
 
@@ -48,7 +48,7 @@ Tick what you want before prompting anything:
 
 - [ ] Feeds: add a site by URL; find its RSS/Atom feed, or watch the page for changes if it has none
 - [ ] Grouping: colored **tags** for feeds (a feed can have several). Don't start with folders; the original did for feeds and books and had to convert both
-- [ ] Books: .txt and .pdf upload, book tags (kept separate from feed tags), "Finished" badge, "Start over", offline download
+- [ ] Books: .txt, .pdf and .epub upload (EPUBs unzipped and laid out in the browser), book tags (kept separate from feed tags), "Finished" badge, "Start over", offline download
 - [ ] Book details from a YAML header in .txt files (title, author, series, volume, genres)
 - [ ] Newsletters by email (sender becomes a feed; removing it blocks the sender)
 - [ ] Podcasts tab with a player bar, synced position, offline downloads
