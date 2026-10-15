@@ -8,7 +8,8 @@
 //   DB                   D1 database binding -> "reader" (tables: schema.sql)
 //   BOOKS                R2 bucket binding -> "reader-books" (kept private)
 //   READER_TOKEN         secret; any long random string, entered once on the page
-//   ANTHROPIC_API_KEY    secret, optional; turns on "Compare coverage" (see Coverage below)
+//   AI                   Workers AI binding, optional; turns on "Compare coverage" (see Coverage below)
+//   ANTHROPIC_API_KEY    secret, optional; compares with Claude instead, when there's no AI binding
 //   ALLOW_PRIVATE_FETCH  dev only: "1" lets /api/fetch reach localhost and
 //                        private IPs, for local test fixtures. Never in production.
 //
@@ -1018,10 +1019,10 @@ async function markRead(request, env) {
 // text, at a lower weight, since two outlets rarely word a headline alike).
 // No AI and nothing stored for that part.
 //
-// "Compare coverage" (POST) is the one step that costs money: the page sends
+// "Compare coverage" (POST) is the one step that uses AI: the page sends
 // each article's full text (it already fetches and extracts articles for
 // reading; feeds that only send a teaser get the page fetched), and the
-// Worker asks Claude for a digest: what the sources agree on, then what each
+// Worker asks a model for a digest: what the sources agree on, then what each
 // says that the others don't. Every one of those bullets must quote its
 // source word for word; a bullet whose quote isn't in that source's text is
 // dropped here, never shown, and the digest says how many were. The digest
@@ -1029,8 +1030,14 @@ async function markRead(request, env) {
 // articles) costs nothing; when a new source turns up, the page offers to
 // compare again.
 //
-// Needs the ANTHROPIC_API_KEY secret. Without it, matching still works and
-// the button says what to add.
+// The model is Llama 3.3 70B on Cloudflare Workers AI, through the AI
+// binding: no other account or key, and the free 10,000 Neurons a day cover
+// ten to twenty comparisons (one is roughly 500 to 1,000 Neurons).
+// Its window is 24,000 tokens, so the articles share COVERAGE_AI_CHARS
+// between them and a longer one is cut (and marked as an excerpt). Without
+// the binding, an ANTHROPIC_API_KEY secret compares with Claude instead
+// (better at this, billed by Anthropic). With neither, matching still works
+// and the button says what to add.
 
 const COVERAGE_WINDOW_MS = 2 * 24 * 60 * 60 * 1000;
 const COVERAGE_POOL = 1500;
@@ -1038,7 +1045,9 @@ const COVERAGE_MAX_SOURCES = 6;
 const COVERAGE_MIN_WORDS = 3;
 const COVERAGE_MIN_SCORE = 6;
 const COVERAGE_MAX_CHARS = 30000;
-const COVERAGE_MODEL = "claude-opus-5-5";
+const COVERAGE_AI_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+const COVERAGE_AI_CHARS = 56000;
+const COVERAGE_CLAUDE_MODEL = "claude-opus-5-5";
 
 // Title and slug words as storyTerms has them, plus words from the start of
 // the text at a quarter weight.
@@ -1124,7 +1133,7 @@ async function getCoverage(env, id) {
 		sources,
 		digest,
 		new_sources: digest ? sources.filter((s) => !covered.has(s.id)).length : 0,
-		enabled: !!env.ANTHROPIC_API_KEY,
+		enabled: !!(env.AI || env.ANTHROPIC_API_KEY),
 	});
 }
 
@@ -1133,8 +1142,8 @@ async function getCoverage(env, id) {
 // partial marks one where only the feed's teaser was to be had (a paywall,
 // or the page couldn't be fetched).
 async function compareCoverage(request, env, id) {
-	if (!env.ANTHROPIC_API_KEY)
-		throw new HttpError(501, "Comparing needs an Anthropic API key: add it to this Worker as the secret ANTHROPIC_API_KEY.");
+	if (!env.AI && !env.ANTHROPIC_API_KEY)
+		throw new HttpError(501, "Comparing needs Workers AI: add a Workers AI binding named AI to this Worker (Settings, Bindings).");
 	const body = await readJSON(request);
 	if (!Array.isArray(body.sources)) throw new HttpError(400, "sources must be an array");
 	const sent = new Map();
@@ -1157,7 +1166,7 @@ async function compareCoverage(request, env, id) {
 		.filter((s) => s && !feeds.has(s.feed_id) && feeds.add(s.feed_id))
 		.map((s) => ({ ...s, ...sent.get(s.id) }));
 	if (sources.length < 2) throw new HttpError(400, "There's only one source with text to compare");
-	const answer = await askForDigest(env, sources);
+	const { answer, model } = env.AI ? await askWorkersAI(env, sources) : await askClaude(env, sources);
 	const digest = checkDigest(answer, sources);
 	const itemIds = sources.map((s) => s.id);
 	const now = Date.now();
@@ -1165,9 +1174,9 @@ async function compareCoverage(request, env, id) {
 	await env.DB.batch([
 		env.DB.prepare("DELETE FROM coverage WHERE created_at < ?").bind(now - PRUNE_AFTER_MS),
 		env.DB.prepare(`INSERT INTO coverage (item_id, item_ids, digest, model, created_at) VALUES (?, ?, ?, ?, ?)`)
-			.bind(id, JSON.stringify(itemIds), JSON.stringify(digest), COVERAGE_MODEL, now),
+			.bind(id, JSON.stringify(itemIds), JSON.stringify(digest), model, now),
 	]);
-	return json({ digest: { ...digest, item_ids: itemIds, model: COVERAGE_MODEL, created_at: now } });
+	return json({ digest: { ...digest, item_ids: itemIds, model, created_at: now } });
 }
 
 const COVERAGE_SYSTEM = `You compare news coverage of one story from several outlets for a reader who wants to see where the outlets agree and where they differ. You get each outlet's article, numbered as a source.
@@ -1224,13 +1233,50 @@ const COVERAGE_SCHEMA = {
 	},
 };
 
-async function askForDigest(env, sources) {
+// The articles as the prompt has them. max: characters per article, past
+// which it's cut and marked as an excerpt like a paywalled one.
+function coverageDocs(sources, max = Infinity) {
 	const docs = sources
 		.map((s, i) => {
-			const partial = s.partial ? ' excerpt="yes"' : "";
-			return `<source number="${i + 1}" outlet="${attr(s.feed_title)}"${partial}>\n<headline>${s.title}</headline>\n${s.text}\n</source>`;
+			const text = s.text.length > max ? s.text.slice(0, max) : s.text;
+			const partial = s.partial || text.length < s.text.length ? ' excerpt="yes"' : "";
+			return `<source number="${i + 1}" outlet="${attr(s.feed_title)}"${partial}>\n<headline>${s.title}</headline>\n${text}\n</source>`;
 		})
 		.join("\n\n");
+	return `${docs}\n\nCompare how these sources cover the story in source 1.`;
+}
+
+async function askWorkersAI(env, sources) {
+	let out;
+	try {
+		out = await env.AI.run(COVERAGE_AI_MODEL, {
+			messages: [
+				{ role: "system", content: COVERAGE_SYSTEM },
+				{ role: "user", content: coverageDocs(sources, Math.floor(COVERAGE_AI_CHARS / sources.length)) },
+			],
+			response_format: { type: "json_schema", json_schema: COVERAGE_SCHEMA },
+			max_tokens: 3000,
+			temperature: 0.2,
+		});
+	} catch (err) {
+		const msg = String(err?.message || err);
+		if (/neuron|limit|quota|429/i.test(msg)) throw new HttpError(429, "Today's free Workers AI allowance is used up. It resets at midnight UTC.");
+		if (/JSON Mode couldn't be met/i.test(msg)) throw new HttpError(502, "The model couldn't put its answer in the right shape. Try again.");
+		throw new HttpError(502, `Workers AI failed: ${msg}`);
+	}
+	let answer = out?.response;
+	if (typeof answer === "string") {
+		try {
+			answer = JSON.parse(answer);
+		} catch {
+			throw new HttpError(502, "The model's answer wasn't readable. Try again.");
+		}
+	}
+	if (!answer || typeof answer !== "object") throw new HttpError(502, "The model gave no answer. Try again.");
+	return { answer, model: COVERAGE_AI_MODEL.replace(/^@cf\/[^/]+\//, "") };
+}
+
+async function askClaude(env, sources) {
 	let res;
 	try {
 		res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -1243,13 +1289,13 @@ async function askForDigest(env, sources) {
 				"anthropic-beta": "server-side-fallback-2026-07-01",
 			},
 			body: JSON.stringify({
-				model: COVERAGE_MODEL,
+				model: COVERAGE_CLAUDE_MODEL,
 				max_tokens: 16000,
 				fallbacks: "default",
 				thinking: { type: "adaptive" },
 				output_config: { effort: "medium", format: { type: "json_schema", schema: COVERAGE_SCHEMA } },
 				system: COVERAGE_SYSTEM,
-				messages: [{ role: "user", content: `${docs}\n\nCompare how these sources cover the story in source 1.` }],
+				messages: [{ role: "user", content: coverageDocs(sources) }],
 			}),
 		});
 	} catch (err) {
@@ -1261,7 +1307,7 @@ async function askForDigest(env, sources) {
 	if (data.stop_reason === "max_tokens") throw new HttpError(502, "The comparison ran too long and was cut off. Try again.");
 	const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
 	try {
-		return JSON.parse(text);
+		return { answer: JSON.parse(text), model: COVERAGE_CLAUDE_MODEL };
 	} catch {
 		throw new HttpError(502, "The model's answer wasn't readable. Try again.");
 	}
