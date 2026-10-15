@@ -8,6 +8,7 @@
 //   DB                   D1 database binding -> "reader" (tables: schema.sql)
 //   BOOKS                R2 bucket binding -> "reader-books" (kept private)
 //   READER_TOKEN         secret; any long random string, entered once on the page
+//   ANTHROPIC_API_KEY    secret, optional; turns on "Compare coverage" (see Coverage below)
 //   ALLOW_PRIVATE_FETCH  dev only: "1" lets /api/fetch reach localhost and
 //                        private IPs, for local test fixtures. Never in production.
 //
@@ -36,6 +37,11 @@
 //   GET    /api/items/:id          one item, with its content
 //   PATCH  /api/items/:id          {read?, saved?, content?, media_pos?, media_len?} (read covers its whole story)
 //   POST   /api/items/mark-read    {feed?, tag?}
+//   GET    /api/items/:id/coverage -> {"sources", "digest", "new_sources", "enabled"}: the article and its best
+//                                  match in each other feed from around the same time, and the newest saved digest
+//                                  covering it (null if none); new_sources counts matches that digest left out
+//   POST   /api/items/:id/coverage {sources: [{id, text}]} -> {"digest"}: compares them with Claude and saves it
+//                                  (ids from GET; text is each article's full text as the page extracted it)
 //   GET    /api/continue           -> {"episode", "book"}: the newest podcast episode part-way
 //                                  through, and the last opened book not finished (either may be null)
 //   GET    /api/media?url=         a podcast episode's file, streamed through for
@@ -180,6 +186,11 @@ async function api(request, env, url) {
 	}
 	if (p === "/api/items/mark-read" && m === "POST") return markRead(request, env);
 	if (p === "/api/continue" && m === "GET") return continueCards(env);
+	const cov = p.match(/^\/api\/items\/(\d+)\/coverage$/);
+	if (cov) {
+		if (m === "GET") return getCoverage(env, toId(cov[1]));
+		if (m === "POST") return compareCoverage(request, env, toId(cov[1]));
+	}
 	if ((id = matchId(p, "/api/items/"))) {
 		if (m === "GET") return getItem(env, id);
 		if (m === "PATCH") return updateItem(request, env, id);
@@ -997,6 +1008,341 @@ async function markRead(request, env) {
 		.bind(...params)
 		.run();
 	return json({ marked: res.meta.changes });
+}
+
+// ---------------------------------------------------------------------------
+// Coverage: the same story from several feeds, compared on request. Opening
+// an article asks GET /api/items/:id/coverage, which finds the best match in
+// each other feed from the two days either side of it, by the same title and
+// slug words as the story grouping above (plus the start of each item's
+// text, at a lower weight, since two outlets rarely word a headline alike).
+// No AI and nothing stored for that part.
+//
+// "Compare coverage" (POST) is the one step that costs money: the page sends
+// each article's full text (it already fetches and extracts articles for
+// reading; feeds that only send a teaser get the page fetched), and the
+// Worker asks Claude for a digest: what the sources agree on, then what each
+// says that the others don't. Every one of those bullets must quote its
+// source word for word; a bullet whose quote isn't in that source's text is
+// dropped here, never shown, and the digest says how many were. The digest
+// is kept in the coverage table, so opening it again (from any of its
+// articles) costs nothing; when a new source turns up, the page offers to
+// compare again.
+//
+// Needs the ANTHROPIC_API_KEY secret. Without it, matching still works and
+// the button says what to add.
+
+const COVERAGE_WINDOW_MS = 2 * 24 * 60 * 60 * 1000;
+const COVERAGE_POOL = 1500;
+const COVERAGE_MAX_SOURCES = 6;
+const COVERAGE_MIN_WORDS = 3;
+const COVERAGE_MIN_SCORE = 6;
+const COVERAGE_MAX_CHARS = 30000;
+const COVERAGE_MODEL = "claude-opus-5-5";
+
+// Title and slug words as storyTerms has them, plus words from the start of
+// the text at a quarter weight.
+function coverageTerms(it) {
+	const terms = storyTerms(it);
+	for (const w of storyWords(notesPreview(it.excerpt, 500))) if (!terms.has(w)) terms.set(w, 0.25);
+	return terms;
+}
+
+// The best match in each other feed for target (both {id, feed_id, title,
+// link, excerpt}), from pool (which may include target), best first.
+function findCoverage(target, pool) {
+	const terms = new Map(pool.map((it) => [it.id, coverageTerms(it)]));
+	if (!terms.has(target.id)) terms.set(target.id, coverageTerms(target));
+	const df = new Map();
+	for (const t of terms.values()) for (const w of t.keys()) df.set(w, (df.get(w) || 0) + 1);
+	const n = terms.size;
+	const mine = terms.get(target.id);
+	const best = new Map();
+	for (const it of pool) {
+		if (it.feed_id === target.feed_id) continue;
+		const theirs = terms.get(it.id);
+		let shared = 0, score = 0;
+		for (const [w, a] of mine) {
+			const b = theirs.get(w);
+			if (b === undefined || df.get(w) >= n) continue;
+			// Title words have to carry it: a word only in both excerpts counts, but not toward the three.
+			if (Math.max(a, b) >= 0.5) shared++;
+			score += Math.log(n / df.get(w)) * Math.min(a, b);
+		}
+		if (shared < COVERAGE_MIN_WORDS || score < COVERAGE_MIN_SCORE) continue;
+		const prev = best.get(it.feed_id);
+		if (!prev || score > prev.score) best.set(it.feed_id, { id: it.id, score });
+	}
+	return [...best.values()].sort((a, b) => b.score - a.score).slice(0, COVERAGE_MAX_SOURCES - 1);
+}
+
+const COVERAGE_SOURCE_COLUMNS = `i.id, i.feed_id, f.title AS feed_title, i.title, i.link,
+	COALESCE(i.published_at, i.created_at) AS sort_at`;
+
+async function coverageSources(env, id) {
+	const target = await env.DB.prepare(
+		`SELECT id, feed_id, title, link, substr(content, 1, 3000) AS excerpt, COALESCE(published_at, created_at) AS at
+		FROM items WHERE id = ? AND media_url IS NULL`,
+	)
+		.bind(id)
+		.first();
+	if (!target) throw new HttpError(404, "No such article");
+	const { results: pool } = await env.DB.prepare(
+		`SELECT id, feed_id, title, link, substr(content, 1, 3000) AS excerpt FROM items
+		WHERE media_url IS NULL AND COALESCE(published_at, created_at) BETWEEN ? AND ?
+		ORDER BY id DESC LIMIT ?`,
+	)
+		.bind(target.at - COVERAGE_WINDOW_MS, target.at + COVERAGE_WINDOW_MS, COVERAGE_POOL)
+		.all();
+	const ids = [id, ...findCoverage(target, pool).map((m) => m.id)];
+	if (ids.length < 2) return [];
+	const { results } = await env.DB.prepare(
+		`SELECT ${COVERAGE_SOURCE_COLUMNS} FROM items i JOIN feeds f ON f.id = i.feed_id
+		WHERE i.id IN (SELECT value FROM json_each(?))`,
+	)
+		.bind(JSON.stringify(ids))
+		.all();
+	return ids.map((x) => results.find((r) => r.id === x)).filter(Boolean);
+}
+
+// The newest digest that covers this item (from any of its articles).
+async function storedDigest(env, id) {
+	const row = await env.DB.prepare(
+		`SELECT * FROM coverage WHERE EXISTS (SELECT 1 FROM json_each(coverage.item_ids) WHERE value = ?)
+		ORDER BY created_at DESC, id DESC LIMIT 1`,
+	)
+		.bind(id)
+		.first();
+	if (!row) return null;
+	return { ...JSON.parse(row.digest), item_ids: JSON.parse(row.item_ids), model: row.model, created_at: row.created_at };
+}
+
+async function getCoverage(env, id) {
+	const [sources, digest] = await Promise.all([coverageSources(env, id), storedDigest(env, id)]);
+	const covered = new Set(digest ? digest.item_ids : []);
+	return json({
+		sources,
+		digest,
+		new_sources: digest ? sources.filter((s) => !covered.has(s.id)).length : 0,
+		enabled: !!env.ANTHROPIC_API_KEY,
+	});
+}
+
+// {sources: [{id, text, partial}]} -> {digest}. The ids are the article and
+// the matches GET found for it; the texts are what the page extracted, and
+// partial marks one where only the feed's teaser was to be had (a paywall,
+// or the page couldn't be fetched).
+async function compareCoverage(request, env, id) {
+	if (!env.ANTHROPIC_API_KEY)
+		throw new HttpError(501, "Comparing needs an Anthropic API key: add it to this Worker as the secret ANTHROPIC_API_KEY.");
+	const body = await readJSON(request);
+	if (!Array.isArray(body.sources)) throw new HttpError(400, "sources must be an array");
+	const sent = new Map();
+	for (const s of body.sources.slice(0, COVERAGE_MAX_SOURCES)) {
+		const text = typeof s?.text === "string" ? s.text.replace(/\s+\n/g, "\n").trim().slice(0, COVERAGE_MAX_CHARS) : "";
+		if (text) sent.set(toId(s.id), { text, partial: s.partial === true });
+	}
+	if (!sent.has(id)) throw new HttpError(400, "The article itself has no text to compare");
+	// Not re-matched here: saving a fetched article can change what matches,
+	// and the page compares what it showed. Articles only, one per feed.
+	const { results } = await env.DB.prepare(
+		`SELECT ${COVERAGE_SOURCE_COLUMNS} FROM items i JOIN feeds f ON f.id = i.feed_id
+		WHERE i.id IN (SELECT value FROM json_each(?)) AND i.media_url IS NULL`,
+	)
+		.bind(JSON.stringify([...sent.keys()]))
+		.all();
+	const feeds = new Set();
+	const sources = [id, ...[...sent.keys()].filter((x) => x !== id)]
+		.map((x) => results.find((r) => r.id === x))
+		.filter((s) => s && !feeds.has(s.feed_id) && feeds.add(s.feed_id))
+		.map((s) => ({ ...s, ...sent.get(s.id) }));
+	if (sources.length < 2) throw new HttpError(400, "There's only one source with text to compare");
+	const answer = await askForDigest(env, sources);
+	const digest = checkDigest(answer, sources);
+	const itemIds = sources.map((s) => s.id);
+	const now = Date.now();
+	// Digests go when their articles would (90 days).
+	await env.DB.batch([
+		env.DB.prepare("DELETE FROM coverage WHERE created_at < ?").bind(now - PRUNE_AFTER_MS),
+		env.DB.prepare(`INSERT INTO coverage (item_id, item_ids, digest, model, created_at) VALUES (?, ?, ?, ?, ?)`)
+			.bind(id, JSON.stringify(itemIds), JSON.stringify(digest), COVERAGE_MODEL, now),
+	]);
+	return json({ digest: { ...digest, item_ids: itemIds, model: COVERAGE_MODEL, created_at: now } });
+}
+
+const COVERAGE_SYSTEM = `You compare news coverage of one story from several outlets for a reader who wants to see where the outlets agree and where they differ. You get each outlet's article, numbered as a source.
+
+Rules:
+- Use only what the articles say. Add no background, no context from memory, and no judgment of which outlet is right.
+- First decide which sources are about the same story as source 1 (the one being read). Put the others in "excluded" with a short reason, and leave them out of everything else.
+- "summary": two to five sentences, as separate entries, stating only facts that at least two included sources report. List every source that reports each fact.
+- "perspectives": what one source says that the others don't. Two kinds: "differs" when it contradicts or frames a shared fact differently (a different number, cause, emphasis, or a characterization the others don't make), and "only" when it reports a detail no other included source has. Write each in plain words, naming nothing but what that source says.
+- Every perspective needs "quote": a passage copied character for character from that source's text, 8 to 40 words, that backs it up. Don't fix typos, change punctuation, or join pieces of separate sentences. If you can't quote it, leave the point out.
+- A source marked excerpt="yes" has only part of its article. Never treat it as leaving something out, and don't write "only" points about what the others have that it lacks.
+- Skip trivia: bylines, photo credits, "this story has been updated", links to other stories. Aim for the points a careful reader would want, at most four per source.
+- If the included sources are effectively the same report (one outlet republishing another's wire copy), say so in "note" and keep "perspectives" short.`;
+
+const COVERAGE_SCHEMA = {
+	type: "object",
+	additionalProperties: false,
+	required: ["headline", "excluded", "summary", "perspectives", "note"],
+	properties: {
+		headline: { type: "string", description: "A plain, neutral headline for the story." },
+		excluded: {
+			type: "array",
+			items: {
+				type: "object",
+				additionalProperties: false,
+				required: ["source", "reason"],
+				properties: { source: { type: "integer" }, reason: { type: "string" } },
+			},
+		},
+		summary: {
+			type: "array",
+			items: {
+				type: "object",
+				additionalProperties: false,
+				required: ["text", "sources"],
+				properties: { text: { type: "string" }, sources: { type: "array", items: { type: "integer" } } },
+			},
+		},
+		perspectives: {
+			type: "array",
+			items: {
+				type: "object",
+				additionalProperties: false,
+				required: ["source", "kind", "text", "quote"],
+				properties: {
+					source: { type: "integer" },
+					kind: { type: "string", enum: ["differs", "only"] },
+					text: { type: "string" },
+					quote: { type: "string" },
+				},
+			},
+		},
+		note: { type: "string", description: "Anything the reader should know about the comparison itself; empty if nothing." },
+	},
+};
+
+async function askForDigest(env, sources) {
+	const docs = sources
+		.map((s, i) => {
+			const partial = s.partial ? ' excerpt="yes"' : "";
+			return `<source number="${i + 1}" outlet="${attr(s.feed_title)}"${partial}>\n<headline>${s.title}</headline>\n${s.text}\n</source>`;
+		})
+		.join("\n\n");
+	let res;
+	try {
+		res = await fetch("https://api.anthropic.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"x-api-key": env.ANTHROPIC_API_KEY.trim(),
+				"anthropic-version": "2023-06-01",
+				// If a safety check declines, the API retries on another model by itself.
+				"anthropic-beta": "server-side-fallback-2026-07-01",
+			},
+			body: JSON.stringify({
+				model: COVERAGE_MODEL,
+				max_tokens: 16000,
+				fallbacks: "default",
+				thinking: { type: "adaptive" },
+				output_config: { effort: "medium", format: { type: "json_schema", schema: COVERAGE_SCHEMA } },
+				system: COVERAGE_SYSTEM,
+				messages: [{ role: "user", content: `${docs}\n\nCompare how these sources cover the story in source 1.` }],
+			}),
+		});
+	} catch (err) {
+		throw new HttpError(502, `Couldn't reach the Anthropic API: ${err?.message || err}`);
+	}
+	const data = await res.json().catch(() => ({}));
+	if (!res.ok) throw new HttpError(502, `The Anthropic API answered ${res.status}: ${data.error?.message || "no details"}`);
+	if (data.stop_reason === "refusal") throw new HttpError(502, "The model declined to compare these articles.");
+	if (data.stop_reason === "max_tokens") throw new HttpError(502, "The comparison ran too long and was cut off. Try again.");
+	const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
+	try {
+		return JSON.parse(text);
+	} catch {
+		throw new HttpError(502, "The model's answer wasn't readable. Try again.");
+	}
+}
+
+function attr(s) { return String(s || "").replace(/[<>"&]/g, " "); }
+
+// Keeps only what holds up: sources that exist, summary points backed by two
+// of them, and perspectives whose quote really is in that source's text.
+// Source numbers become item ids, and each kept quote gets a link to the
+// passage itself (a text fragment, which most browsers scroll to and mark).
+function checkDigest(answer, sources) {
+	const bySource = (n) => (Number.isInteger(n) && n >= 1 && n <= sources.length ? sources[n - 1] : null);
+	const excluded = [];
+	for (const e of Array.isArray(answer.excluded) ? answer.excluded : []) {
+		const s = bySource(e?.source);
+		if (s && s !== sources[0] && !excluded.some((x) => x.id === s.id)) excluded.push({ id: s.id, reason: str(e.reason, 300) || "" });
+	}
+	const out = new Set(excluded.map((e) => e.id));
+	const included = (n) => { const s = bySource(n); return s && !out.has(s.id) ? s : null; };
+	const summary = [];
+	for (const p of Array.isArray(answer.summary) ? answer.summary : []) {
+		const ids = [...new Set((Array.isArray(p?.sources) ? p.sources : []).map(included).filter(Boolean).map((s) => s.id))];
+		const text = str(p?.text, 1000);
+		if (text && ids.length >= 2) summary.push({ text, sources: ids });
+	}
+	const perspectives = [];
+	let dropped = 0;
+	for (const p of Array.isArray(answer.perspectives) ? answer.perspectives : []) {
+		const s = included(p?.source);
+		const text = str(p?.text, 1000), quote = str(p?.quote, 1000);
+		if (!s || !text || !quote || (p.kind !== "differs" && p.kind !== "only")) { dropped++; continue; }
+		const exact = findQuote(s.text, quote);
+		if (!exact) { dropped++; continue; }
+		perspectives.push({ source: s.id, kind: p.kind, text, quote: exact, link: s.link ? s.link.split("#")[0] + textFragment(exact) : null });
+	}
+	return {
+		headline: str(answer.headline, 300) || sources[0].title,
+		summary,
+		perspectives,
+		excluded,
+		note: str(answer.note, 1000) || "",
+		dropped,
+		// Names and links as they were, so the digest reads the same after an article is pruned.
+		articles: sources.map((s) => ({ id: s.id, feed_title: s.feed_title, title: s.title, link: s.link })),
+		partial: sources.filter((s) => s.partial).map((s) => s.id),
+	};
+}
+
+// Quotes are matched ignoring case, spacing, and curly-vs-straight quotes and
+// dashes; what's returned is the source's own wording.
+function foldQuote(s) {
+	return s.replace(/[‘’‚′]/g, "'").replace(/[“”„″]/g, '"').replace(/[–—−]/g, "-")
+		.replace(/ /g, " ").toLowerCase();
+}
+function findQuote(text, quote) {
+	// Fold both, keeping a map from each folded, space-collapsed character back to the original.
+	const map = [];
+	let folded = "";
+	const src = foldQuote(text);
+	for (let i = 0; i < src.length; i++) {
+		if (/\s/.test(src[i])) {
+			if (folded.endsWith(" ") || !folded) continue;
+			folded += " ";
+		} else folded += src[i];
+		map.push(i);
+	}
+	const q = foldQuote(quote).replace(/\s+/g, " ").trim().replace(/^["'….]+|["'…]+$/g, "").trim();
+	if (q.split(" ").length < 4) return null;
+	const at = folded.indexOf(q);
+	if (at < 0) return null;
+	return text.slice(map[at], map[at + q.length - 1] + 1);
+}
+
+// #:~:text=start,end for a long passage (the first and last few words), or
+// the whole thing when it's short. Commas, dashes and ampersands must be escaped.
+function textFragment(quote) {
+	const enc = (s) => encodeURIComponent(s).replace(/-/g, "%2D").replace(/,/g, "%2C");
+	const words = quote.split(/\s+/);
+	if (words.length <= 10) return "#:~:text=" + enc(quote);
+	return "#:~:text=" + enc(words.slice(0, 5).join(" ")) + "," + enc(words.slice(-5).join(" "));
 }
 
 // ---------------------------------------------------------------------------
@@ -2043,6 +2389,20 @@ const PAGE = String.raw`<!doctype html>
 	.episode video { width: 100%; max-height: 70vh; background: #000; border-radius: 6px; }
 	.episode .player { width: 100%; }
 	.episode .player iframe { display: block; width: 100%; aspect-ratio: 16 / 9; height: auto; max-height: 70vh; border: 0; border-radius: 6px; background: #000; }
+	.coverage { font: 15px/1.5 var(--sans); border: 1px solid var(--line); background: var(--card); border-radius: 12px; padding: 12px 14px; margin: -8px 0 22px; }
+	.coverage .covhead { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+	.coverage .covhead .lbl { flex: 1 1 14em; color: var(--muted); font-size: 14px; }
+	.coverage .covstatus { color: var(--muted); font-size: 14px; margin: 8px 0 0; }
+	.coverage .covstatus.err { color: var(--bad); }
+	.coverage h3 { font-size: 17px; line-height: 1.3; margin: 14px 0 2px; }
+	.coverage h4 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 16px 0 6px; }
+	.coverage h5 { font-size: 15px; margin: 12px 0 4px; }
+	.coverage ul { margin: 0; padding-left: 1.2em; }
+	.coverage li { margin: 0 0 8px; }
+	.coverage .who { color: var(--muted); font-size: 13px; white-space: nowrap; }
+	.coverage .kind { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-right: 4px; }
+	.coverage .quote { display: block; margin-top: 2px; color: var(--muted); font-size: 14px; font-style: italic; overflow-wrap: anywhere; }
+	.coverage .fine { color: var(--muted); font-size: 13px; margin: 12px 0 0; }
 	.episode .when { color: var(--muted); font-size: 14px; font-variant-numeric: tabular-nums; }
 	.btn.on { border-color: var(--accent); color: var(--accent); }
 	body.has-pbar { padding-bottom: calc(96px + env(safe-area-inset-bottom)); }
@@ -2168,6 +2528,7 @@ const PAGE = String.raw`<!doctype html>
 			<a id="aLink" class="btn small" target="_blank" rel="noopener noreferrer">Original &#8599;</a>
 		</div>
 		<div id="aEpisode" class="episode" hidden></div>
+		<section id="aCoverage" class="coverage" aria-label="Coverage in other feeds" hidden></section>
 		<div id="aBody" class="prose"></div>
 		<button id="aFull" class="btn wide" type="button" hidden>Load full article</button>
 		<nav id="aNav" class="itemnav" aria-label="Other items" hidden>
@@ -3851,6 +4212,8 @@ async function openItem(id) {
 	show($("aNav"), false);
 	show($("aEpisode"), false);
 	$("aEpisode").textContent = "";
+	show($("aCoverage"), false);
+	$("aCoverage").textContent = "";
 	var it;
 	try {
 		it = (await apiJSON("/api/items/" + id)).item;
@@ -3872,6 +4235,7 @@ async function openItem(id) {
 	var row = storyRow(it);
 	if (!it.read || (row && !row.read)) setFlags(it, { read: 1 });
 	renderItemButtons();
+	if (!it.media_url) loadCoverage(it);
 	// Copies saved before gallery slides were read kept only the first photo
 	// (and AP's "License this photo" links): fetched again once.
 	if (it.content && !(it.link && /License this photo/i.test(it.content))) {
@@ -3915,6 +4279,169 @@ async function loadFull(it) {
 		body.append(p);
 	}
 }
+// ---------- coverage
+// When other feeds carry the same story, a box above the article names them
+// and offers "Compare coverage": the Worker finds the matches (no AI), and
+// comparing sends each article's full text to it for a digest from Claude,
+// which it saves (see "Coverage" in the Worker). The text is what reading
+// the article would show: its saved copy, or for a feed that only sends a
+// teaser, the page fetched and extracted (and saved, as opening it would).
+// A saved digest opens at once, from any of the articles in it.
+
+// Under this much text, a saved copy is taken for the feed's teaser.
+var COVERAGE_PARTIAL = 1500;
+async function loadCoverage(it) {
+	var data;
+	try { data = await apiJSON("/api/items/" + it.id + "/coverage"); } catch (e) { return; }
+	if (state.item !== it) return;
+	it.coverage = data;
+	renderCoverage(it, false);
+}
+function renderCoverage(it, open, status, bad) {
+	var data = it.coverage, box = $("aCoverage");
+	box.textContent = "";
+	var others = data.sources.filter(function (s) { return s.id !== it.id; });
+	if (!others.length && !data.digest) { show(box, false); return; }
+	show(box, true);
+	var head = h("div", "covhead");
+	var lbl = h("span", "lbl", others.length ? "Also covered by " : "Compared earlier");
+	others.forEach(function (s, i) {
+		if (i) lbl.append(i === others.length - 1 ? " and " : ", ");
+		var a = h("a", null, s.feed_title);
+		a.href = "#/item/" + s.id;
+		a.title = s.title;
+		lbl.append(a);
+	});
+	head.append(lbl);
+	var busy = status && !bad;
+	if (data.digest) {
+		var toggle = h("button", "btn small", open ? "Hide digest" : "Show coverage digest");
+		toggle.type = "button";
+		toggle.disabled = busy;
+		toggle.addEventListener("click", function () { renderCoverage(it, !open); });
+		head.append(toggle);
+	}
+	if (!data.digest || data.new_sources) {
+		var go = h("button", "btn small" + (data.digest ? "" : " primary"),
+			data.digest ? "Compare again (" + data.new_sources + " new)" : "Compare coverage");
+		go.type = "button";
+		go.disabled = busy;
+		go.addEventListener("click", function () { compareCoverage(it).catch(fail); });
+		head.append(go);
+	}
+	box.append(head);
+	if (status) box.append(h("p", "covstatus" + (bad ? " err" : ""), status));
+	if (open && data.digest) box.append(digestView(data.digest));
+}
+function digestView(d) {
+	var wrap = h("div"), byId = {};
+	(d.articles || []).forEach(function (a) { byId[a.id] = a; });
+	function name(id) { return byId[id] ? byId[id].feed_title : "?"; }
+	wrap.append(h("h3", null, d.headline));
+	if (d.summary.length) {
+		wrap.append(h("h4", null, "What the sources agree on"));
+		var ul = h("ul");
+		d.summary.forEach(function (p) {
+			var li = h("li", null, p.text + " ");
+			li.append(h("span", "who", "(" + p.sources.map(name).join(", ") + ")"));
+			ul.append(li);
+		});
+		wrap.append(ul);
+	}
+	if (d.perspectives.length) {
+		wrap.append(h("h4", null, "What the sources are saying"));
+		(d.articles || []).forEach(function (a) {
+			var mine = d.perspectives.filter(function (p) { return p.source === a.id; });
+			if (!mine.length) return;
+			var h5 = h("h5"), link = h("a", null, a.feed_title);
+			link.href = "#/item/" + a.id;
+			link.title = a.title;
+			h5.append(link);
+			var ul = h("ul");
+			mine.forEach(function (p) {
+				var li = h("li");
+				li.append(h("span", "kind", p.kind === "differs" ? "Differs" : "Only here"), p.text);
+				var q = h(p.link ? "a" : "span", "quote", "“" + p.quote + "”" + (p.link ? " ↗" : ""));
+				if (p.link) { q.href = p.link; q.target = "_blank"; q.rel = "noopener noreferrer"; q.title = "Open this passage at " + a.feed_title; }
+				li.append(q);
+				ul.append(li);
+			});
+			wrap.append(h5, ul);
+		});
+	} else if (d.summary.length) {
+		wrap.append(h("p", "fine", "No source reported anything the others didn't."));
+	}
+	var fine = [];
+	if (d.note) fine.push(d.note);
+	d.excluded.forEach(function (e) { fine.push("Left out " + name(e.id) + ": " + e.reason); });
+	if (d.partial.length) fine.push("Only an excerpt was available from " + d.partial.map(name).join(", ") + ", so it can't be said to leave anything out.");
+	if (d.dropped) fine.push(d.dropped + (d.dropped === 1 ? " point was" : " points were") + " dropped because the quote backing it wasn't in the article.");
+	fine.push("Compared " + longDate(d.created_at) + " by " + d.model + ". Check the quotes before relying on a point.");
+	fine.forEach(function (t) { wrap.append(h("p", "fine", t)); });
+	return wrap;
+}
+async function compareCoverage(it) {
+	var sources = it.coverage.sources;
+	renderCoverage(it, false, "Getting the full text of " + sources.length + " articles…");
+	var texts = await Promise.all(sources.map(function (s) {
+		return articleText(s.id === it.id ? it : s.id).catch(function () { return { text: "" }; });
+	}));
+	if (state.item !== it) return;
+	renderCoverage(it, false, "Comparing " + sources.length + " sources. This can take a minute…");
+	var res;
+	try {
+		res = await apiJSON("/api/items/" + it.id + "/coverage", {
+			method: "POST",
+			json: { sources: sources.map(function (s, i) { return { id: s.id, text: texts[i].text, partial: texts[i].partial }; }) },
+		});
+	} catch (e) {
+		if (e.message === UNAUTH) throw e;
+		if (state.item === it) renderCoverage(it, !!it.coverage.digest, e.message, true);
+		return;
+	}
+	it.coverage.digest = res.digest;
+	it.coverage.new_sources = 0;
+	if (state.item === it) renderCoverage(it, true);
+}
+// An article's text for comparing, as {text, partial}: paragraphs as plain
+// text, and whether it's only the feed's teaser because the page itself
+// couldn't be fetched or had no article to find.
+async function articleText(itemOrId) {
+	var it = typeof itemOrId === "object" ? itemOrId : (await apiJSON("/api/items/" + itemOrId)).item;
+	var holder = h("div");
+	holder.append(sanitize(it.content || "", it.link || it.site_url || location.href));
+	var text = blockText(holder);
+	if (text.length >= COVERAGE_PARTIAL) return { text: text, partial: false };
+	if (!it.link) return { text: text, partial: false };
+	try {
+		var page = await proxyGet(it.link), ex = extract(page.text, page.url), full = h("div");
+		full.append(sanitize(ex.html, ex.base));
+		var more = blockText(full);
+		// Nothing found on the page means a paywall or an odd layout; the same or less, that the copy was whole.
+		if (more.length < 80) return { text: text, partial: true };
+		if (more.length <= text.length) return { text: text, partial: false };
+		var html = full.innerHTML;
+		if (html.length < 400000) {
+			it.content = html;
+			api("/api/items/" + it.id, { method: "PATCH", json: { content: html } }).catch(function () {});
+		}
+		return { text: more, partial: false };
+	} catch (e) {
+		if (e.message === UNAUTH) throw e;
+		return { text: text, partial: true };
+	}
+}
+function blockText(node) {
+	var out = [];
+	node.querySelectorAll("p, li, h1, h2, h3, h4, h5, h6, pre, td, dd").forEach(function (b) {
+		if (b.querySelector("p, li")) return;
+		var t = b.textContent.replace(/\s+/g, " ").trim();
+		if (t) out.push(t);
+	});
+	var joined = out.join("\n\n"), all = node.textContent.replace(/\s+/g, " ").trim();
+	return joined.length >= all.length * 0.6 ? joined : all;
+}
+
 // ---------- next / previous item
 // Steps through the list the article was opened from (state.items), by the
 // buttons under it, the arrow or j/k keys, or a sideways swipe. Opened
