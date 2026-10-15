@@ -20,10 +20,16 @@ database_id = "0001e946-d815-406b-8d8e-b8863b8dc2db"
 binding = "BOOKS"
 bucket_name = "reader-books"
 
+# Workers AI, for "Compare coverage" (docs/setup.md, Part 7). In the
+# dashboard: Settings -> Bindings -> Add binding -> Workers AI, name AI.
+[ai]
+binding = "AI"
+
 # Secret (not stored here) -- set with `npx wrangler secret put READER_TOKEN`:
 #   READER_TOKEN  -- any long random string; the page asks for it once per
 #                    device and sends it as a Bearer token
-#   ANTHROPIC_API_KEY -- optional; turns on "Compare coverage" (docs/setup.md, Part 7)
+#   ANTHROPIC_API_KEY -- optional; "Compare coverage" uses Claude instead,
+#                        but only when there's no AI binding (docs/setup.md, Part 7)
 #
 # Dev only (put it in .dev.vars, never in production):
 #   ALLOW_PRIVATE_FETCH = "1"  -- lets /api/fetch reach localhost/private IPs
