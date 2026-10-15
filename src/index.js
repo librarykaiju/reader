@@ -1085,7 +1085,7 @@ function findCoverage(target, pool) {
 	return [...best.values()].sort((a, b) => b.score - a.score).slice(0, COVERAGE_MAX_SOURCES - 1);
 }
 
-const COVERAGE_SOURCE_COLUMNS = `i.id, i.feed_id, f.title AS feed_title, i.title, i.link,
+const COVERAGE_SOURCE_COLUMNS = `i.id, i.feed_id, i.story_id, i.read, f.title AS feed_title, i.title, i.link,
 	COALESCE(i.published_at, i.created_at) AS sort_at`;
 
 async function coverageSources(env, id) {
@@ -2146,6 +2146,37 @@ const PAGE = String.raw`<!doctype html>
 		--ok: #3f5a12; --ok-bg: #dfe3bd;
 		color-scheme: light;
 	}
+	/* Dark themes from wr1t3r (its src/style.css), mapped onto the reader's colors. */
+	:root[data-theme=dracula] {
+		--bg: #282a36; --fg: #f8f8f2; --muted: #a3abcc; --line: #44475a; --card: #2f3241; --sel: #44475a;
+		--accent: #bd93f9; --on-accent: #282a36; --dot: #bd93f9; --bad: #ff5555; --pdf-page: #2f3241; --hl: #5d5f2a; --hl-edge: #f1fa8c;
+		--ok: #50fa7b; --ok-bg: #44475a;
+		color-scheme: dark;
+	}
+	:root[data-theme=kanagawa] {
+		--bg: #1f1f28; --fg: #dcd7ba; --muted: #c8c093; --line: #363646; --card: #2a2a37; --sel: #223249;
+		--accent: #7e9cd8; --on-accent: #1f1f28; --dot: #7e9cd8; --bad: #e46876; --pdf-page: #2a2a37; --hl: #49443c; --hl-edge: #e6c384;
+		--ok: #98bb6c; --ok-bg: #363646;
+		color-scheme: dark;
+	}
+	:root[data-theme=tokyonight] {
+		--bg: #1a1b26; --fg: #c0caf5; --muted: #a9b1d6; --line: #292e42; --card: #1f2335; --sel: #283457;
+		--accent: #7aa2f7; --on-accent: #1a1b26; --dot: #7aa2f7; --bad: #f7768e; --pdf-page: #1f2335; --hl: #3d59a1; --hl-edge: #e0af68;
+		--ok: #9ece6a; --ok-bg: #292e42;
+		color-scheme: dark;
+	}
+	:root[data-theme=gruvbox] {
+		--bg: #282828; --fg: #ebdbb2; --muted: #a89984; --line: #3c3836; --card: #32302f; --sel: #504945;
+		--accent: #fe8019; --on-accent: #282828; --dot: #fe8019; --bad: #fb4934; --pdf-page: #32302f; --hl: #5c4a1c; --hl-edge: #fabd2f;
+		--ok: #b8bb26; --ok-bg: #3c3836;
+		color-scheme: dark;
+	}
+	:root[data-theme=monokai] {
+		--bg: #272822; --fg: #f8f8f2; --muted: #a59f85; --line: #3e3d32; --card: #2f302a; --sel: #49483e;
+		--accent: #a6e22e; --on-accent: #272822; --dot: #a6e22e; --bad: #f92672; --pdf-page: #2f302a; --hl: #5b5a2e; --hl-edge: #e6db74;
+		--ok: #a6e22e; --ok-bg: #3e3d32;
+		color-scheme: dark;
+	}
 	* { box-sizing: border-box; }
 	html { -webkit-text-size-adjust: 100%; }
 	body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.45 var(--sans); }
@@ -2195,6 +2226,11 @@ const PAGE = String.raw`<!doctype html>
 	.seg button { flex: 1; border: 0; background: none; padding: 9px 4px; font-size: 14px; cursor: pointer; min-width: 0; }
 	.seg button + button { border-left: 1px solid var(--line); }
 	.seg button[aria-pressed=true] { background: var(--sel); font-weight: 600; }
+	/* The theme picker: three across, the gaps drawn as lines. */
+	.seg.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--line); }
+	.seg.grid button { background: var(--card); white-space: nowrap; }
+	.seg.grid button + button { border-left: 0; }
+	.seg.grid button[aria-pressed=true] { background: var(--sel); }
 	.menu { display: grid; gap: 8px; }
 	.txt mark.hl { background: var(--hl); color: inherit; border-radius: 2px; cursor: pointer; }
 	.txt mark.hl.noted { text-decoration: underline dotted; text-decoration-thickness: 2px; text-underline-offset: 3px; }
@@ -2343,7 +2379,8 @@ const PAGE = String.raw`<!doctype html>
 	.prose svg.chart { display: block; max-width: 100%; height: auto; margin: 1.2em 0; background: #fff; color: #222; border-radius: 6px; }
 	.prose svg.chart text { fill: currentColor; }
 	.prose svg.chart path:not([fill]), .prose svg.chart polyline:not([fill]), .prose svg.chart line { fill: none; stroke: currentColor; }
-	:root[data-theme=dark] .prose svg.chart, :root[data-theme=dark] .prose .player.chart iframe { filter: invert(.88) hue-rotate(180deg); }
+	:root[data-theme=dark] .prose svg.chart, :root[data-theme=dracula] .prose svg.chart, :root[data-theme=kanagawa] .prose svg.chart, :root[data-theme=tokyonight] .prose svg.chart, :root[data-theme=gruvbox] .prose svg.chart, :root[data-theme=monokai] .prose svg.chart,
+	:root[data-theme=dark] .prose .player.chart iframe, :root[data-theme=dracula] .prose .player.chart iframe, :root[data-theme=kanagawa] .prose .player.chart iframe, :root[data-theme=tokyonight] .prose .player.chart iframe, :root[data-theme=gruvbox] .prose .player.chart iframe, :root[data-theme=monokai] .prose .player.chart iframe { filter: invert(.88) hue-rotate(180deg); }
 	@media (prefers-color-scheme: dark) { :root:not([data-theme]) .prose svg.chart, :root:not([data-theme]) .prose .player.chart iframe { filter: invert(.88) hue-rotate(180deg); } }
 	.prose .bsky .bsky-media { margin-top: .6em; display: grid; gap: 8px; }
 	.prose .bsky .bsky-media img { display: block; }
@@ -2401,7 +2438,7 @@ const PAGE = String.raw`<!doctype html>
 	.pdfpage { position: relative; width: 100%; background: var(--pdf-page); margin: 0 auto 14px; box-shadow: 0 1px 4px rgba(0,0,0,.18); }
 	.pdfpage canvas { display: block; width: 100%; height: 100%; }
 	.pdfpage .pn { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); color: var(--muted); font-size: 14px; }
-	:root[data-theme=dark] .pdfpage canvas { filter: invert(.88) hue-rotate(180deg); }
+	:root[data-theme=dark] .pdfpage canvas, :root[data-theme=dracula] .pdfpage canvas, :root[data-theme=kanagawa] .pdfpage canvas, :root[data-theme=tokyonight] .pdfpage canvas, :root[data-theme=gruvbox] .pdfpage canvas, :root[data-theme=monokai] .pdfpage canvas { filter: invert(.88) hue-rotate(180deg); }
 	@media (prefers-color-scheme: dark) { :root:not([data-theme]) .pdfpage canvas { filter: invert(.88) hue-rotate(180deg); } }
 	:root[data-theme=sepia] .pdfpage canvas { filter: sepia(.5) brightness(.96); }
 	.cbz { display: flex; flex-direction: column; align-items: center; padding: 8px 0 24px; -webkit-user-select: none; user-select: none; }
@@ -2501,11 +2538,16 @@ const PAGE = String.raw`<!doctype html>
 
 <div id="settings" class="pop" hidden>
 	<h2>Theme</h2>
-	<div class="seg" id="themes">
+	<div class="seg grid" id="themes">
 		<button type="button" data-theme="auto">Auto</button>
 		<button type="button" data-theme="light">Light</button>
 		<button type="button" data-theme="dark">Dark</button>
 		<button type="button" data-theme="sepia">Sepia</button>
+		<button type="button" data-theme="dracula">Dracula</button>
+		<button type="button" data-theme="kanagawa">Kanagawa</button>
+		<button type="button" data-theme="tokyonight">Tokyo Night</button>
+		<button type="button" data-theme="gruvbox">Gruvbox</button>
+		<button type="button" data-theme="monokai">Monokai</button>
 	</div>
 	<h2>Text size</h2>
 	<div class="seg">
@@ -2767,9 +2809,11 @@ function bytes(n) {
 
 var fontSize = clamp(Number(read("readerFontSize")) || 19, 14, 30);
 
+// Auto follows the system; the rest are set on <html> as data-theme.
+var THEMES = ["auto", "light", "dark", "sepia", "dracula", "kanagawa", "tokyonight", "gruvbox", "monokai"];
 function applyTheme(t) {
 	var root = document.documentElement;
-	if (t === "light" || t === "dark" || t === "sepia") root.setAttribute("data-theme", t);
+	if (THEMES.indexOf(t) > 0) root.setAttribute("data-theme", t);
 	else { root.removeAttribute("data-theme"); t = "auto"; }
 	document.querySelectorAll("#themes button").forEach(function (b) { b.setAttribute("aria-pressed", String(b.dataset.theme === t)); });
 	var meta = document.querySelector("meta[name=theme-color]");
@@ -4365,7 +4409,10 @@ function renderCoverage(it, open, status, bad) {
 		var toggle = h("button", "btn small", open ? "Hide digest" : "Show coverage digest");
 		toggle.type = "button";
 		toggle.disabled = busy;
-		toggle.addEventListener("click", function () { renderCoverage(it, !open); });
+		toggle.addEventListener("click", function () {
+			if (open) readDigest(it);
+			renderCoverage(it, !open);
+		});
 		head.append(toggle);
 	}
 	if (!data.digest || data.new_sources) {
@@ -4379,6 +4426,16 @@ function renderCoverage(it, open, status, bad) {
 	box.append(head);
 	if (status) box.append(h("p", "covstatus" + (bad ? " err" : ""), status));
 	if (open && data.digest) box.append(digestView(data.digest));
+}
+// Hiding the digest marks every article it compared as read: having read
+// the comparison, there's no need to open each one.
+function readDigest(it) {
+	var data = it.coverage, byId = {};
+	data.sources.forEach(function (s) { byId[s.id] = s; });
+	(data.digest.articles || []).forEach(function (a) {
+		var x = a.id === it.id ? it : byId[a.id] || { id: a.id };
+		if (!x.read) setFlags(x, { read: 1 });
+	});
 }
 function digestView(d) {
 	var wrap = h("div"), byId = {};
