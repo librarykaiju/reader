@@ -2844,8 +2844,8 @@ const PAGE = String.raw`<!doctype html>
 	.pdfpage { position: relative; width: 100%; background: var(--pdf-page); margin: 0 auto 14px; box-shadow: 0 1px 4px rgba(0,0,0,.18); }
 	.pdfpage canvas { display: block; width: 100%; height: 100%; }
 	.pdfpage .pn { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); color: var(--muted); font-size: 14px; }
-	:root[data-theme=dark] .pdfpage canvas, :root[data-theme=dracula] .pdfpage canvas, :root[data-theme=kanagawa] .pdfpage canvas, :root[data-theme=tokyonight] .pdfpage canvas, :root[data-theme=gruvbox] .pdfpage canvas, :root[data-theme=monokai] .pdfpage canvas { filter: invert(.88) hue-rotate(180deg); }
-	@media (prefers-color-scheme: dark) { :root:not([data-theme]) .pdfpage canvas { filter: invert(.88) hue-rotate(180deg); } }
+	:root[data-theme=dark] .pdfpage canvas:not(.art), :root[data-theme=dracula] .pdfpage canvas:not(.art), :root[data-theme=kanagawa] .pdfpage canvas:not(.art), :root[data-theme=tokyonight] .pdfpage canvas:not(.art), :root[data-theme=gruvbox] .pdfpage canvas:not(.art), :root[data-theme=monokai] .pdfpage canvas:not(.art) { filter: invert(.88) hue-rotate(180deg); }
+	@media (prefers-color-scheme: dark) { :root:not([data-theme]) .pdfpage canvas:not(.art) { filter: invert(.88) hue-rotate(180deg); } }
 	:root[data-theme=sepia] .pdfpage canvas { filter: sepia(.5) brightness(.96); }
 	.cbz { display: flex; flex-direction: column; align-items: center; padding: 8px 0 24px; -webkit-user-select: none; user-select: none; }
 	.cbzpage { width: 100%; min-height: 40vh; display: flex; align-items: center; justify-content: center; cursor: pointer; touch-action: pan-y pinch-zoom; }
@@ -7598,6 +7598,11 @@ async function renderPdfPage(sess, div) {
 		if (!sess.alive || !div.want) { canvas.width = canvas.height = 0; return; }
 		var old = div.querySelector("canvas");
 		if (old) { old.width = old.height = 0; old.remove(); }
+		// Dark themes flip a page's colors so white paper turns dark. Pages
+		// that aren't mostly plain paper (covers, comics, colour art) keep
+		// their real colours.
+		if (div.art === undefined) div.art = !mostlyPaper(canvas);
+		canvas.classList.toggle("art", div.art);
 		div.appendChild(canvas);
 		div.dataset.key = key;
 	} catch (e) {
@@ -7607,6 +7612,24 @@ async function renderPdfPage(sess, div) {
 		div.task = null;
 	}
 	if (sess.alive && div.want && div.dataset.key !== div.clientWidth + "@" + dpr) renderPdfPage(sess, div);
+}
+// True when most of the page is white or near-white with little colour,
+// like printed text.
+function mostlyPaper(canvas) {
+	try {
+		var w = 40, hgt = Math.max(1, Math.round(40 * canvas.height / canvas.width));
+		var c = document.createElement("canvas");
+		c.width = w; c.height = hgt;
+		var x = c.getContext("2d", { willReadFrequently: true });
+		x.drawImage(canvas, 0, 0, w, hgt);
+		var px = x.getImageData(0, 0, w, hgt).data, paper = 0;
+		for (var i = 0; i < px.length; i += 4) {
+			var r = px[i], g = px[i + 1], b = px[i + 2], hi = Math.max(r, g, b), lo = Math.min(r, g, b);
+			if (px[i + 3] < 128 || (lo > 200 && hi - lo < 40)) paper++;
+		}
+		c.width = c.height = 0;
+		return paper / (px.length / 4) > 0.55;
+	} catch (e) { return true; }
 }
 function releasePdfPage(div) {
 	if (div.task) div.task.cancel();
