@@ -57,7 +57,8 @@
 //   GET    /api/books/:id/file     the file itself (?dl=1: saving it for offline, so not "opened")
 //   GET    /api/books/:id/part?at=&len=  len bytes of the file from byte at (up to 4 MB; for drawing a PDF's cover)
 //   GET    /api/books/:id/cover    the cover image (an EPUB's or a comic's first page is found the first time); 404 if none
-//   PUT    /api/books/:id/cover    body = a JPEG/PNG/WebP the page drew (a PDF's first page)
+//   PUT    /api/books/:id/cover    body = a JPEG/PNG/WebP: a PDF's first page the page drew, or one chosen in Edit details
+//   DELETE /api/books/:id/cover    back to the automatic cover (the file's own, or a PDF's first page)
 //   PATCH  /api/books/:id          {title?, author?, series?, volume?, position?, finished?, opened?, tags?, reread?}
 //                                  (author/series/volume: the page reads them from an EPUB's own details)
 //                                  (reread: fill the details again from a .txt's YAML header)
@@ -222,6 +223,7 @@ async function api(request, env, url) {
 	if (cover) {
 		if (m === "GET") return bookCover(env, toId(cover[1]));
 		if (m === "PUT") return putBookCover(request, env, toId(cover[1]));
+		if (m === "DELETE") return deleteBookCover(env, toId(cover[1]));
 	}
 	if ((id = matchId(p, "/api/books/"))) {
 		if (m === "PATCH") return updateBook(request, env, id);
@@ -2058,6 +2060,12 @@ async function putBookCover(request, env, id) {
 	return json({ ok: true });
 }
 
+async function deleteBookCover(env, id) {
+	await getBook(env, id);
+	await env.BOOKS.delete(coverKey(id));
+	return json({ ok: true });
+}
+
 // Reading a zip in R2 a piece at a time: its table of contents from the
 // end of the file, then just the entries wanted.
 async function r2Bytes(env, key, offset, length) {
@@ -2516,6 +2524,14 @@ const PAGE = String.raw`<!doctype html>
 	.hlquote { margin: 0 0 10px; padding: 2px 0 2px 10px; border-left: 3px solid var(--hl-edge); font: 15px/1.45 var(--serif); white-space: pre-line; overflow-wrap: anywhere; }
 	.hlpop textarea { width: 100%; box-sizing: border-box; font: 15px/1.4 var(--sans); padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); resize: vertical; }
 	.hlrow { display: flex; gap: 8px; margin-top: 10px; }
+	.details label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 10px; }
+	.details label input { margin-top: 4px; color: var(--fg); font-size: 16px; }
+	.details .drow { display: grid; grid-template-columns: 1fr 84px; gap: 10px; }
+	.details .dcover { display: flex; gap: 14px; align-items: center; margin-bottom: 12px; }
+	.details .dcover .cover { width: 84px; flex: none; margin: 0; }
+	.details .gencover { gap: 6px; padding: 12% 8%; }
+	.details .gencover .gt { font-size: 11px; }
+	.details .gencover .ga, .details .gencover .gk { display: none; }
 	.hlrow span { flex: 1; }
 	.hlitems { list-style: none; margin: 0; padding: 0; }
 	.hlitems li + li { border-top: 1px solid var(--line); }
@@ -2861,6 +2877,7 @@ const PAGE = String.raw`<!doctype html>
 		<button id="bmFind" class="btn" type="button" hidden>Search in book</button>
 		<button id="bmHighlights" class="btn" type="button" hidden>Highlights</button>
 		<button id="bmGuided" class="btn" type="button" hidden aria-pressed="false">Guided view</button>
+		<button id="bmDetails" class="btn" type="button">Edit details</button>
 		<button id="bmFinish" class="btn" type="button">Mark finished</button>
 		<button id="bmRestart" class="btn" type="button">Start over</button>
 		<button id="bmDownload" class="btn" type="button">Download for offline</button>
@@ -3023,6 +3040,31 @@ const PAGE = String.raw`<!doctype html>
 		<span></span>
 		<button id="findClose" class="btn ghost" type="button">Close</button>
 	</div>
+</div>
+<div id="detailsBox" class="pop hlpop" role="dialog" aria-label="Book details" hidden>
+	<h2>Edit details</h2>
+	<form id="detailsForm" class="details">
+		<label>Title <input id="dTitle" type="text" required maxlength="300" autocomplete="off"></label>
+		<label>Author <input id="dAuthor" type="text" maxlength="300" autocomplete="off"></label>
+		<div class="drow">
+			<label>Series <input id="dSeries" type="text" maxlength="300" autocomplete="off"></label>
+			<label>Volume <input id="dVolume" type="text" maxlength="20" autocomplete="off"></label>
+		</div>
+		<div class="dcover">
+			<div id="dCover" class="cover"></div>
+			<div class="menu">
+				<button id="dCoverPick" class="btn small" type="button">Choose image…</button>
+				<button id="dCoverAuto" class="btn small" type="button">Automatic cover</button>
+				<input id="dCoverFile" class="vh" type="file" accept="image/jpeg,image/png,image/webp" tabindex="-1" aria-hidden="true">
+			</div>
+		</div>
+		<div id="dTags"></div>
+		<div class="hlrow">
+			<button id="dCancel" class="btn ghost" type="button">Cancel</button>
+			<span></span>
+			<button id="dSave" class="btn primary" type="submit">Save</button>
+		</div>
+	</form>
 </div>
 <div id="tocList" class="pop hlpop" role="dialog" aria-label="Contents" hidden>
 	<h2>Contents</h2>
@@ -4537,6 +4579,7 @@ async function route() {
 	closeBook();
 	openSettings(false);
 	openBookMenu(false);
+	if (details) closeDetails();
 	state.item = null;
 	try {
 		if (LIST_VIEWS[r.name]) return await showList(r, prev);
@@ -6050,11 +6093,7 @@ function bookRow(b) {
 	if (state.editBooks) {
 		var t = h("div", "tools");
 		t.append(
-			button("Rename", "btn small", async function () {
-				var name = prompt("Rename book", b.title);
-				if (!name || !name.trim()) return;
-				try { await apiJSON("/api/books/" + b.id, { method: "PATCH", json: { title: name.trim() } }); await loadBooks(); } catch (e) { fail(e); }
-			}),
+			button("Edit details", "btn small", function (e) { e.stopPropagation(); openDetails(b); }),
 			button(b.finished_at ? "Mark unfinished" : "Mark finished", "btn small", async function () {
 				try { await setFinished(b, !b.finished_at); } catch (e) { fail(e); }
 				renderBooks();
@@ -6092,7 +6131,7 @@ function bookCard(b) {
 	if (pct) a.append(bar);
 	li.append(a);
 	if (coverUrls[b.id]) showCover(cov, coverUrls[b.id]);
-	else if (b.type !== "txt" && b.cover !== "none") watchCover(b, cov);
+	else if (b.cover === "yes" || (b.type !== "txt" && b.cover !== "none")) watchCover(b, cov);
 	return li;
 }
 function drawnCover(b) {
@@ -6215,6 +6254,120 @@ async function pdfCoverFromFile(b, cov) {
 		task.destroy();
 	}
 }
+// Edit details: a book's title, author, series and volume, its cover (an
+// image chosen here, drawn small, or back to the automatic one) and its tags.
+var details = null;
+function openDetails(b) {
+	details = { book: b, cover: undefined, url: null };
+	$("dTitle").value = b.title || "";
+	$("dAuthor").value = b.author || "";
+	$("dSeries").value = b.series || "";
+	$("dVolume").value = b.volume || "";
+	$("dCoverFile").value = "";
+	renderDetailsCover();
+	renderDetailsTags();
+	show($("detailsBox"), true);
+	$("dTitle").focus();
+}
+function closeDetails() {
+	if (details && details.url) URL.revokeObjectURL(details.url);
+	details = null;
+	show($("detailsBox"), false);
+}
+function renderDetailsCover() {
+	var b = details.book, c = $("dCover");
+	c.textContent = "";
+	c.append(drawnCover(Object.assign({}, b, { title: $("dTitle").value || b.title })));
+	if (details.cover) showCover(c, details.url);
+	else if (details.cover === undefined) {
+		if (coverUrls[b.id]) showCover(c, coverUrls[b.id]);
+		else if (b.cover === "yes" || (b.type !== "txt" && b.cover !== "none")) loadCover(b, c);
+	}
+	show($("dCoverAuto"), details.cover !== null && (!!details.cover || b.cover === "yes"));
+}
+function renderDetailsTags() {
+	var b = details.book, box = h("div", "chips feedtags");
+	box.setAttribute("role", "group");
+	box.setAttribute("aria-label", "Tags");
+	(state.bookTags || []).forEach(function (t) {
+		var c = button(t.name, "chip " + tagColor(t.id), function () { toggleBookTag(b, t.id).then(function () { if (details) renderDetailsTags(); }); });
+		c.setAttribute("aria-pressed", String(hasBookTag(b, t.id)));
+		box.append(c);
+	});
+	$("dTags").textContent = "";
+	$("dTags").append(box);
+}
+// A chosen image, at most 600 pixels wide, as a JPEG.
+async function coverFromImage(file) {
+	var url = URL.createObjectURL(file), img = new Image();
+	try {
+		img.src = url;
+		await img.decode();
+		var scale = Math.min(1, 600 / img.naturalWidth), canvas = document.createElement("canvas");
+		canvas.width = Math.round(img.naturalWidth * scale);
+		canvas.height = Math.round(img.naturalHeight * scale);
+		canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+		var blob = await new Promise(function (ok) { canvas.toBlob(ok, "image/jpeg", 0.85); });
+		canvas.width = canvas.height = 0;
+		if (!blob) throw new Error("Couldn't read that image.");
+		return blob;
+	} finally { URL.revokeObjectURL(url); }
+}
+async function saveDetails() {
+	var d = details, b = d.book, patch = {};
+	var vals = { title: $("dTitle").value.trim(), author: $("dAuthor").value.trim(), series: $("dSeries").value.trim(), volume: $("dVolume").value.trim() };
+	if (!vals.title) { $("dTitle").focus(); return; }
+	Object.keys(vals).forEach(function (k) { if (vals[k] !== (b[k] || "")) patch[k] = vals[k]; });
+	$("dSave").disabled = true;
+	try {
+		if (Object.keys(patch).length) {
+			var data = await apiJSON("/api/books/" + b.id, { method: "PATCH", json: patch });
+			Object.assign(b, data.book);
+			keepBookDetails(b);
+			if (session && session.book === b) { $("heading").textContent = b.title; document.title = b.title + " — Reader"; }
+		}
+		if (d.cover !== undefined) {
+			var res = await api("/api/books/" + b.id + "/cover", d.cover ? { method: "PUT", body: d.cover } : { method: "DELETE" });
+			if (!res.ok) throw new Error((await res.json().catch(function () { return {}; })).error || "HTTP " + res.status);
+			if (coverUrls[b.id]) URL.revokeObjectURL(coverUrls[b.id]);
+			delete coverUrls[b.id];
+			pdfCoverTried[b.id] = false;
+			if (d.cover) { coverUrls[b.id] = d.url; d.url = null; b.cover = "yes"; } else b.cover = null;
+		}
+		closeDetails();
+		renderBooks();
+	} catch (e) { fail(e); }
+	finally { $("dSave").disabled = false; }
+}
+$("detailsForm").addEventListener("submit", function (e) { e.preventDefault(); saveDetails(); });
+$("dCancel").addEventListener("click", closeDetails);
+$("dCoverPick").addEventListener("click", function () { $("dCoverFile").click(); });
+$("dCoverFile").addEventListener("change", async function () {
+	var file = this.files[0];
+	if (!file || !details) return;
+	try {
+		var blob = await coverFromImage(file);
+		if (details.url) URL.revokeObjectURL(details.url);
+		details.cover = blob;
+		details.url = URL.createObjectURL(blob);
+		renderDetailsCover();
+	} catch (e) { fail(new Error("Couldn't read that image.")); }
+});
+$("dCoverAuto").addEventListener("click", function () {
+	if (details.url) URL.revokeObjectURL(details.url);
+	details.url = null;
+	details.cover = details.book.cover === "yes" ? null : undefined;
+	renderDetailsCover();
+});
+$("bmDetails").addEventListener("click", function (e) {
+	e.stopPropagation();
+	openBookMenu(false);
+	if (session) openDetails(session.book);
+});
+document.addEventListener("click", function (e) {
+	if (!$("detailsBox").hidden && !$("detailsBox").contains(e.target)) closeDetails();
+});
+
 $("libLayout").addEventListener("click", function () {
 	state.libView = state.libView === "covers" ? "list" : "covers";
 	store("readerBookView", state.libView === "covers" ? "covers" : null);
