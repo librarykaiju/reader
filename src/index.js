@@ -2882,7 +2882,7 @@ const PAGE = String.raw`<!doctype html>
 			<option value="author">Author</option>
 			<option value="series">Series</option>
 		</select>
-		<button id="bookView" class="btn small" type="button" aria-pressed="false">Covers</button>
+		<button id="libLayout" class="btn small" type="button" aria-pressed="false">Covers</button>
 	</div>
 	<ul id="books" class="tree books flat"></ul>
 	<p id="booksEmpty" class="empty" hidden>No books yet. Upload a .txt, .pdf, .epub or .cbz to start.</p>
@@ -5895,9 +5895,9 @@ function renderBooks() {
 	var grid = state.libView === "covers" && !edit;
 	ul.textContent = "";
 	ul.className = grid ? "covers" : "tree books flat";
-	$("bookView").textContent = state.libView === "covers" ? "List" : "Covers";
-	$("bookView").setAttribute("aria-pressed", String(state.libView === "covers"));
-	show($("bookView"), !edit);
+	$("libLayout").textContent = state.libView === "covers" ? "List" : "Covers";
+	$("libLayout").setAttribute("aria-pressed", String(state.libView === "covers"));
+	show($("libLayout"), !edit);
 	renderBookTags();
 	if (tag != null) books = books.filter(function (b) { return hasBookTag(b, tag); });
 	var tagged = books.length;
@@ -6079,7 +6079,7 @@ async function sendPdfCover(sess) {
 		coverUrls[b.id] = URL.createObjectURL(blob);
 	} catch (e) {}
 }
-$("bookView").addEventListener("click", function () {
+$("libLayout").addEventListener("click", function () {
 	state.libView = state.libView === "covers" ? "list" : "covers";
 	store("readerBookView", state.libView === "covers" ? "covers" : null);
 	if (state.books) renderBooks();
@@ -7980,6 +7980,12 @@ async function start() {
 // Back online: send places saved while offline, and show the whole Library again.
 window.addEventListener("online", function () { if (token()) loadBooks().catch(function () {}); });
 
+// The page lives at "/" and routes by the hash. Opened at a path instead
+// (reader.example/book/12), that path is the route: #/book/12.
+if (location.pathname !== "/") {
+	var atPath = location.pathname.replace(/\/+$/, "");
+	history.replaceState(null, "", "/" + location.search + (location.hash || (atPath ? "#" + atPath : "")));
+}
 applyTheme(read("readerTheme"));
 applySize(fontSize);
 if (token()) start(); else askToken();
