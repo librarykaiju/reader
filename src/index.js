@@ -51,6 +51,8 @@
 //   PUT    /api/books?name=&tag=  body = a .txt, .pdf, .cbz or .epub file -> {"book"} (tag: a book tag id to put on it)
 //                                  (a file name already in the Library replaces that book's file: {"book", "replaced": true})
 //   GET    /api/books/:id/file     the file itself (?dl=1: saving it for offline, so not "opened")
+//   GET    /api/books/:id/cover    the cover image (an EPUB's or a comic's first page is found the first time); 404 if none
+//   PUT    /api/books/:id/cover    body = a JPEG/PNG/WebP the page drew (a PDF's first page)
 //   PATCH  /api/books/:id          {title?, author?, series?, volume?, position?, finished?, opened?, tags?, reread?}
 //                                  (author/series/volume: the page reads them from an EPUB's own details)
 //                                  (reread: fill the details again from a .txt's YAML header)
@@ -203,6 +205,11 @@ async function api(request, env, url) {
 	}
 	const file = p.match(/^\/api\/books\/(\d+)\/file$/);
 	if (file && m === "GET") return bookFile(env, toId(file[1]), url.searchParams.has("dl"));
+	const cover = p.match(/^\/api\/books\/(\d+)\/cover$/);
+	if (cover) {
+		if (m === "GET") return bookCover(env, toId(cover[1]));
+		if (m === "PUT") return putBookCover(request, env, toId(cover[1]));
+	}
 	if ((id = matchId(p, "/api/books/"))) {
 		if (m === "PATCH") return updateBook(request, env, id);
 		if (m === "DELETE") return deleteBook(env, id);
@@ -1677,10 +1684,15 @@ async function sha256Hex(bytes) {
 
 async function listBooks(env) {
 	const { results } = await env.DB.prepare(
-		`SELECT ${BOOK_COLUMNS}, (SELECT json_group_array(t.tag_id) FROM book_tag_links t WHERE t.book_id = books.id) AS tags
+		`SELECT ${BOOK_COLUMNS}, (SELECT json_group_array(t.tag_id) FROM book_tag_links t WHERE t.book_id = books.id) AS tags, r2_key
 		FROM books ORDER BY COALESCE(last_opened_at, created_at) DESC, id DESC`,
 	).all();
-	for (const b of results) b.tags = JSON.parse(b.tags || "[]");
+	const covers = await coverStates(env, new Map(results.map((b) => [b.id, b.r2_key])));
+	for (const b of results) {
+		b.tags = JSON.parse(b.tags || "[]");
+		b.cover = covers.get(b.id) || null;
+	}
+	for (const b of results) delete b.r2_key;
 	return json({ books: results });
 }
 
@@ -1887,9 +1899,191 @@ function addBookTags(env, bookId, ids) {
 
 async function deleteBook(env, id) {
 	const book = await getBook(env, id);
-	await env.BOOKS.delete(book.r2_key);
+	await env.BOOKS.delete([book.r2_key, coverKey(id)]);
 	await env.DB.prepare("DELETE FROM books WHERE id = ?").bind(id).run();
 	return json({ ok: true });
+}
+
+// Covers, kept in R2 as covers/<book id>, each tagged with the file it came
+// from (customMetadata.src = the book's r2_key), so a re-uploaded file is
+// looked at afresh. An EPUB's cover (from its package file) or a comic's
+// first page is found here the first time it's asked for, reading only the
+// zip's table of contents and that one image from R2. A PDF's is drawn by
+// the page from its first page and sent up. Finding nothing leaves an empty
+// object, so the file isn't searched again. The Library list says which
+// books have one (cover: "yes"), have none ("none"), or haven't been looked
+// at (null).
+const MAX_COVER_BYTES = 8 * 1024 * 1024;
+function coverKey(id) { return `covers/${id}`; }
+// books: id -> r2_key.
+async function coverStates(env, books) {
+	const out = new Map();
+	let cursor;
+	do {
+		const page = await env.BOOKS.list({ prefix: "covers/", cursor, include: ["customMetadata"] });
+		for (const o of page.objects) {
+			const id = Number(o.key.slice(7));
+			if (books.get(id) === o.customMetadata?.src) out.set(id, o.size > 0 ? "yes" : "none");
+		}
+		cursor = page.truncated ? page.cursor : null;
+	} while (cursor);
+	return out;
+}
+function imageType(u8) {
+	if (u8[0] === 0xff && u8[1] === 0xd8 && u8[2] === 0xff) return "image/jpeg";
+	if (u8[0] === 0x89 && u8[1] === 0x50 && u8[2] === 0x4e && u8[3] === 0x47) return "image/png";
+	if (u8[0] === 0x47 && u8[1] === 0x49 && u8[2] === 0x46) return "image/gif";
+	if (u8[8] === 0x57 && u8[9] === 0x45 && u8[10] === 0x42 && u8[11] === 0x50 && u8[0] === 0x52) return "image/webp";
+	return null;
+}
+function coverResponse(bytes, type) {
+	return new Response(bytes, {
+		headers: {
+			"Content-Type": type,
+			"Cache-Control": "private, max-age=3600",
+			"X-Content-Type-Options": "nosniff",
+			"Content-Security-Policy": "default-src 'none'; sandbox",
+		},
+	});
+}
+async function bookCover(env, id) {
+	const book = await getBook(env, id);
+	const stored = await env.BOOKS.get(coverKey(id));
+	if (stored && stored.customMetadata?.src === book.r2_key) {
+		if (!stored.size) throw new HttpError(404, "No cover");
+		return coverResponse(stored.body, stored.customMetadata.type || "image/jpeg");
+	}
+	if (stored) await stored.arrayBuffer().catch(() => {});
+	const type = bookType(book);
+	if (type !== "epub" && type !== "cbz") throw new HttpError(404, "No cover");
+	let img = null;
+	try {
+		img = await findZipCover(env, book.r2_key, book.size, type);
+	} catch (err) {
+		console.warn("cover", id, err);
+	}
+	const kind = img && imageType(img);
+	await env.BOOKS.put(coverKey(id), kind ? img : new Uint8Array(0), { customMetadata: { src: book.r2_key, type: kind || "" } });
+	if (!kind) throw new HttpError(404, "No cover");
+	return coverResponse(img, kind);
+}
+async function putBookCover(request, env, id) {
+	const book = await getBook(env, id);
+	const img = new Uint8Array(await request.arrayBuffer());
+	if (img.length > MAX_COVER_BYTES) throw new HttpError(413, "Cover too large");
+	const kind = imageType(img);
+	if (!kind || kind === "image/gif") throw new HttpError(415, "A cover must be a JPEG, PNG or WebP");
+	await env.BOOKS.put(coverKey(id), img, { customMetadata: { src: book.r2_key, type: kind } });
+	return json({ ok: true });
+}
+
+// Reading a zip in R2 a piece at a time: its table of contents from the
+// end of the file, then just the entries wanted.
+async function r2Bytes(env, key, offset, length) {
+	const obj = await env.BOOKS.get(key, { range: { offset, length } });
+	return obj ? new Uint8Array(await obj.arrayBuffer()) : null;
+}
+async function r2Zip(env, key, size) {
+	const tailLen = Math.min(size, 22 + 65535 + 20);
+	const tail = await r2Bytes(env, key, size - tailLen, tailLen);
+	if (!tail) return null;
+	const dv = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
+	let end = -1;
+	for (let i = tail.length - 22; i >= 0; i--) if (dv.getUint32(i, true) === 0x06054b50) { end = i; break; }
+	if (end < 0) return null;
+	let count = dv.getUint16(end + 10, true), cdSize = dv.getUint32(end + 12, true), cdAt = dv.getUint32(end + 16, true);
+	if ((count === 0xffff || cdAt === 0xffffffff) && end >= 20 && dv.getUint32(end - 20, true) === 0x07064b50) {
+		const z = await r2Bytes(env, key, Number(dv.getBigUint64(end - 12, true)), 56);
+		const zv = new DataView(z.buffer, z.byteOffset, z.byteLength);
+		count = Number(zv.getBigUint64(32, true));
+		cdSize = Number(zv.getBigUint64(40, true));
+		cdAt = Number(zv.getBigUint64(48, true));
+	}
+	if (cdSize > 8 * 1024 * 1024) return null;
+	const cd = await r2Bytes(env, key, cdAt, cdSize);
+	const cv = new DataView(cd.buffer, cd.byteOffset, cd.byteLength), names = new TextDecoder(), files = [];
+	for (let at = 0, n = 0; n < count && at + 46 <= cd.length && cv.getUint32(at, true) === 0x02014b50; n++) {
+		const flags = cv.getUint16(at + 8, true), method = cv.getUint16(at + 10, true);
+		let csize = cv.getUint32(at + 20, true), usize = cv.getUint32(at + 24, true), local = cv.getUint32(at + 42, true);
+		const nl = cv.getUint16(at + 28, true), xl = cv.getUint16(at + 30, true), cl = cv.getUint16(at + 32, true);
+		const name = names.decode(cd.subarray(at + 46, at + 46 + nl));
+		for (let x = at + 46 + nl; x + 4 <= at + 46 + nl + xl; ) {
+			const tag = cv.getUint16(x, true), len = cv.getUint16(x + 2, true);
+			let v = x + 4;
+			if (tag === 1) {
+				if (usize === 0xffffffff) { usize = Number(cv.getBigUint64(v, true)); v += 8; }
+				if (csize === 0xffffffff) { csize = Number(cv.getBigUint64(v, true)); v += 8; }
+				if (local === 0xffffffff) local = Number(cv.getBigUint64(v, true));
+			}
+			x += 4 + len;
+		}
+		at += 46 + nl + xl + cl;
+		if (!/\/$/.test(name)) files.push({ name, flags, method, csize, usize, local });
+	}
+	return { key, files };
+}
+async function r2ZipRead(env, zip, e) {
+	if (!e || e.flags & 1 || e.usize > MAX_COVER_BYTES || (e.method !== 0 && e.method !== 8)) return null;
+	const head = await r2Bytes(env, zip.key, e.local, 30);
+	if (!head || new DataView(head.buffer).getUint32(0, true) !== 0x04034b50) return null;
+	const skip = 30 + (head[26] | (head[27] << 8)) + (head[28] | (head[29] << 8));
+	const data = await r2Bytes(env, zip.key, e.local + skip, e.csize);
+	if (e.method === 0) return data;
+	return new Uint8Array(await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"))).arrayBuffer());
+}
+const COVER_IMAGE = /\.(jpe?g|png|gif|webp)$/i;
+async function findZipCover(env, key, size, type) {
+	const zip = await r2Zip(env, key, size);
+	if (!zip) return null;
+	const byName = (n) => zip.files.find((f) => f.name === n) || zip.files.find((f) => f.name.toLowerCase() === n.toLowerCase());
+	const images = zip.files.filter((f) => COVER_IMAGE.test(f.name) && !/(^|\/)(__MACOSX\/|\.)/.test(f.name));
+	if (type === "cbz") {
+		images.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+		return r2ZipRead(env, zip, images[0]);
+	}
+	// EPUB: container.xml names the package file, whose manifest marks the
+	// cover (EPUB 3's properties="cover-image", or EPUB 2's <meta name="cover">).
+	const text = async (e) => {
+		const b = await r2ZipRead(env, zip, e);
+		return b ? new TextDecoder().decode(b) : "";
+	};
+	const container = await text(byName("META-INF/container.xml"));
+	const opfPath = decodeXml((/<rootfile\b[^>]*\bfull-path\s*=\s*["']([^"']+)/i.exec(container) || [])[1] || "");
+	const opf = opfPath ? await text(byName(opfPath)) : "";
+	const dir = opfPath.includes("/") ? opfPath.slice(0, opfPath.lastIndexOf("/") + 1) : "";
+	const items = [...opf.matchAll(/<(?:\w+:)?item\b[^>]*>/gi)].map((m) => ({
+		id: xmlAttr(m[0], "id"), href: xmlAttr(m[0], "href"), type: xmlAttr(m[0], "media-type"), props: xmlAttr(m[0], "properties"),
+	}));
+	const metaTag = [...opf.matchAll(/<(?:\w+:)?meta\b[^>]*>/gi)].map((m) => m[0]).find((t) => /\bname\s*=\s*["']cover["']/i.test(t));
+	const metaId = metaTag && xmlAttr(metaTag, "content");
+	const isImage = (it) => it && /^image\/(jpeg|png|gif|webp)$/i.test(it.type || "") && it.href;
+	const pick = items.find((it) => /(^|\s)cover-image(\s|$)/.test(it.props || "") && isImage(it))
+		|| items.find((it) => metaId && it.id === metaId && isImage(it))
+		|| items.find((it) => isImage(it) && /cover/i.test(it.id + " " + it.href));
+	if (pick) {
+		const path = resolveZipPath(dir, pick.href);
+		const img = await r2ZipRead(env, zip, byName(path));
+		if (img) return img;
+	}
+	const named = images.find((f) => /(^|\/)cover[^/]*$/i.test(f.name));
+	return named ? r2ZipRead(env, zip, named) : null;
+}
+function decodeXml(s) {
+	return s.replace(/&(amp|lt|gt|quot|apos);/g, (_, e) => ({ amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" })[e]);
+}
+function xmlAttr(tag, name) {
+	const m = new RegExp(`\\s${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "i").exec(tag);
+	return m ? decodeXml(m[1] ?? m[2]) : null;
+}
+function resolveZipPath(dir, href) {
+	let path = href.split("#")[0];
+	try { path = decodeURIComponent(path); } catch {}
+	const out = [];
+	for (const part of (dir + path).split("/")) {
+		if (part === "..") out.pop();
+		else if (part && part !== ".") out.push(part);
+	}
+	return out.join("/");
 }
 
 // Highlights in .txt and .epub books (migration 0007). Positions count
@@ -2400,6 +2594,22 @@ const PAGE = String.raw`<!doctype html>
 	.libfind { display: flex; gap: 8px; margin: 10px 0 2px; }
 	.libfind input { flex: 1; min-width: 0; }
 	.libfind select { flex: none; }
+	.libfind .btn { flex: none; min-height: 40px; }
+	/* Covers view: a grid of covers, a drawn one where a book has none. */
+	.covers { list-style: none; margin: 14px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 20px 14px; }
+	.covers a { display: flex; flex-direction: column; gap: 3px; color: inherit; text-decoration: none; min-width: 0; }
+	.cover { position: relative; aspect-ratio: 2 / 3; border-radius: 5px; overflow: hidden; background: var(--sel); box-shadow: 0 1px 4px rgba(0,0,0,.22); margin-bottom: 5px; }
+	.cover img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; }
+	.gencover { position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: center; gap: 10px; padding: 16% 12%; text-align: center;
+		color: #fbf7ee; font-family: var(--serif); outline: 1px solid rgba(255,255,255,.35); outline-offset: -7px;
+		background-image: linear-gradient(90deg, rgba(0,0,0,.28), rgba(0,0,0,0) 7%, rgba(255,255,255,.06) 9%, rgba(0,0,0,0) 12%); }
+	.gencover .gt { font-weight: 700; font-size: 15px; line-height: 1.2; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 6; overflow: hidden; }
+	.gencover .ga { font-size: 12px; font-style: italic; opacity: .85; overflow-wrap: anywhere; }
+	.gencover .gk { position: absolute; bottom: 12px; left: 0; right: 0; font: 600 10px/1 var(--sans); letter-spacing: .08em; opacity: .6; }
+	.cover .cdone { position: absolute; top: 6px; right: 6px; margin: 0; }
+	.covers .ct { font-weight: 600; font-size: 14px; line-height: 1.25; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+	.covers .ca { font-size: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+	.covers .bar-prog { margin-top: 3px; }
 	.uploads { list-style: none; margin: 8px 0 0; padding: 0; font-size: 14px; }
 	.uploads li { padding: 4px 0; overflow-wrap: anywhere; }
 	.books .child > .row > a { flex-direction: column; align-items: stretch; gap: 2px; padding-left: 8px; }
@@ -2672,6 +2882,7 @@ const PAGE = String.raw`<!doctype html>
 			<option value="author">Author</option>
 			<option value="series">Series</option>
 		</select>
+		<button id="bookView" class="btn small" type="button" aria-pressed="false">Covers</button>
 	</div>
 	<ul id="books" class="tree books flat"></ul>
 	<p id="booksEmpty" class="empty" hidden>No books yet. Upload a .txt, .pdf, .epub or .cbz to start.</p>
@@ -2762,7 +2973,7 @@ var state = {
 	route: null, prev: null, fromList: false, lastList: "#/unread",
 	view: "unread", feed: null, tag: null,
 	episodes: [], epNext: null, epTag: null, epOffline: false, epDownloadedOnly: false, epKind: "podcasts", itemEp: null, fromPodcasts: false,
-	feeds: [], tags: [], books: null, bookTags: readJSON("readerBookTags") || [], libTag: null, libSearch: "", libSort: read("readerBookSort") || "recent",
+	feeds: [], tags: [], books: null, bookTags: readJSON("readerBookTags") || [], libTag: null, libSearch: "", libSort: read("readerBookSort") || "recent", libView: read("readerBookView") === "covers" ? "covers" : "list",
 	items: [], next: null, listKey: "", listScroll: 0, stale: true,
 	refreshing: false, errors: {}, editFeeds: false, editBooks: false, item: null
 };
@@ -5655,13 +5866,18 @@ function repaintBook(id) {
 // one is picked.
 function renderBooks() {
 	var ul = $("books"), books = state.books || [], edit = state.editBooks, tag = state.libTag;
+	var grid = state.libView === "covers" && !edit;
 	ul.textContent = "";
+	ul.className = grid ? "covers" : "tree books flat";
+	$("bookView").textContent = state.libView === "covers" ? "List" : "Covers";
+	$("bookView").setAttribute("aria-pressed", String(state.libView === "covers"));
+	show($("bookView"), !edit);
 	renderBookTags();
 	if (tag != null) books = books.filter(function (b) { return hasBookTag(b, tag); });
 	var tagged = books.length;
 	books = sortBooks(books.filter(bookMatches(state.libSearch)), state.libSort);
 	$("libTitle").textContent = tag != null ? "Library · " + (tag === 0 ? "Untagged" : (bookTagById(tag) || {}).name || "") : "Library";
-	books.forEach(function (b) { ul.append(bookRow(b)); });
+	books.forEach(function (b) { ul.append(grid ? bookCard(b) : bookRow(b)); });
 	var off = !!state.libOffline;
 	$("booksEmpty").textContent = tagged && !books.length ? "No books match “" + state.libSearch.trim() + "”."
 		: tag != null && (state.books || []).length ? "No books with this tag."
@@ -5747,6 +5963,101 @@ function bookRow(b) {
 	}
 	return li;
 }
+// The Covers view: a book's cover over its title and author. A cover comes
+// from the Worker (an EPUB's own, a comic's first page, a PDF's first page
+// once the PDF has been opened here); a .txt book, or one without, gets one
+// drawn from its title and author. Covers load as they scroll into view and
+// are kept for this visit.
+var coverUrls = {}, coverIO = null;
+var COVER_COLORS = ["#7a3b2e", "#2f4f6f", "#3d5a3a", "#5b3f6e", "#8a6a1f", "#1f5e5e", "#6b2f45", "#4a4f63", "#7b4a1c", "#35524a"];
+function bookCard(b) {
+	var li = h("li"), a = h("a"), cov = h("div", "cover");
+	a.href = "#/book/" + b.id;
+	a.setAttribute("aria-label", b.title + (b.author ? ", " + b.author : ""));
+	cov.append(drawnCover(b));
+	if (b.finished_at) cov.append(h("span", "badge cdone", "Finished"));
+	var pos = parsePos(b.position), pct = pos && pos.f ? Math.round(pos.f * 100) : 0;
+	var bar = h("div", "bar-prog"), fill = h("span");
+	fill.style.width = pct + "%";
+	bar.append(fill);
+	a.append(cov, h("span", "ct", b.title));
+	if (b.author) a.append(h("span", "ca", b.author));
+	if (pct) a.append(bar);
+	li.append(a);
+	if (coverUrls[b.id]) showCover(cov, coverUrls[b.id]);
+	else if (b.type !== "txt" && b.cover !== "none" && !(b.type === "pdf" && b.cover !== "yes")) watchCover(b, cov);
+	return li;
+}
+function drawnCover(b) {
+	var n = 0, key = (b.title || "") + (b.author || "");
+	for (var i = 0; i < key.length; i++) n = (n * 31 + key.charCodeAt(i)) >>> 0;
+	var g = h("div", "gencover");
+	g.style.backgroundColor = COVER_COLORS[n % COVER_COLORS.length];
+	g.setAttribute("aria-hidden", "true");
+	g.append(h("span", "gt", b.title));
+	if (b.author) g.append(h("span", "ga", b.author));
+	g.append(h("span", "gk", b.type.toUpperCase()));
+	return g;
+}
+function showCover(cov, url) {
+	var img = h("img");
+	img.alt = "";
+	img.decoding = "async";
+	img.src = url;
+	cov.append(img);
+}
+function watchCover(b, cov) {
+	if (!window.IntersectionObserver) return loadCover(b, cov);
+	if (!coverIO) coverIO = new IntersectionObserver(function (entries) {
+		entries.forEach(function (e) {
+			if (!e.isIntersecting) return;
+			coverIO.unobserve(e.target);
+			loadCover(e.target.book, e.target);
+		});
+	}, { rootMargin: "300px 0px" });
+	cov.book = b;
+	coverIO.observe(cov);
+}
+async function loadCover(b, cov) {
+	if (state.libOffline) return;
+	try {
+		var res = await api("/api/books/" + b.id + "/cover");
+		if (res.status === 404) { b.cover = "none"; return; }
+		if (!res.ok) return;
+		var url = coverUrls[b.id] = URL.createObjectURL(await res.blob());
+		b.cover = "yes";
+		if (cov.isConnected) showCover(cov, url);
+	} catch (e) {}
+}
+// A PDF's cover: its first page, drawn small once it's open here, if the
+// Worker doesn't have one for this file yet.
+async function sendPdfCover(sess) {
+	var b = sess.book;
+	if (b.cover === "yes" || state.libOffline || !window.HTMLCanvasElement) return;
+	try {
+		var page = await sess.pdf.doc.getPage(1), vp1 = page.getViewport({ scale: 1 });
+		var vp = page.getViewport({ scale: 360 / vp1.width }), canvas = document.createElement("canvas");
+		canvas.width = Math.floor(vp.width);
+		canvas.height = Math.floor(vp.height);
+		var ctx = canvas.getContext("2d");
+		ctx.fillStyle = "#fff";
+		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		await page.render({ canvasContext: ctx, viewport: vp }).promise;
+		var blob = await new Promise(function (ok) { canvas.toBlob(ok, "image/jpeg", 0.82); });
+		canvas.width = canvas.height = 0;
+		if (!blob) return;
+		var res = await api("/api/books/" + b.id + "/cover", { method: "PUT", body: blob });
+		if (!res.ok) return;
+		b.cover = "yes";
+		if (coverUrls[b.id]) URL.revokeObjectURL(coverUrls[b.id]);
+		coverUrls[b.id] = URL.createObjectURL(blob);
+	} catch (e) {}
+}
+$("bookView").addEventListener("click", function () {
+	state.libView = state.libView === "covers" ? "list" : "covers";
+	store("readerBookView", state.libView === "covers" ? "covers" : null);
+	if (state.books) renderBooks();
+});
 // Deletes the book and its file for good, and this device's download of it.
 async function deleteBook(b) {
 	if (!confirm("Delete “" + b.title + "”? The file is removed for good, from every device.")) return false;
@@ -6715,6 +7026,7 @@ async function openPdf(sess, pos) {
 	});
 	var page = clamp(pos.page || 1, 1, pdf.n);
 	$("progress").textContent = page + " / " + pdf.n;
+	setTimeout(function () { if (sess.alive) sendPdfCover(sess); }, 1500);
 	if (page > 1 || pos.pf > 0) aim(sess, function () {
 		var r = pages[page - 1].getBoundingClientRect();
 		return window.scrollY + r.top + (pos.pf || 0) * r.height - headerBottom();
