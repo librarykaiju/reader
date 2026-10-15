@@ -1085,7 +1085,7 @@ function findCoverage(target, pool) {
 	return [...best.values()].sort((a, b) => b.score - a.score).slice(0, COVERAGE_MAX_SOURCES - 1);
 }
 
-const COVERAGE_SOURCE_COLUMNS = `i.id, i.feed_id, f.title AS feed_title, i.title, i.link,
+const COVERAGE_SOURCE_COLUMNS = `i.id, i.feed_id, i.story_id, i.read, f.title AS feed_title, i.title, i.link,
 	COALESCE(i.published_at, i.created_at) AS sort_at`;
 
 async function coverageSources(env, id) {
@@ -4365,7 +4365,10 @@ function renderCoverage(it, open, status, bad) {
 		var toggle = h("button", "btn small", open ? "Hide digest" : "Show coverage digest");
 		toggle.type = "button";
 		toggle.disabled = busy;
-		toggle.addEventListener("click", function () { renderCoverage(it, !open); });
+		toggle.addEventListener("click", function () {
+			if (open) readDigest(it);
+			renderCoverage(it, !open);
+		});
 		head.append(toggle);
 	}
 	if (!data.digest || data.new_sources) {
@@ -4379,6 +4382,16 @@ function renderCoverage(it, open, status, bad) {
 	box.append(head);
 	if (status) box.append(h("p", "covstatus" + (bad ? " err" : ""), status));
 	if (open && data.digest) box.append(digestView(data.digest));
+}
+// Hiding the digest marks every article it compared as read: having read
+// the comparison, there's no need to open each one.
+function readDigest(it) {
+	var data = it.coverage, byId = {};
+	data.sources.forEach(function (s) { byId[s.id] = s; });
+	(data.digest.articles || []).forEach(function (a) {
+		var x = a.id === it.id ? it : byId[a.id] || { id: a.id };
+		if (!x.read) setFlags(x, { read: 1 });
+	});
 }
 function digestView(d) {
 	var wrap = h("div"), byId = {};
