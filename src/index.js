@@ -1188,7 +1188,8 @@ Rules:
 - "perspectives": what one source says that the others don't. Two kinds: "differs" when it contradicts or frames a shared fact differently (a different number, cause, emphasis, or a characterization the others don't make), and "only" when it reports a detail no other included source has. Write each in plain words, naming nothing but what that source says.
 - Every perspective needs "quote": a passage copied character for character from that source's text, 8 to 40 words, that backs it up. Don't fix typos, change punctuation, or join pieces of separate sentences. If you can't quote it, leave the point out.
 - A source marked excerpt="yes" has only part of its article. Never treat it as leaving something out, and don't write "only" points about what the others have that it lacks.
-- Skip trivia: bylines, photo credits, "this story has been updated", links to other stories. Aim for the points a careful reader would want, at most four per source.
+- Compare only the story itself. Ignore anything else on the page: lists or teasers of other stories ("Previously", "Related", "Read more"), newsletter or subscription pitches, ads, comments. Never make a point from them.
+- Skip trivia: bylines, photo credits, "this story has been updated". Aim for the points a careful reader would want, at most four per source.
 - If the included sources are effectively the same report (one outlet republishing another's wire copy), say so in "note" and keep "perspectives" short.`;
 
 const COVERAGE_SCHEMA = {
@@ -4477,15 +4478,29 @@ async function articleText(itemOrId) {
 		return { text: text, partial: true };
 	}
 }
+// The article's text, a paragraph per block, for comparing. Leaves out what
+// a page hangs on the end of a story: "Previously:" and "Related" lists, and
+// teasers for other posts ("... READ THE REST"), so they aren't compared.
+var OTHER_STORIES = /^(previously|related( stories| posts| articles| coverage| reading)?|more (from|on|stories)\b[^:]{0,40}|read (more|next|this next)|see also|further reading|recommended( for you| reading)?|you (may|might) also like|trending|popular)\s*:/i;
+var TEASER_END = /(read the rest|read more|continue reading|keep reading|full story)\W*$/i;
 function blockText(node) {
-	var out = [];
+	var out = [], seen = 0;
 	node.querySelectorAll("p, li, h1, h2, h3, h4, h5, h6, pre, td, dd").forEach(function (b) {
 		if (b.querySelector("p, li")) return;
 		var t = b.textContent.replace(/\s+/g, " ").trim();
-		if (t) out.push(t);
+		if (!t) return;
+		seen += t.length;
+		if (OTHER_STORIES.test(t) || TEASER_END.test(t) || linkShare(b, t) >= 0.6) return;
+		out.push(t);
 	});
 	var joined = out.join("\n\n"), all = node.textContent.replace(/\s+/g, " ").trim();
-	return joined.length >= all.length * 0.6 ? joined : all;
+	return seen >= all.length * 0.6 ? joined : all;
+}
+// How much of a block's text is link text: a list of links to other posts is nearly all.
+function linkShare(b, t) {
+	var n = 0;
+	b.querySelectorAll("a").forEach(function (a) { n += a.textContent.replace(/\s+/g, " ").trim().length; });
+	return t.length > 0 ? n / t.length : 0;
 }
 
 // ---------- next / previous item
