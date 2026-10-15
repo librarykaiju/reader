@@ -4309,12 +4309,38 @@ async function loadItems(append, keepScroll) {
 	if (!append && !state.items.length) { $("empty").textContent = "Loading…"; show($("empty"), true); }
 	var data = await apiJSON("/api/items?" + q);
 	if (seq !== loadSeq) return;
+	if (!append) {
+		await untouched();
+		if (seq !== loadSeq) return;
+	}
 	state.items = append ? state.items.concat(data.items) : data.items;
 	state.next = data.next;
 	state.listKey = listKeyNow();
 	state.stale = false;
 	renderItems();
 	if (keepScroll) window.scrollTo(0, y);
+}
+// A fresh list (after a refresh, or coming back to a list that changed) waits
+// while a finger is on the screen and a moment after it lifts. Swapping the
+// rows mid-tap loses the tap: Safari drops a tap when the page changes under
+// it, and the row that was there is gone.
+var touchDown = 0, touchUp = 0;
+["touchstart", "pointerdown"].forEach(function (t) {
+	document.addEventListener(t, function (e) { if (t === "touchstart" || e.pointerType !== "mouse") touchDown = Date.now(); }, { capture: true, passive: true });
+});
+["touchend", "touchcancel", "pointerup", "pointercancel"].forEach(function (t) {
+	document.addEventListener(t, function () { touchUp = Date.now(); }, { capture: true, passive: true });
+});
+function untouched() {
+	return new Promise(function (done) {
+		(function check() {
+			var now = Date.now();
+			if (touchDown > touchUp && now - touchDown < 5000) return setTimeout(check, 100);
+			var wait = touchUp + 500 - now;
+			if (wait > 0) return setTimeout(check, wait);
+			done();
+		})();
+	});
 }
 function listKeyNow() { return state.view + "|" + state.feed + "|" + state.tag; }
 function renderListTitle() {
@@ -4458,7 +4484,7 @@ async function showList(r, prev) {
 	}
 	if (!back) { window.scrollTo(0, 0); state.items = []; }
 	await loadItems(false);
-	if (back) window.scrollTo(0, state.listScroll);
+	if (back && state.route === r) window.scrollTo(0, state.listScroll);
 }
 // Continue listening / Continue reading, atop Unread and All (not a feed or
 // tag): the episode part-way through (the one last played on this device if
