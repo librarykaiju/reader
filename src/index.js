@@ -2248,6 +2248,11 @@ const PAGE = String.raw`<!doctype html>
 	.hlq { font: 15px/1.4 var(--serif); display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; line-clamp: 4; overflow: hidden; border-left: 3px solid var(--hl-edge); padding-left: 8px; }
 	.hln { font-size: 14px; }
 	.hlm { font-size: 13px; color: var(--bad); }
+	.findform { margin-bottom: 4px; }
+	.findq { font: 15px/1.4 var(--serif); overflow-wrap: anywhere; }
+	.findq mark { background: var(--hl); color: inherit; border-radius: 2px; }
+	.findwhere { font-size: 13px; color: var(--muted); }
+	::highlight(find) { background-color: var(--hl-edge); color: var(--bg); }
 	.seg .val { flex: 0 0 56px; display: grid; place-items: center; font-variant-numeric: tabular-nums; border-left: 1px solid var(--line); border-right: 1px solid var(--line); font-size: 14px; }
 
 	.wrap { max-width: 1100px; margin: 0 auto; padding: 0 16px 64px; }
@@ -2562,6 +2567,7 @@ const PAGE = String.raw`<!doctype html>
 	<h2>This book</h2>
 	<div class="menu">
 		<button id="bmContents" class="btn" type="button" hidden>Contents</button>
+		<button id="bmFind" class="btn" type="button" hidden>Search in book</button>
 		<button id="bmHighlights" class="btn" type="button" hidden>Highlights</button>
 		<button id="bmGuided" class="btn" type="button" hidden aria-pressed="false">Guided view</button>
 		<button id="bmFinish" class="btn" type="button">Mark finished</button>
@@ -2711,6 +2717,19 @@ const PAGE = String.raw`<!doctype html>
 		<button id="hlExport" class="btn" type="button">Export Markdown</button>
 		<span></span>
 		<button id="hlListClose" class="btn ghost" type="button">Close</button>
+	</div>
+</div>
+<div id="findList" class="pop hlpop" role="dialog" aria-label="Search in book" hidden>
+	<h2>Search in book</h2>
+	<form id="findForm" class="findform">
+		<label class="vh" for="findQ">Words to find</label>
+		<input id="findQ" type="search" placeholder="Words to find" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="search">
+	</form>
+	<p id="findStatus" class="hint" hidden></p>
+	<ul id="findItems" class="hlitems"></ul>
+	<div class="hlrow">
+		<span></span>
+		<button id="findClose" class="btn ghost" type="button">Close</button>
 	</div>
 </div>
 <div id="tocList" class="pop hlpop" role="dialog" aria-label="Contents" hidden>
@@ -5860,6 +5879,10 @@ function closeBook() {
 	s.alive = false;
 	flushPosition(s);
 	s.cleanup.forEach(function (fn) { try { fn(); } catch (e) {} });
+	showFind(false);
+	$("findQ").value = "";
+	$("findItems").textContent = "";
+	findStatus("");
 	$("bookBody").textContent = "";
 	document.title = "Reader";
 }
@@ -5895,6 +5918,7 @@ function renderBookMenu() {
 	var n = session.hl ? session.hl.list.length : 0;
 	show($("bmContents"), b.type === "epub" && !!(session.epub && session.epub.toc.length));
 	show($("bmHighlights"), b.type === "txt" || b.type === "epub");
+	show($("bmFind"), b.type === "txt" || b.type === "epub" || b.type === "pdf");
 	$("bmHighlights").textContent = n ? "Highlights (" + n + ")" : "Highlights";
 	show($("bmGuided"), b.type === "cbz");
 	$("bmGuided").textContent = "Guided view: " + (guidedOn() ? "on" : "off");
@@ -6437,6 +6461,191 @@ document.addEventListener("click", function (e) {
 	if (!$("hlList").hidden && !$("hlList").contains(e.target)) showHlList(false);
 });
 
+// ---------- search in a book
+// "Search in book" in the book menu: every place the words turn up in the
+// open .txt, .epub or .pdf, ignoring case and accents, each with the text
+// around it. Tap one to go there; in a .txt or .epub the words light up for
+// a few seconds. A PDF's text is read a page at a time and kept for the
+// next search. Comics have no text to search.
+
+var FIND_SHOW = 300, FIND_COUNT = 5000, FIND_AROUND = 70;
+var findRun = 0, findTimer = null, findLit = null;
+
+// s folded for searching (fold(), whitespace as single spaces), with where
+// in s each folded character came from.
+function foldMap(s) {
+	var out = [], from = [];
+	for (var i = 0; i < s.length; i++) {
+		var c = s.charCodeAt(i) < 128 ? s[i].toLowerCase() : fold(s[i]);
+		for (var j = 0; j < c.length; j++) { out.push(/\s/.test(c[j]) ? " " : c[j]); from.push(i); }
+	}
+	return { s: out.join(""), from: from };
+}
+function findQuery(q) { return fold(q).replace(/\s+/g, " ").trim(); }
+// Every place q turns up in a folded string, as [start, end) in the original.
+function findIn(m, q, limit) {
+	var hits = [];
+	for (var k = m.s.indexOf(q); k >= 0 && hits.length < limit; k = m.s.indexOf(q, k + q.length))
+		hits.push([m.from[k], m.from[k + q.length - 1] + 1]);
+	return hits;
+}
+function findSnippet(text, a, b) {
+	var from = Math.max(0, a - FIND_AROUND), to = Math.min(text.length, b + FIND_AROUND);
+	if (from > 0) { var sp = text.indexOf(" ", from); if (sp > 0 && sp < a) from = sp + 1; }
+	if (to < text.length) { var sp2 = text.lastIndexOf(" ", to); if (sp2 > b) to = sp2; }
+	var q = h("span", "findq");
+	q.append((from > 0 ? "…" : "") + text.slice(from, a).replace(/\s+/g, " "), h("mark", null, text.slice(a, b)),
+		text.slice(b, to).replace(/\s+/g, " ") + (to < text.length ? "…" : ""));
+	return q;
+}
+function openFind() {
+	var sess = session;
+	if (!sess) return;
+	openBookMenu(false);
+	show($("findList"), true);
+	var q = $("findQ");
+	q.focus();
+	q.select();
+	if (q.value.trim() && sess.findFor !== q.value) runFind();
+}
+function showFind(on) {
+	show($("findList"), on);
+	if (!on) findRun++;
+}
+function findStatus(text) {
+	$("findStatus").textContent = text || "";
+	show($("findStatus"), !!text);
+}
+async function runFind() {
+	var sess = session, run = ++findRun, raw = $("findQ").value, q = findQuery(raw), ul = $("findItems");
+	if (!sess) return;
+	ul.textContent = "";
+	sess.findFor = raw;
+	if (!q) { findStatus(""); return; }
+	var total = 0, shown = 0;
+	function add(snippet, where, go) {
+		total++;
+		if (shown >= FIND_SHOW) return;
+		shown++;
+		var li = h("li"), btn = h("button", "hlgo");
+		btn.type = "button";
+		btn.append(snippet, h("span", "findwhere", where));
+		btn.addEventListener("click", function () { showFind(false); go(); });
+		li.append(btn);
+		ul.append(li);
+	}
+	function done() {
+		findStatus(!total ? "Nothing found for “" + raw.trim() + "”."
+			: (total >= FIND_COUNT ? "At least " + FIND_COUNT.toLocaleString() + " places" : total.toLocaleString() + (total === 1 ? " place" : " places"))
+				+ (total > shown ? ", the first " + shown + " listed." : "."));
+	}
+	if (sess.txt) {
+		var t = sess.txt, m = t.folded || (t.folded = foldMap(fullText(t)));
+		findIn(m, q, FIND_COUNT).forEach(function (hit) {
+			var i = paraAt(t, hit[0]), base = t.starts[i];
+			add(findSnippet(t.paras[i], hit[0] - base, hit[1] - base), Math.round(hit[0] / t.total * 100) + "%",
+				function () { findJump(sess, hit[0], hit[1]); });
+		});
+		return done();
+	}
+	if (sess.pdf) {
+		var pdf = sess.pdf;
+		pdf.texts = pdf.texts || [];
+		for (var n = 1; n <= pdf.n && total < FIND_COUNT; n++) {
+			if (!pdf.texts[n]) {
+				findStatus("Searching… page " + n + " of " + pdf.n);
+				try { pdf.texts[n] = await pdfPageText(pdf, n); } catch (e) { pdf.texts[n] = { text: "", items: [], m: foldMap("") }; }
+				if (run !== findRun || !sess.alive) return;
+			}
+			var pt = pdf.texts[n];
+			findIn(pt.m, q, FIND_COUNT - total).forEach(function (hit) {
+				var at = pdfItemAt(pt, hit[0]), page = n;
+				add(findSnippet(pt.text, hit[0], hit[1]), "Page " + page, function () { pdfFindJump(sess, page, at ? at.y : 0); });
+			});
+		}
+		if (!total && pdf.texts.slice(1).every(function (x) { return !x.text.trim(); }))
+			return findStatus("This PDF has no text to search: its pages are images.");
+		return done();
+	}
+	findStatus("This book has no text to search.");
+}
+// A PDF page's text, with where each piece starts and how far down the page
+// it sits (0 top, 1 bottom).
+async function pdfPageText(pdf, n) {
+	var page = await pdf.doc.getPage(n), vp = page.getViewport({ scale: 1 }), tc = await page.getTextContent();
+	var text = "", items = [];
+	tc.items.forEach(function (it) {
+		if (typeof it.str !== "string") return;
+		var y = it.transform ? vp.convertToViewportPoint(it.transform[4], it.transform[5])[1] / vp.height : 0;
+		items.push({ at: text.length, y: clamp(y, 0, 1) });
+		text += it.str + (it.hasEOL ? "\n" : "");
+	});
+	return { text: text, items: items, m: foldMap(text) };
+}
+function pdfItemAt(pt, pos) {
+	var lo = 0, hi = pt.items.length - 1;
+	if (hi < 0) return null;
+	while (lo < hi) { var mid = (lo + hi + 1) >> 1; if (pt.items[mid].at <= pos) lo = mid; else hi = mid - 1; }
+	return pt.items[lo];
+}
+function pdfFindJump(sess, n, y) {
+	var div = sess.pdf.pages[n - 1];
+	aim(sess, function () {
+		var r = div.getBoundingClientRect();
+		return window.scrollY + r.top + y * r.height - headerBottom() - window.innerHeight * 0.3;
+	}, sess.track);
+	// Save where it landed, but a jump to the last page isn't reading to the end.
+	setTimeout(function () {
+		if (!sess.alive || sess.restoring) return;
+		sess.quietEnd = true;
+		sess.track();
+		sess.quietEnd = false;
+	}, 400);
+}
+// The words [a, b) of the text as a Range inside paragraph p, which starts at base.
+function findRange(p, a, b) {
+	var walk = document.createTreeWalker(p, NodeFilter.SHOW_TEXT), n, at = 0, r = document.createRange(), started = false;
+	while ((n = walk.nextNode())) {
+		var len = n.data.length;
+		if (!started && a < at + len) { r.setStart(n, a - at); started = true; }
+		if (started && b <= at + len) { r.setEnd(n, b - at); return r; }
+		at += len;
+	}
+	return null;
+}
+function findJump(sess, a, b) {
+	var t = sess.txt, i = paraAt(t, a), p = paraEl(t, i), base = t.starts[i];
+	aim(sess, function () {
+		var r = findRange(p, a - base, b - base), box = r && r.getClientRects()[0];
+		var top = box && box.height ? box.top : p.getBoundingClientRect().top;
+		return window.scrollY + top - headerBottom() - window.innerHeight * 0.3;
+	}, sess.track);
+	sess.jumpedTo = -1;
+	setTimeout(function () {
+		if (!sess.alive) return;
+		if (sess.track) { sess.jumpedTo = window.scrollY; sess.track(); }
+		findLight(findRange(p, a - base, b - base));
+	}, 400);
+}
+// Light up the found words for a few seconds (the CSS Custom Highlight API,
+// so the page's own markup is left alone; where that's missing, nothing lights up).
+function findLight(range) {
+	if (!range || !window.CSS || !CSS.highlights || typeof Highlight !== "function") return;
+	clearTimeout(findLit);
+	CSS.highlights.set("find", new Highlight(range));
+	findLit = setTimeout(function () { CSS.highlights.delete("find"); }, 4000);
+}
+$("bmFind").addEventListener("click", function (e) { e.stopPropagation(); openFind(); });
+$("findForm").addEventListener("submit", function (e) { e.preventDefault(); clearTimeout(findTimer); runFind(); });
+$("findQ").addEventListener("input", function () {
+	clearTimeout(findTimer);
+	findTimer = setTimeout(runFind, session && session.pdf ? 600 : 250);
+});
+$("findClose").addEventListener("click", function () { showFind(false); });
+document.addEventListener("click", function (e) {
+	if (!$("findList").hidden && !$("findList").contains(e.target)) showFind(false);
+});
+
 // ---------- .pdf reader (pdf.js, loaded only when a PDF is opened)
 
 var pdfjsLoading = null;
@@ -6495,8 +6704,9 @@ async function openPdf(sess, pos) {
 		var c = pdfCurrent(pdf);
 		savePosition(sess, { page: c.page, pf: Math.round(c.within * 1000) / 1000, pages: pdf.n, f: Math.round((c.page - 1 + c.within) / pdf.n * 1e4) / 1e4 },
 			c.page + " / " + pdf.n);
-		checkEnd(sess, pages[pages.length - 1]);
+		if (!sess.quietEnd) checkEnd(sess, pages[pages.length - 1]);
 	};
+	sess.track = track;
 	listen(sess, window, "scroll", onScrollFrame(track), { passive: true });
 	var resizeTimer;
 	listen(sess, window, "resize", function () {
