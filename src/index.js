@@ -41,10 +41,11 @@
 //   GET    /api/media?url=         a podcast episode's file, streamed through for
 //                                  downloading (podcast hosts rarely allow CORS)
 //   GET    /api/books              -> {"books": [...each with tags: [book tag ids]]}
-//   PUT    /api/books?name=&tag=  body = a .txt, .pdf or .cbz file -> {"book"} (tag: a book tag id to put on it)
+//   PUT    /api/books?name=&tag=  body = a .txt, .pdf, .cbz or .epub file -> {"book"} (tag: a book tag id to put on it)
 //                                  (a file name already in the Library replaces that book's file: {"book", "replaced": true})
 //   GET    /api/books/:id/file     the file itself (?dl=1: saving it for offline, so not "opened")
-//   PATCH  /api/books/:id          {title?, position?, finished?, opened?, tags?, reread?}
+//   PATCH  /api/books/:id          {title?, author?, series?, volume?, position?, finished?, opened?, tags?, reread?}
+//                                  (author/series/volume: the page reads them from an EPUB's own details)
 //                                  (reread: fill the details again from a .txt's YAML header)
 //                                  (position null = start over)
 //   DELETE /api/books/:id          also deletes the file from R2
@@ -73,14 +74,14 @@ const PRUNE_AFTER_MS = 90 * 24 * 60 * 60 * 1000;
 // Email Routing itself takes up to 25MB; newsletters are far smaller.
 const MAX_EMAIL_BYTES = 10 * 1024 * 1024;
 
-const BOOK_TYPES = { txt: "text/plain; charset=utf-8", pdf: "application/pdf", cbz: "application/vnd.comicbook+zip" };
-// A CBZ comic (a zip of page images) is saved with type 'pdf', because the
-// live books table only allows 'txt' and 'pdf' and changing that means
-// rebuilding the table. Its .cbz file name is what marks it, so the type
-// read back from the database comes from that.
-const BOOK_TYPE = "CASE WHEN filename LIKE '%.cbz' THEN 'cbz' ELSE type END";
-function storedType(ext) { return ext === "cbz" ? "pdf" : ext; }
-function bookType(book) { return /\.cbz$/i.test(book.filename) ? "cbz" : book.type; }
+const BOOK_TYPES = { txt: "text/plain; charset=utf-8", pdf: "application/pdf", cbz: "application/vnd.comicbook+zip", epub: "application/epub+zip" };
+// A CBZ comic (a zip of page images) or an EPUB is saved with type 'pdf',
+// because the live books table only allows 'txt' and 'pdf' and changing that
+// means rebuilding the table. Its .cbz or .epub file name is what marks it,
+// so the type read back from the database comes from that.
+const BOOK_TYPE = "CASE WHEN filename LIKE '%.cbz' THEN 'cbz' WHEN filename LIKE '%.epub' THEN 'epub' ELSE type END";
+function storedType(ext) { return ext === "cbz" || ext === "epub" ? "pdf" : ext; }
+function bookType(book) { const m = /\.(cbz|epub)$/i.exec(book.filename); return m ? m[1].toLowerCase() : book.type; }
 // Every book column but r2_key, which never leaves the Worker.
 const BOOK_COLUMNS = `id, title, filename, ${BOOK_TYPE} AS type, size, position, finished_at, created_at, last_opened_at, author, series, volume`;
 // An item with a media file is a podcast episode, or a video if the file is
@@ -1294,7 +1295,7 @@ async function uploadBook(request, env, url) {
 	const filename = (url.searchParams.get("name") || "").split(/[\\/]/).pop().trim().slice(0, 300);
 	const dot = filename.lastIndexOf(".");
 	const ext = dot > 0 ? filename.slice(dot + 1).toLowerCase() : "";
-	if (!BOOK_TYPES[ext]) throw new HttpError(415, "Only .txt, .pdf and .cbz files");
+	if (!BOOK_TYPES[ext]) throw new HttpError(415, "Only .txt, .pdf, .cbz and .epub files");
 	const tagParam = url.searchParams.get("tag");
 	const uploadTags = tagParam ? await tagRefs(env, [tagParam], TAGS.books) : [];
 
@@ -1382,6 +1383,11 @@ async function updateBook(request, env, id) {
 		if (!title) throw new HttpError(400, "title can't be empty");
 		sets.push("title = ?");
 		params.push(title);
+	}
+	for (const key of ["author", "series", "volume"]) {
+		if (body[key] === undefined) continue;
+		sets.push(key + " = ?");
+		params.push(str(body[key], 300));
 	}
 	if (body.position !== undefined) {
 		const pos = body.position === null ? null : String(body.position);
@@ -1493,9 +1499,9 @@ async function deleteBook(env, id) {
 	return json({ ok: true });
 }
 
-// Highlights in .txt books (migration 0007). Positions count characters in
-// the text after any YAML header, as the page splits it; the page does the
-// matching, the server only keeps them.
+// Highlights in .txt and .epub books (migration 0007). Positions count
+// characters in the text after any YAML header (an EPUB: in its text, as the
+// page lays it out); the page does the matching, the server only keeps them.
 const HIGHLIGHT_COLUMNS = "id, book_id, start_pos, end_pos, text, note, created_at, updated_at";
 const MAX_HIGHLIGHT_CHARS = 20000;
 const MAX_NOTE_CHARS = 10000;
@@ -1527,7 +1533,7 @@ async function addHighlight(request, env, bookId) {
 	if (typeof body.text !== "string" || !body.text.trim()) throw new HttpError(400, "text is needed");
 	if (body.text.length > MAX_HIGHLIGHT_CHARS) throw new HttpError(413, "That highlight is too long");
 	const book = await getBook(env, bookId);
-	if (/\.(pdf|cbz)$/i.test(book.filename)) throw new HttpError(400, "Highlights are for .txt books");
+	if (/\.(pdf|cbz)$/i.test(book.filename)) throw new HttpError(400, "Highlights are for .txt and .epub books");
 	const now = Date.now();
 	const highlight = await env.DB.prepare(
 		`INSERT INTO highlights (book_id, start_pos, end_pos, text, note, created_at, updated_at)
@@ -1978,6 +1984,26 @@ const PAGE = String.raw`<!doctype html>
 	.txt { max-width: 68ch; margin: 0 auto; padding: 24px 16px 45vh; font-family: var(--serif); font-size: var(--reader-size); line-height: 1.65; overflow-wrap: break-word; }
 	.txt p { margin: 0 0 .9em; white-space: pre-line; }
 	.txt .chunk { content-visibility: auto; contain-intrinsic-size: auto 1500px; }
+	/* An EPUB's blocks: the book's own styles aren't used, only its structure. */
+	.epub .chunk > * { margin: 0 0 .9em; }
+	.epub p { white-space: normal; }
+	.epub .chunk > .estart { margin-top: 3em; }
+	.epub h1, .epub h2, .epub h3, .epub h4, .epub h5, .epub h6 { line-height: 1.25; margin: 1.2em 0 .6em; }
+	.epub h1 { font-size: 1.6em; } .epub h2 { font-size: 1.35em; } .epub h3 { font-size: 1.15em; } .epub h4, .epub h5, .epub h6 { font-size: 1em; }
+	.epub .ec { text-align: center; } .epub .er { text-align: right; }
+	.epub img { max-width: 100%; height: auto; vertical-align: middle; }
+	.epub .eimg { text-align: center; }
+	.epub .eimg img { max-height: 85vh; }
+	.epub blockquote { margin-left: 1.2em; margin-right: 0; }
+	.epub ul, .epub ol { padding-left: 1.4em; }
+	.epub li { margin: .2em 0; }
+	.epub pre { white-space: pre-wrap; font-size: .85em; }
+	.epub table { display: block; overflow-x: auto; border-collapse: collapse; }
+	.epub td, .epub th { padding: 2px 8px; vertical-align: top; }
+	.epub hr { border: 0; border-top: 1px solid var(--line); margin: 1.5em 25%; }
+	.epub sup, .epub sub { line-height: 0; }
+	.tocgo { display: block; width: 100%; text-align: left; background: none; border: 0; padding: 9px 0; color: inherit; cursor: pointer; font: 15px/1.35 var(--sans); }
+	.tocgo[aria-current=true] { font-weight: 700; color: var(--accent); }
 	.pdf { max-width: 920px; margin: 0 auto; padding: 16px 16px 45vh; }
 	.pdfpage { position: relative; width: 100%; background: var(--pdf-page); margin: 0 auto 14px; box-shadow: 0 1px 4px rgba(0,0,0,.18); }
 	.pdfpage canvas { display: block; width: 100%; height: 100%; }
@@ -2086,6 +2112,7 @@ const PAGE = String.raw`<!doctype html>
 <div id="bookMenu" class="pop" hidden>
 	<h2>This book</h2>
 	<div class="menu">
+		<button id="bmContents" class="btn" type="button" hidden>Contents</button>
 		<button id="bmHighlights" class="btn" type="button" hidden>Highlights</button>
 		<button id="bmGuided" class="btn" type="button" hidden aria-pressed="false">Guided view</button>
 		<button id="bmFinish" class="btn" type="button">Mark finished</button>
@@ -2173,8 +2200,8 @@ const PAGE = String.raw`<!doctype html>
 			<select id="uploadTag"></select>
 			<button id="uploadBtn" class="btn primary" type="button">Upload</button>
 		</div>
-		<input id="bookFile" class="vh" type="file" accept=".txt,.pdf,.cbz,text/plain,application/pdf,application/vnd.comicbook+zip,application/x-cbz,application/zip" multiple tabindex="-1" aria-hidden="true">
-		<div class="hint">.txt, .pdf or .cbz comics, up to 95 MB each. A file with the same name as a book here replaces that book's file. ⤓ keeps a book on this device for reading offline.</div>
+		<input id="bookFile" class="vh" type="file" accept=".txt,.pdf,.cbz,.epub,text/plain,application/pdf,application/vnd.comicbook+zip,application/x-cbz,application/zip,application/epub+zip" multiple tabindex="-1" aria-hidden="true">
+		<div class="hint">.txt, .pdf, DRM-free .epub, or .cbz comics, up to 95 MB each. A file with the same name as a book here replaces that book's file. ⤓ keeps a book on this device for reading offline.</div>
 		<ul id="uploads" class="uploads"></ul>
 	</div>
 	<p id="libNote" class="hint" hidden>You're offline. These are the books downloaded on this device; your place syncs when you're back online.</p>
@@ -2191,7 +2218,7 @@ const PAGE = String.raw`<!doctype html>
 		</select>
 	</div>
 	<ul id="books" class="tree books flat"></ul>
-	<p id="booksEmpty" class="empty" hidden>No books yet. Upload a .txt, .pdf or .cbz to start.</p>
+	<p id="booksEmpty" class="empty" hidden>No books yet. Upload a .txt, .pdf, .epub or .cbz to start.</p>
 </section>
 
 <section id="bookView" hidden>
@@ -2234,6 +2261,14 @@ const PAGE = String.raw`<!doctype html>
 		<button id="hlExport" class="btn" type="button">Export Markdown</button>
 		<span></span>
 		<button id="hlListClose" class="btn ghost" type="button">Close</button>
+	</div>
+</div>
+<div id="tocList" class="pop hlpop" role="dialog" aria-label="Contents" hidden>
+	<h2>Contents</h2>
+	<ul id="tocItems" class="hlitems"></ul>
+	<div class="hlrow">
+		<span></span>
+		<button id="tocClose" class="btn ghost" type="button">Close</button>
 	</div>
 </div>
 <div id="toast" class="toast" role="status" hidden></div>
@@ -4966,7 +5001,7 @@ function renderBooks() {
 	var off = !!state.libOffline;
 	$("booksEmpty").textContent = tagged && !books.length ? "No books match “" + state.libSearch.trim() + "”."
 		: tag != null && (state.books || []).length ? "No books with this tag."
-		: off ? "You're offline, and no books are downloaded on this device." : "No books yet. Upload a .txt, .pdf or .cbz to start.";
+		: off ? "You're offline, and no books are downloaded on this device." : "No books yet. Upload a .txt, .pdf, .epub or .cbz to start.";
 	show($("booksEmpty"), !books.length);
 	show($("libNote"), off && !!books.length);
 	show($("libUpload"), !off);
@@ -5095,9 +5130,17 @@ function uploadOne(file, tagId) {
 		var li = h("li", "", file.name + " …");
 		$("uploads").append(li);
 		var done = function (ok, msg) { li.textContent = (ok ? "✓ " : "✗ ") + file.name + (msg ? ": " + msg : ""); li.className = ok ? "" : "err"; resolve(); };
-		if (!/\.(txt|pdf|cbz)$/i.test(file.name)) return done(false, "only .txt, .pdf and .cbz files");
+		if (!/\.(txt|pdf|cbz|epub)$/i.test(file.name)) return done(false, "only .txt, .pdf, .cbz and .epub files");
 		if (file.size > 95 * 1024 * 1024) return done(false, "over 95 MB");
-		if (/\.cbz$/i.test(file.name)) {
+		// An EPUB is opened here first: a locked (DRM) one is turned away,
+		// and its title, author and series go on the book once it's up.
+		var meta = null;
+		if (/\.epub$/i.test(file.name)) {
+			file.arrayBuffer().then(function (buf) {
+				if (String.fromCharCode.apply(null, new Uint8Array(buf, 0, Math.min(2, buf.byteLength))) !== "PK") throw new Error("not a zip file, so not an EPUB");
+				return epubLoad(buf);
+			}).then(function (ep) { meta = ep.meta; send(); }, function (e) { done(false, e.message || "couldn't read the file"); });
+		} else if (/\.cbz$/i.test(file.name)) {
 			// A CBR renamed to .cbz is still a RAR inside, which can't be opened here.
 			file.slice(0, 4).arrayBuffer().then(function (buf) {
 				var sig = String.fromCharCode.apply(null, new Uint8Array(buf));
@@ -5116,13 +5159,16 @@ function uploadOne(file, tagId) {
 				var data = {};
 				try { data = JSON.parse(xhr.responseText); } catch (e) {}
 				if (xhr.status >= 300) return done(false, data.error || "HTTP " + xhr.status);
-				done(true, data.replaced ? "replaced the file of “" + data.book.title + "”" : "");
-				// A downloaded copy is the old file now: fetch the new one.
-				if (data.replaced && bookDownloads[data.book.id]) {
-					forgetBookDownload(data.book.id);
-					saveBookDownloads();
-					downloadBook(data.book);
-				}
+				var details = meta ? epubDetails(data.book, meta).catch(function () {}) : Promise.resolve();
+				details.then(function () {
+					done(true, data.replaced ? "replaced the file of “" + data.book.title + "”" : "");
+					// A downloaded copy is the old file now: fetch the new one.
+					if (data.replaced && bookDownloads[data.book.id]) {
+						forgetBookDownload(data.book.id);
+						saveBookDownloads();
+						downloadBook(data.book);
+					}
+				});
 			};
 			xhr.onerror = function () { done(false, "network error"); };
 			xhr.send(file);
@@ -5154,6 +5200,7 @@ async function openBook(id) {
 	try {
 		if (book.type === "pdf") await openPdf(sess, parsePos(book.position) || {});
 		else if (book.type === "cbz") await openCbz(sess, parsePos(book.position) || {});
+		else if (book.type === "epub") await openEpub(sess, parsePos(book.position) || {});
 		else await openTxt(sess, parsePos(book.position) || {});
 	} catch (e) {
 		if (!sess.alive) return;
@@ -5184,7 +5231,7 @@ function flushPosition(sess, keepalive) {
 	sess.dirty = false;
 	setPosition(sess.book, JSON.stringify(sess.pos), keepalive);
 }
-// Reaching the end marks a book finished: the last line of a .txt, the
+// Reaching the end marks a book finished: the last line of a .txt or .epub, the
 // bottom edge of a PDF's last page, or a comic's last page, brought onto the screen by the reader
 // (not by restoring a saved place). At most once per opening, and not again
 // after "Mark unfinished" in the same opening. Scrolling back never unmarks.
@@ -5201,7 +5248,8 @@ function renderBookMenu() {
 	var b = session && session.book;
 	if (!b) return;
 	var n = session.hl ? session.hl.list.length : 0;
-	show($("bmHighlights"), b.type === "txt");
+	show($("bmContents"), b.type === "epub" && !!(session.epub && session.epub.toc.length));
+	show($("bmHighlights"), b.type === "txt" || b.type === "epub");
 	$("bmHighlights").textContent = n ? "Highlights (" + n + ")" : "Highlights";
 	show($("bmGuided"), b.type === "cbz");
 	$("bmGuided").textContent = "Guided view: " + (guidedOn() ? "on" : "off");
@@ -5317,7 +5365,13 @@ async function openTxt(sess, pos) {
 		if (chunks.length % 40 === 0) { await pause(); if (!sess.alive) return; }
 	}
 	if (!paras.length) body.append(h("p", "muted", "This file is empty."));
-	var t = sess.txt = { paras: paras, starts: starts, total: Math.max(total, 1), chunks: chunks };
+	startText(sess, { paras: paras, starts: starts, total: Math.max(total, 1), chunks: chunks }, pos);
+}
+// Reading a .txt or an .epub, once its blocks are on the page: position
+// tracking, highlights, and back to the saved place.
+function startText(sess, t, pos) {
+	var chunks = t.chunks;
+	sess.txt = t;
 	estimateChunks(t);
 	sess.capture = function () { return txtFraction(t); };
 	sess.relayout = function (f) { estimateChunks(t); restoreTxt(sess, f); };
@@ -5325,7 +5379,12 @@ async function openTxt(sess, pos) {
 		if (sess.restoring || !t.chunks.length) return;
 		var f = txtFraction(t);
 		savePosition(sess, { f: Math.round(f * 1e5) / 1e5 }, Math.round(f * 100) + "%");
-		checkEnd(sess, chunks[chunks.length - 1].lastElementChild);
+		// An EPUB's notes after its end don't count (endIdx), and nor does a
+		// jump by link, until the reader scrolls on from where it landed.
+		if (t.endIdx != null && paraAt(t, f * t.total) > t.endIdx) return;
+		if (sess.jumpedTo != null && (sess.jumpedTo < 0 || Math.abs(window.scrollY - sess.jumpedTo) < 40)) return;
+		sess.jumpedTo = null;
+		checkEnd(sess, t.endIdx != null ? paraEl(t, t.endIdx) : chunks[chunks.length - 1].lastElementChild);
 	};
 	sess.track = track;
 	hlStart(sess);
@@ -5377,7 +5436,7 @@ function restoreTxt(sess, f) {
 	}, sess.track);
 }
 
-// ---------- highlights and notes (.txt books)
+// ---------- highlights and notes (.txt and .epub books)
 // Select some text and a bar at the bottom offers Highlight or Add note; tap
 // a highlight to see, change or delete its note. Each one is kept by its
 // character positions in the text (after any YAML header) plus the words
@@ -5448,19 +5507,54 @@ function hlRender(sess) {
 function hlPara(t, i, marks) {
 	var p = paraEl(t, i), text = t.paras[i], base = t.starts[i];
 	if (!p) return;
+	if (t.rich) return hlRich(p, hlPieces(text, base, marks));
 	p.textContent = "";
 	if (!marks.length) { p.textContent = text; return; }
-	var cuts = [0, text.length];
+	hlPieces(text, base, marks).forEach(function (s) {
+		var piece = text.slice(s.a, s.b);
+		if (!s.on) { p.append(piece); return; }
+		p.append(hlMark(s.on, piece));
+	});
+}
+// A paragraph's text cut where highlights start and end: [{a, b, on}], on
+// being the highlight over that piece (or null).
+function hlPieces(text, base, marks) {
+	var cuts = [0, text.length], out = [];
 	marks.forEach(function (x) { cuts.push(clamp(x.start_pos - base, 0, text.length), clamp(x.end_pos - base, 0, text.length)); });
 	cuts = cuts.filter(function (c, k) { return cuts.indexOf(c) === k; }).sort(function (a, b) { return a - b; });
 	for (var k = 0; k < cuts.length - 1; k++) {
-		var a = cuts[k], b = cuts[k + 1], piece = text.slice(a, b), on = null;
+		var a = cuts[k], b = cuts[k + 1], on = null;
 		marks.forEach(function (x) { if (x.start_pos - base <= a && x.end_pos - base >= b) on = x; });
-		if (!on) { p.append(piece); continue; }
-		var m = h("mark", "hl" + (on.note ? " noted" : ""), piece);
-		m.dataset.h = on.id;
-		p.append(m);
+		out.push({ a: a, b: b, on: on });
 	}
+	return out;
+}
+function hlMark(x, content) {
+	var m = h("mark", "hl" + (x.note ? " noted" : ""));
+	m.dataset.h = x.id;
+	if (content) m.append(content);
+	return m;
+}
+// An EPUB block keeps its own markup (italics, links, images), so its marks
+// go around the bits of text inside it instead of rebuilding it.
+function hlRich(p, pieces) {
+	p.querySelectorAll("mark.hl").forEach(function (m) { m.replaceWith.apply(m, [].slice.call(m.childNodes)); });
+	p.normalize();
+	var on = pieces.filter(function (s) { return s.on; });
+	if (!on.length) return;
+	var walk = document.createTreeWalker(p, NodeFilter.SHOW_TEXT), nodes = [], n, at = 0;
+	while ((n = walk.nextNode())) { nodes.push({ n: n, a: at }); at += n.data.length; }
+	nodes.forEach(function (o) {
+		var len = o.n.data.length;
+		// Last piece first, so splitting leaves the earlier offsets as they were.
+		for (var k = on.length - 1; k >= 0; k--) {
+			var a = Math.max(on[k].a - o.a, 0), b = Math.min(on[k].b - o.a, len);
+			if (b <= a) continue;
+			if (b < o.n.data.length) o.n.splitText(b);
+			var mid = a > 0 ? o.n.splitText(a) : o.n;
+			mid.parentNode.insertBefore(hlMark(on[k].on, ""), mid).append(mid);
+		}
+	});
 }
 
 // A point in the selection as a position in the text.
@@ -5471,8 +5565,10 @@ function hlPoint(t, node, offset) {
 		if (offset < kids.length) { node = kids[offset]; offset = 0; el = node; }
 		else { node = kids[kids.length - 1]; offset = node.childNodes.length; el = node; }
 	}
-	var p = el.closest && el.closest(".txt p");
-	if (!p) return null;
+	// The paragraph (an EPUB: the block) it's in, a child of a chunk.
+	var p = el;
+	while (p && p.parentNode && !(p.parentNode.classList && p.parentNode.classList.contains("chunk"))) p = p.parentNode;
+	if (!p || !p.parentNode) return null;
 	var ci = t.chunks.indexOf(p.parentNode), k = [].indexOf.call(p.parentNode.children, p);
 	if (ci < 0 || k < 0) return null;
 	var r = document.createRange();
@@ -5823,11 +5919,12 @@ function releasePdfPage(div) {
 // offline. Pages are unpacked as they're shown, with a few on either side.
 
 var CBZ_IMAGES = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", avif: "image/avif", bmp: "image/bmp" };
-// -> [{name, method, offset, csize, type}] for the page images, in reading order.
-function readZip(buf) {
+// -> [{name, method, offset, csize, flags}] for every file in a zip (a CBZ
+// or an EPUB), in the zip's order. what: "a CBZ", for the error.
+function zipEntries(buf, what) {
 	var u8 = new Uint8Array(buf), dv = new DataView(buf), end = -1;
 	for (var i = u8.length - 22; i >= Math.max(0, u8.length - 22 - 65535); i--) if (dv.getUint32(i, true) === 0x06054b50) { end = i; break; }
-	if (end < 0) throw new Error("This isn't a zip file, so it can't be read as a CBZ.");
+	if (end < 0) throw new Error("This isn't a zip file, so it can't be read as " + what + ".");
 	var count = dv.getUint16(end + 10, true), at = dv.getUint32(end + 16, true);
 	// Zip64: the real count and start are in a second record.
 	if ((count === 0xffff || at === 0xffffffff) && end >= 20 && dv.getUint32(end - 20, true) === 0x07064b50) {
@@ -5835,7 +5932,7 @@ function readZip(buf) {
 		count = Number(dv.getBigUint64(z + 32, true));
 		at = Number(dv.getBigUint64(z + 48, true));
 	}
-	var names = new TextDecoder("utf-8"), pages = [];
+	var names = new TextDecoder("utf-8"), files = [];
 	for (var n = 0; n < count && at + 46 <= u8.length && dv.getUint32(at, true) === 0x02014b50; n++) {
 		var flags = dv.getUint16(at + 8, true), method = dv.getUint16(at + 10, true);
 		var csize = dv.getUint32(at + 20, true), size = dv.getUint32(at + 24, true), local = dv.getUint32(at + 42, true);
@@ -5852,22 +5949,31 @@ function readZip(buf) {
 			x += 4 + len;
 		}
 		at += 46 + nl + xl + cl;
-		var ext = (/\.(\w+)$/.exec(name) || [])[1];
-		var type = ext && CBZ_IMAGES[ext.toLowerCase()];
-		if (!type || /(^|\/)(__MACOSX\/|\.)/.test(name)) continue;
-		if (flags & 1) throw new Error("This comic is password-protected, so it can't be opened.");
-		if (method !== 0 && method !== 8) throw new Error("This comic uses a kind of zip compression the reader can't unpack.");
-		if (local + 30 > u8.length || dv.getUint32(local, true) !== 0x04034b50) continue;
+		if (/\/$/.test(name) || local + 30 > u8.length || dv.getUint32(local, true) !== 0x04034b50) continue;
 		var offset = local + 30 + dv.getUint16(local + 26, true) + dv.getUint16(local + 28, true);
-		pages.push({ name: name, method: method, offset: offset, csize: csize, type: type });
+		files.push({ name: name, method: method, offset: offset, csize: csize, flags: flags });
 	}
+	return files;
+}
+// -> [{name, method, offset, csize, type}] for a CBZ's page images, in reading order.
+function readZip(buf) {
+	var pages = [];
+	zipEntries(buf, "a CBZ").forEach(function (e) {
+		var ext = (/\.(\w+)$/.exec(e.name) || [])[1];
+		var type = ext && CBZ_IMAGES[ext.toLowerCase()];
+		if (!type || /(^|\/)(__MACOSX\/|\.)/.test(e.name)) return;
+		if (e.flags & 1) throw new Error("This comic is password-protected, so it can't be opened.");
+		if (e.method !== 0 && e.method !== 8) throw new Error("This comic uses a kind of zip compression the reader can't unpack.");
+		e.type = type;
+		pages.push(e);
+	});
 	pages.sort(function (a, b) { return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }); });
 	return pages;
 }
 async function zipEntryBlob(u8, e) {
 	var data = u8.subarray(e.offset, e.offset + e.csize);
 	if (e.method === 0) return new Blob([data], { type: e.type });
-	if (!window.DecompressionStream) throw new Error("This browser is too old to unpack this comic.");
+	if (!window.DecompressionStream) throw new Error("This browser is too old to unpack this file.");
 	var out = await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"))).arrayBuffer();
 	return new Blob([out], { type: e.type });
 }
@@ -6088,6 +6194,462 @@ async function openCbz(sess, pos) {
 	sess.cleanup.push(function () { Object.keys(urls).forEach(function (k) { urls[k].then(URL.revokeObjectURL, function () {}); }); });
 	await go(pos.page || 1, false);
 }
+
+// ---------- .epub reader
+// An EPUB is a zip of XHTML chapters plus a list of them (the OPF). Like a
+// CBZ, it's unpacked here in the browser, so there's nothing to load and the
+// Worker only keeps the file. epubLoad and epubBlocks know nothing about the
+// database or the rest of this page: they turn the file into its details
+// (title, author, series, cover), its contents and a list of blocks
+// (paragraphs, headings, images). The reader puts those blocks where a
+// .txt's paragraphs go, so position, the end-of-book check and highlights
+// work the same way, by character position in the book's text. The book's
+// own styles aren't used, so it takes the reader's font, size and theme;
+// its italics, bold and centering are kept.
+// Only DRM-free EPUBs open. A store's copy protection (Adobe, Apple, Kobo)
+// encrypts the chapters, and those files are turned away at upload.
+
+var EPUB_DRM = "This EPUB has DRM (copy protection), so it can't be read here. Only DRM-free EPUBs work.";
+// Fonts scrambled so they can't be lifted out aren't DRM; the text is plain.
+var EPUB_FONT_KEYS = /^http:\/\/(www\.idpf\.org\/2008\/embedding|ns\.adobe\.com\/pdf\/enc#RC)$/;
+var EPUB_BLOCK = /^(p|h[1-6]|blockquote|pre|ul|ol|dl|table|figure|hr)$/;
+var EPUB_HAS_BLOCK = "p,div,h1,h2,h3,h4,h5,h6,blockquote,pre,ul,ol,dl,table,figure,hr,section,article,aside,header,footer,main,nav";
+var XLINK_NS = "http://www.w3.org/1999/xlink";
+
+function epubTags(node, name) { return node ? [].slice.call(node.getElementsByTagNameNS("*", name)) : []; }
+// A link inside the book as a zip path (plus its #fragment), from the file
+// it's in. null for a link off the book.
+function epubPath(href, from) {
+	if (!href) return null;
+	try {
+		var u = new URL(String(href).trim(), "https://epub.invalid/" + from.split("/").map(encodeURIComponent).join("/"));
+		if (u.origin !== "https://epub.invalid") return null;
+		return decodeURIComponent(u.pathname.slice(1)) + decodeURIComponent(u.hash);
+	} catch (e) { return null; }
+}
+// Chapters are XHTML; a broken one (a bare &nbsp;, say) is read as HTML instead.
+function epubDoc(text) {
+	var doc = new DOMParser().parseFromString(text, "application/xhtml+xml");
+	return doc.getElementsByTagName("parsererror").length ? parseHTML(text) : doc;
+}
+
+// -> {meta: {title, author, series, volume}, spine: [{path, type, linear}], toc:
+// [{label, depth, to}], cover (a zip path or null), text(path), image(path)}.
+// Throws for a locked (DRM) or broken file.
+async function epubLoad(buf) {
+	var u8 = new Uint8Array(buf), files = {}, lower = {};
+	zipEntries(buf, "an EPUB").forEach(function (e) { files[e.name] = e; lower[e.name.toLowerCase()] = e; });
+	var entry = function (path) { return files[path] || lower[String(path).toLowerCase()] || null; };
+	var blob = async function (path, type) {
+		var e = entry(path);
+		if (!e) return null;
+		if (e.flags & 1) throw new Error(EPUB_DRM);
+		if (e.method !== 0 && e.method !== 8) throw new Error("This EPUB uses a kind of zip compression the reader can't unpack.");
+		return zipEntryBlob(u8, Object.assign({}, e, { type: type || "" }));
+	};
+	var text = async function (path) { var b = await blob(path); return b ? decodeText(await b.arrayBuffer()) : null; };
+	var xml = async function (path) { var t = await text(path); return t == null ? null : parseXML(t); };
+
+	if (entry("META-INF/rights.xml") || entry("META-INF/sinf.xml")) throw new Error(EPUB_DRM);
+	var enc = await xml("META-INF/encryption.xml");
+	if (epubTags(enc, "EncryptionMethod").some(function (m) { return !EPUB_FONT_KEYS.test(m.getAttribute("Algorithm") || ""); })) throw new Error(EPUB_DRM);
+
+	var container = await xml("META-INF/container.xml");
+	var opfPath = (epubTags(container, "rootfile")[0] || { getAttribute: function () { return null; } }).getAttribute("full-path");
+	var opf = opfPath ? await xml(opfPath) : null;
+	if (!opf) throw new Error("This EPUB is missing its list of chapters, so it can't be opened.");
+	var manifest = {}, byPath = {};
+	epubTags(opf, "item").forEach(function (it) {
+		var path = epubPath(it.getAttribute("href"), opfPath);
+		if (!path) return;
+		var m = { id: it.getAttribute("id"), path: path.split("#")[0], type: (it.getAttribute("media-type") || "").toLowerCase(), props: " " + (it.getAttribute("properties") || "") + " " };
+		manifest[m.id] = byPath[m.path] = m;
+	});
+	var items = Object.keys(manifest).map(function (k) { return manifest[k]; });
+	var spineEl = epubTags(opf, "spine")[0];
+	var spine = epubTags(spineEl, "itemref").map(function (r) {
+		var m = manifest[r.getAttribute("idref")];
+		return m && { path: m.path, type: m.type, linear: r.getAttribute("linear") !== "no" };
+	}).filter(function (m) { return m && /html/.test(m.type) && entry(m.path); });
+	if (!spine.length) throw new Error("This EPUB has no chapters in it.");
+
+	var md = epubTags(opf, "metadata")[0] || opf, metas = epubTags(md, "meta");
+	var refine = function (el, prop) {
+		var id = el && el.getAttribute("id");
+		var m = id && metas.filter(function (x) { return x.getAttribute("refines") === "#" + id && x.getAttribute("property") === prop; })[0];
+		return m ? m.textContent.trim() : "";
+	};
+	var named = function (name) {
+		var m = metas.filter(function (x) { return x.getAttribute("name") === name; })[0];
+		return m ? (m.getAttribute("content") || "").trim() : "";
+	};
+	var titles = epubTags(md, "title");
+	var title = titles.filter(function (t) { return refine(t, "title-type") === "main"; })[0] || titles[0];
+	var creators = epubTags(md, "creator");
+	var authors = creators.filter(function (c) {
+		var role = c.getAttribute("opf:role") || c.getAttribute("role") || refine(c, "role");
+		return !role || role === "aut";
+	});
+	if (!authors.length) authors = creators.slice(0, 1);
+	var coll = metas.filter(function (x) {
+		return x.getAttribute("property") === "belongs-to-collection" && (refine(x, "collection-type") || "series") === "series";
+	})[0];
+	var volume = coll ? refine(coll, "group-position") : named("calibre:series_index");
+	var meta = {
+		title: title ? plain(title.textContent) : "",
+		author: authors.map(function (a) { return plain(a.textContent); }).filter(Boolean).join(", "),
+		series: coll ? plain(coll.textContent) : named("calibre:series"),
+		volume: String(volume || "").replace(/\.0+$/, "")
+	};
+
+	var isImage = function (m) { return m && /^image\//.test(m.type); };
+	var cover = items.filter(function (m) { return /\scover-image\s/.test(m.props); })[0] || manifest[named("cover")];
+	if (!isImage(cover)) cover = items.filter(function (m) { return isImage(m) && /cover/i.test(m.id + " " + m.path); })[0];
+
+	// Contents: the EPUB 3 nav page, else the EPUB 2 NCX.
+	var toc = [], nav = items.filter(function (m) { return /\snav\s/.test(m.props); })[0];
+	if (nav) {
+		var navText = await text(nav.path), navDoc = navText ? epubDoc(navText) : null, navs = epubTags(navDoc, "nav");
+		var tocNav = navs.filter(function (n) { return /(^|\s)toc(\s|$)/.test(n.getAttribute("epub:type") || n.getAttributeNS("http://www.idpf.org/2007/ops", "type") || ""); })[0] || navs[0];
+		(function list(ol, depth) {
+			kids(ol, "li").forEach(function (li) {
+				var a = kid(li, "a"), label = a ? plain(a.textContent) : "", to = a && epubPath(a.getAttribute("href"), nav.path);
+				if (label && to) toc.push({ label: label, depth: depth, to: to });
+				var sub = kid(li, "ol");
+				if (sub && depth < 6) list(sub, depth + 1);
+			});
+		})(epubTags(tocNav, "ol")[0], 0);
+	}
+	var ncx = !toc.length && (manifest[spineEl && spineEl.getAttribute("toc")] || items.filter(function (m) { return m.type === "application/x-dtbncx+xml"; })[0]);
+	if (ncx) {
+		var ncxDoc = await xml(ncx.path);
+		(function points(parent, depth) {
+			kids(parent, "navPoint").forEach(function (p) {
+				var label = plain(epubTags(kid(p, "navLabel"), "text").map(function (t) { return t.textContent; }).join(" "));
+				var c = kid(p, "content"), to = c && epubPath(c.getAttribute("src"), ncx.path);
+				if (label && to) toc.push({ label: label, depth: depth, to: to });
+				if (depth < 6) points(p, depth + 1);
+			});
+		})(epubTags(ncxDoc, "navMap")[0], 0);
+	}
+
+	return {
+		meta: meta, spine: spine, toc: toc, cover: cover ? cover.path : null, text: text,
+		styles: items.filter(function (m) { return m.type === "text/css"; }).map(function (m) { return m.path; }),
+		has: function (path) { return !!entry(path); },
+		image: function (path) {
+			var m = byPath[path], ext = (/\.(\w+)$/.exec(path) || [])[1];
+			var type = (m && m.type) || (ext && (CBZ_IMAGES[ext.toLowerCase()] || (/^svg$/i.test(ext) ? "image/svg+xml" : ""))) || "";
+			return /^image\//.test(type) ? blob(path, type) : Promise.resolve(null);
+		}
+	};
+}
+
+// The book's stylesheets, only for which classes mean italic, bold or
+// centered (calibre's "calibre5" and the like say so nowhere else).
+// Only single-class rules are read: ".x" or "p.x".
+function epubCss(css, out) {
+	var re = /([^{}@]+)\{([^{}]*)\}/g, m;
+	css = css.replace(/\/\*[\s\S]*?\*\//g, "");
+	while ((m = re.exec(css))) {
+		var d = m[2].toLowerCase();
+		var it = /font-style\s*:\s*(italic|oblique)/.test(d), bd = /font-weight\s*:\s*(bold|bolder|[6-9]00)\b/.test(d);
+		var al = /text-align\s*:\s*center/.test(d) ? "ec" : /text-align\s*:\s*right/.test(d) ? "er" : "";
+		if (!it && !bd && !al) continue;
+		m[1].split(",").forEach(function (sel) {
+			var c = /^[a-z0-9]*\.([\w-]+)$/i.exec(sel.trim());
+			if (!c) return;
+			if (it) out.i[c[1]] = 1;
+			if (bd) out.b[c[1]] = 1;
+			if (al) out.al[c[1]] = al;
+		});
+	}
+}
+function epubFmt(n, css) {
+	var cls = (n.getAttribute("class") || "").split(/\s+/).filter(Boolean), st = (n.getAttribute("style") || "").toLowerCase();
+	var named = function (re) { return cls.some(function (c) { return re.test(c); }); };
+	var al = "";
+	cls.forEach(function (c) { if (css.al[c]) al = css.al[c]; });
+	if (/text-align\s*:\s*center/.test(st)) al = "ec"; else if (/text-align\s*:\s*right/.test(st)) al = "er";
+	return {
+		i: /font-style\s*:\s*(italic|oblique)/.test(st) || cls.some(function (c) { return css.i[c]; }) || named(/(^|[_-])(italic|ital|emph)([_-]|$)/i),
+		b: /font-weight\s*:\s*(bold|bolder|[6-9]00)\b/.test(st) || cls.some(function (c) { return css.b[c]; }) || named(/(^|[_-])(bold|strong)([_-]|$)/i),
+		al: al || (named(/^(center|centered|centre|centred)$/i) ? "ec" : "")
+	};
+}
+
+// One chapter's body into clean elements, from the same allow-list as
+// articles (ALLOWED, DROP). Links into the book get data-to (a zip path),
+// images data-zip (filled in when they come near the screen), and anything
+// a link can point at keeps its place in data-eid.
+function epubClean(from, to, path, ep, css, depth, pre) {
+	if (depth > 60) return;
+	for (var n = from.firstChild; n; n = n.nextSibling) {
+		if (n.nodeType === 3 || n.nodeType === 4) { to.appendChild(document.createTextNode(pre ? n.data : n.data.replace(/\s+/g, " "))); continue; }
+		if (n.nodeType !== 1) continue;
+		var tag = n.localName.toLowerCase(), id = n.getAttribute("id"), eid = id ? path + "#" + id : null;
+		// A cover page is often an SVG wrapped around one <image>.
+		if (tag === "svg") {
+			var im = epubTags(n, "image")[0];
+			if (im) epubImg(im.getAttributeNS(XLINK_NS, "href") || im.getAttribute("href"), "", to, path, ep, eid);
+			continue;
+		}
+		if (tag === "img") { epubImg(n.getAttribute("src"), n.getAttribute("alt"), to, path, ep, eid); continue; }
+		if (DROP.test(tag)) continue;
+		if (AS_DIV.test(tag)) tag = "div";
+		var allowed = tag !== "span" && ALLOWED[tag], e = null, fmt = epubFmt(n, css);
+		if (allowed) {
+			e = document.createElement(tag);
+			allowed.forEach(function (a) {
+				var v = n.getAttribute(a);
+				if (v && /^(colspan|rowspan|start)$/.test(a) && /^\d{1,5}$/.test(v.trim())) e.setAttribute(a, v.trim());
+				else if (v && a === "title") e.setAttribute(a, v.slice(0, 300));
+			});
+			if (tag === "a") epubLink(n, e, path);
+			if (eid) e.dataset.eid = eid;
+			if (fmt.al && /^(p|div|h[1-6]|blockquote)$/.test(tag)) e.className = fmt.al;
+			to.appendChild(e);
+		} else if (eid) {
+			var spot = document.createElement("span");
+			spot.dataset.eid = eid;
+			to.appendChild(spot);
+		}
+		var inner = e || to;
+		// Italic or bold from a class or a style, on something holding only text.
+		if ((fmt.i || fmt.b) && !n.querySelector(EPUB_HAS_BLOCK)) {
+			if (fmt.i && !/^(em|i|cite)$/.test(tag)) inner = inner.appendChild(document.createElement("em"));
+			if (fmt.b && !/^(strong|b|h[1-6]|th)$/.test(tag)) inner = inner.appendChild(document.createElement("strong"));
+		}
+		epubClean(n, inner, path, ep, css, depth + 1, pre || tag === "pre");
+	}
+}
+function epubLink(n, e, path) {
+	var href = (n.getAttribute("href") || n.getAttributeNS(XLINK_NS, "href") || "").trim();
+	if (!href) return;
+	if (/^(https?|mailto):/i.test(href)) {
+		e.setAttribute("href", href.slice(0, 2000));
+		e.setAttribute("target", "_blank");
+		e.setAttribute("rel", "noopener noreferrer");
+		return;
+	}
+	var to = epubPath(href, path);
+	if (!to) return;
+	e.setAttribute("href", "#");
+	e.dataset.to = to;
+}
+function epubImg(src, alt, to, path, ep, eid) {
+	var p = epubPath(src, path);
+	p = p && p.split("#")[0];
+	if (!p || !ep.has(p)) return;
+	var img = document.createElement("img");
+	img.alt = alt || "";
+	img.setAttribute("decoding", "async");
+	img.dataset.zip = p;
+	if (eid) img.dataset.eid = eid;
+	to.appendChild(img);
+}
+
+// Every chapter, in order, as a flat list of blocks: a chapter's divs are
+// opened up until what's left is paragraphs, headings, lists, figures and
+// the like; loose text between them becomes a paragraph. -> {blocks,
+// anchors: {"path#id": {i, el}}, starts: {path: first block}, end: the
+// last block of the book proper, before any notes kept out of the reading
+// order (linear="no")}.
+async function epubBlocks(ep, alive) {
+	var css = { i: {}, b: {}, al: {} };
+	for (var c = 0; c < ep.styles.length; c++) epubCss((await ep.text(ep.styles[c]).catch(function () { return ""; })) || "", css);
+	var out = { blocks: [], anchors: {}, starts: {}, end: null }, st = { run: null, pending: [] };
+	for (var s = 0; s < ep.spine.length; s++) {
+		var path = ep.spine[s].path, src = await ep.text(path);
+		if (!alive()) return null;
+		var body = src == null ? null : epubTags(epubDoc(src), "body")[0];
+		var first = out.blocks.length;
+		out.starts[path] = first;
+		if (!body) continue;
+		var frag = document.createDocumentFragment();
+		epubClean(body, frag, path, ep, css, 0, false);
+		epubFlatten(frag, out, st);
+		epubEndRun(out, st);
+		if (first > 0 && out.blocks.length > first) out.blocks[first].classList.add("estart");
+		if (ep.spine[s].linear && out.blocks.length) out.end = out.blocks.length - 1;
+		if (s % 4 === 3) await pause();
+	}
+	// A cover the chapters never show goes first.
+	if (ep.cover && !out.blocks.some(function (b) { return b.querySelector("img[data-zip='" + ep.cover.replace(/['\\]/g, "\\$&") + "']"); })) {
+		var p = document.createElement("p"), img = document.createElement("img");
+		img.alt = "Cover";
+		img.dataset.zip = ep.cover;
+		p.append(img);
+		out.blocks.unshift(p);
+		Object.keys(out.starts).forEach(function (k) { out.starts[k]++; });
+		Object.keys(out.anchors).forEach(function (k) { out.anchors[k].i++; });
+		if (out.end != null) out.end++;
+		epubMark(p);
+	}
+	var last = out.blocks.length - 1;
+	st.pending.forEach(function (id) { if (last >= 0) out.anchors[id] = { i: last, el: null }; });
+	Object.keys(out.starts).forEach(function (k) { out.starts[k] = Math.min(out.starts[k], Math.max(last, 0)); });
+	return out;
+}
+function epubFlatten(from, out, st) {
+	for (var n = from.firstChild, next; n; n = next) {
+		next = n.nextSibling;
+		var tag = n.nodeType === 1 ? n.localName : "";
+		if (tag !== "div" && !EPUB_BLOCK.test(tag)) {
+			(st.run = st.run || document.createElement("p")).appendChild(n);
+			continue;
+		}
+		epubEndRun(out, st);
+		if (tag === "div" && n.querySelector(EPUB_HAS_BLOCK)) {
+			if (n.dataset.eid) st.pending.push(n.dataset.eid);
+			epubFlatten(n, out, st);
+			epubEndRun(out, st);
+		} else epubPush(out, st, n);
+	}
+}
+function epubEndRun(out, st) {
+	var run = st.run;
+	st.run = null;
+	if (run) epubPush(out, st, run);
+}
+function epubPush(out, st, el) {
+	var spots = el.querySelectorAll("[data-eid]");
+	// Nothing to read or see (a spacer, an empty anchor): its link targets
+	// move on to the next block.
+	if (!el.textContent.trim() && !el.querySelector("img") && el.localName !== "hr") {
+		if (el.dataset.eid) st.pending.push(el.dataset.eid);
+		spots.forEach(function (s) { st.pending.push(s.dataset.eid); });
+		return;
+	}
+	var i = out.blocks.length;
+	out.blocks.push(el);
+	st.pending.forEach(function (id) { out.anchors[id] = { i: i, el: null }; });
+	st.pending = [];
+	if (el.dataset.eid) out.anchors[el.dataset.eid] = { i: i, el: el };
+	spots.forEach(function (s) { out.anchors[s.dataset.eid] = { i: i, el: s }; });
+	epubMark(el);
+}
+// A block that's only a picture is centered.
+function epubMark(el) { if (!el.textContent.trim() && el.querySelector("img")) el.classList.add("eimg"); }
+
+async function openEpub(sess, pos) {
+	var res = await bookFileRes(sess.book);
+	var buf = await res.arrayBuffer();
+	if (!sess.alive) return;
+	var ep = await epubLoad(buf);
+	var built = await epubBlocks(ep, function () { return sess.alive; });
+	if (!built || !sess.alive) return;
+	var body = $("bookBody"), blocks = built.blocks, paras = [], starts = [], total = 0, chunks = [];
+	body.textContent = "";
+	body.className = "txt epub";
+	for (var c = 0; c < blocks.length; c += CHUNK) {
+		var div = h("div", "chunk");
+		for (var k = c; k < Math.min(c + CHUNK, blocks.length); k++) {
+			var text = blocks[k].textContent;
+			starts.push(total);
+			paras.push(text);
+			total += text.length + 1;
+			div.appendChild(blocks[k]);
+		}
+		chunks.push(div);
+		body.appendChild(div);
+		if (chunks.length % 40 === 0) { await pause(); if (!sess.alive) return; }
+	}
+	if (!blocks.length) body.append(h("p", "muted", "There's no text in this book."));
+	var t = { paras: paras, starts: starts, total: Math.max(total, 1), chunks: chunks, rich: true, anchors: built.anchors, docStart: built.starts, endIdx: built.end };
+	sess.epub = { toc: ep.toc.filter(function (x) { return epubTarget(t, x.to); }) };
+	// Pictures are unpacked as they come near the screen.
+	var urls = {};
+	var io = new IntersectionObserver(function (entries) {
+		entries.forEach(function (e) {
+			if (!e.isIntersecting) return;
+			var img = e.target, path = img.dataset.zip;
+			io.unobserve(img);
+			(urls[path] = urls[path] || ep.image(path).then(function (b) { return b && URL.createObjectURL(b); })).then(function (u) { if (u) img.src = u; }, function () {});
+		});
+	}, { rootMargin: "150% 0px" });
+	body.querySelectorAll("img[data-zip]").forEach(function (img) { io.observe(img); });
+	sess.cleanup.push(function () {
+		io.disconnect();
+		Object.keys(urls).forEach(function (k) { urls[k].then(function (u) { if (u) URL.revokeObjectURL(u); }, function () {}); });
+		show($("tocList"), false);
+	});
+	// Links inside the book (contents pages, footnotes) jump within it.
+	listen(sess, body, "click", function (e) {
+		var a = e.target.closest && e.target.closest("a[data-to]");
+		if (!a) return;
+		e.preventDefault();
+		var sel = window.getSelection();
+		if (e.target.closest("mark.hl") || (sel && !sel.isCollapsed)) return;
+		epubGo(sess, a.dataset.to);
+	});
+	startText(sess, t, pos);
+	renderBookMenu();
+	// Uploaded without its details filled in (the upload's second step
+	// failed, say): fill them in now.
+	var b = sess.book;
+	if (!b.author && !b.series && !state.libOffline) epubDetails(b, ep.meta).then(function () {
+		if (sess.alive) $("heading").textContent = b.title;
+	}, function () {});
+}
+// A link's target, as a block (and the element in it, if there is one).
+function epubTarget(t, to) {
+	var hit = t.anchors[to];
+	if (hit) return hit;
+	var file = to.split("#")[0];
+	return Object.prototype.hasOwnProperty.call(t.docStart, file) && t.paras.length ? { i: t.docStart[file], el: null } : null;
+}
+function epubGo(sess, to) {
+	var t = sess.txt, hit = t && epubTarget(t, to);
+	if (!hit) return;
+	var el = hit.el || paraEl(t, hit.i);
+	aim(sess, function () { return window.scrollY + el.getBoundingClientRect().top - headerBottom() - 8; }, sess.track);
+	sess.jumpedTo = -1;
+	setTimeout(function () { if (!sess.alive || !sess.track) return; sess.jumpedTo = window.scrollY; sess.track(); }, 400);
+}
+// The book's title, author, series and volume from the EPUB, onto the
+// Library's entry. The title only while it's still the one made from the
+// file name, so a rename sticks.
+function epubDetails(b, meta) {
+	var made = b.filename.replace(/\.[^.]+$/, "").replace(/[_]+/g, " ").replace(/\s+/g, " ").trim() || b.filename, patch = {};
+	if (meta.title && b.title === made && meta.title !== b.title) patch.title = meta.title;
+	["author", "series", "volume"].forEach(function (k) { if (meta[k] && meta[k] !== b[k]) patch[k] = meta[k]; });
+	if (!Object.keys(patch).length) return Promise.resolve();
+	return apiJSON("/api/books/" + b.id, { method: "PATCH", json: patch }).then(function (d) {
+		Object.assign(b, d.book);
+		keepBookDetails(b);
+	});
+}
+
+// The contents, from the book menu: tap a chapter to go there. The one
+// being read is marked.
+function openToc() {
+	var sess = session;
+	if (!sess || !sess.epub || !sess.txt) return;
+	openBookMenu(false);
+	showHlList(false);
+	showHlPop(false);
+	var t = sess.txt, ul = $("tocItems"), cur = null, curBtn = null;
+	var here = t.chunks.length ? paraAt(t, txtFraction(t) * t.total) : 0;
+	sess.epub.toc.forEach(function (x) { var hit = epubTarget(t, x.to); if (hit.i <= here) cur = x; });
+	ul.textContent = "";
+	sess.epub.toc.forEach(function (x) {
+		var li = h("li"), go = h("button", "tocgo", x.label);
+		go.type = "button";
+		go.style.paddingLeft = x.depth * 16 + "px";
+		if (x === cur) { go.setAttribute("aria-current", "true"); curBtn = go; }
+		go.addEventListener("click", function () { show($("tocList"), false); epubGo(sess, x.to); });
+		li.append(go);
+		ul.append(li);
+	});
+	show($("tocList"), true);
+	if (curBtn) curBtn.scrollIntoView({ block: "center" });
+}
+$("tocClose").addEventListener("click", function () { show($("tocList"), false); });
+$("bmContents").addEventListener("click", function (e) { e.stopPropagation(); openToc(); });
+document.addEventListener("click", function (e) {
+	if (!$("tocList").hidden && !$("tocList").contains(e.target)) show($("tocList"), false);
+});
 
 // ---------- wiring
 
