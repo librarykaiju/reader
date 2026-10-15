@@ -51,6 +51,7 @@
 //   PUT    /api/books?name=&tag=  body = a .txt, .pdf, .cbz or .epub file -> {"book"} (tag: a book tag id to put on it)
 //                                  (a file name already in the Library replaces that book's file: {"book", "replaced": true})
 //   GET    /api/books/:id/file     the file itself (?dl=1: saving it for offline, so not "opened")
+//   GET    /api/books/:id/part?at=&len=  len bytes of the file from byte at (up to 4 MB; for drawing a PDF's cover)
 //   GET    /api/books/:id/cover    the cover image (an EPUB's or a comic's first page is found the first time); 404 if none
 //   PUT    /api/books/:id/cover    body = a JPEG/PNG/WebP the page drew (a PDF's first page)
 //   PATCH  /api/books/:id          {title?, author?, series?, volume?, position?, finished?, opened?, tags?, reread?}
@@ -205,6 +206,8 @@ async function api(request, env, url) {
 	}
 	const file = p.match(/^\/api\/books\/(\d+)\/file$/);
 	if (file && m === "GET") return bookFile(env, toId(file[1]), url.searchParams.has("dl"));
+	const part = p.match(/^\/api\/books\/(\d+)\/part$/);
+	if (part && m === "GET") return bookPart(env, toId(part[1]), url);
 	const cover = p.match(/^\/api\/books\/(\d+)\/cover$/);
 	if (cover) {
 		if (m === "GET") return bookCover(env, toId(cover[1]));
@@ -1776,6 +1779,19 @@ async function bookFile(env, id, download) {
 			"X-Content-Type-Options": "nosniff",
 			"Content-Security-Policy": "default-src 'none'; sandbox",
 		},
+	});
+}
+
+// A piece of a book's file, so the page can draw a PDF's first page without
+// downloading all of it (pdf.js asks for the pieces it needs).
+async function bookPart(env, id, url) {
+	const book = await getBook(env, id);
+	const at = Number(url.searchParams.get("at")), len = Number(url.searchParams.get("len"));
+	if (!Number.isInteger(at) || !Number.isInteger(len) || at < 0 || len < 1 || len > 4 * 1024 * 1024) throw new HttpError(400, "at and len must be whole numbers, len up to 4 MB");
+	const obj = await env.BOOKS.get(book.r2_key, { range: { offset: at, length: len } });
+	if (!obj) throw new HttpError(404, "The file is missing from storage");
+	return new Response(obj.body, {
+		headers: { "Content-Type": "application/octet-stream", "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" },
 	});
 }
 
@@ -6011,7 +6027,7 @@ function bookCard(b) {
 	if (pct) a.append(bar);
 	li.append(a);
 	if (coverUrls[b.id]) showCover(cov, coverUrls[b.id]);
-	else if (b.type !== "txt" && b.cover !== "none" && !(b.type === "pdf" && b.cover !== "yes")) watchCover(b, cov);
+	else if (b.type !== "txt" && b.cover !== "none") watchCover(b, cov);
 	return li;
 }
 function drawnCover(b) {
@@ -6044,40 +6060,95 @@ function watchCover(b, cov) {
 	cov.book = b;
 	coverIO.observe(cov);
 }
+// The Library may have been drawn again while the cover was on its way.
+function coverArrived(b, cov) {
+	if (!cov.isConnected) cov = document.querySelector('#books a[href="#/book/' + b.id + '"] .cover');
+	if (cov && !cov.querySelector("img")) showCover(cov, coverUrls[b.id]);
+}
 async function loadCover(b, cov) {
 	if (state.libOffline) return;
+	if (b.type === "pdf" && b.cover !== "yes") return queuePdfCover(b, cov);
 	try {
 		var res = await api("/api/books/" + b.id + "/cover");
 		if (res.status === 404) { b.cover = "none"; return; }
 		if (!res.ok) return;
-		var url = coverUrls[b.id] = URL.createObjectURL(await res.blob());
+		coverUrls[b.id] = URL.createObjectURL(await res.blob());
 		b.cover = "yes";
-		if (cov.isConnected) showCover(cov, url);
+		coverArrived(b, cov);
 	} catch (e) {}
 }
-// A PDF's cover: its first page, drawn small once it's open here, if the
-// Worker doesn't have one for this file yet.
+// A PDF's cover: its first page, drawn small and kept by the Worker. Drawn
+// when the PDF is opened here, or when its spot in the Covers view comes on
+// screen: then pdf.js reads only the parts of the file that page needs, one
+// PDF at a time. A PDF that can't be drawn keeps its drawn cover.
+async function pdfCoverBlob(doc) {
+	var page = await doc.getPage(1), vp1 = page.getViewport({ scale: 1 });
+	var vp = page.getViewport({ scale: 360 / vp1.width }), canvas = document.createElement("canvas");
+	canvas.width = Math.floor(vp.width);
+	canvas.height = Math.floor(vp.height);
+	var ctx = canvas.getContext("2d");
+	ctx.fillStyle = "#fff";
+	ctx.fillRect(0, 0, canvas.width, canvas.height);
+	await page.render({ canvasContext: ctx, viewport: vp }).promise;
+	var blob = await new Promise(function (ok) { canvas.toBlob(ok, "image/jpeg", 0.82); });
+	canvas.width = canvas.height = 0;
+	page.cleanup();
+	return blob;
+}
+async function savePdfCover(b, blob) {
+	var res = await api("/api/books/" + b.id + "/cover", { method: "PUT", body: blob });
+	if (!res.ok) return false;
+	b.cover = "yes";
+	if (coverUrls[b.id]) URL.revokeObjectURL(coverUrls[b.id]);
+	coverUrls[b.id] = URL.createObjectURL(blob);
+	return true;
+}
 async function sendPdfCover(sess) {
 	var b = sess.book;
 	if (b.cover === "yes" || state.libOffline || !window.HTMLCanvasElement) return;
 	try {
-		var page = await sess.pdf.doc.getPage(1), vp1 = page.getViewport({ scale: 1 });
-		var vp = page.getViewport({ scale: 360 / vp1.width }), canvas = document.createElement("canvas");
-		canvas.width = Math.floor(vp.width);
-		canvas.height = Math.floor(vp.height);
-		var ctx = canvas.getContext("2d");
-		ctx.fillStyle = "#fff";
-		ctx.fillRect(0, 0, canvas.width, canvas.height);
-		await page.render({ canvasContext: ctx, viewport: vp }).promise;
-		var blob = await new Promise(function (ok) { canvas.toBlob(ok, "image/jpeg", 0.82); });
-		canvas.width = canvas.height = 0;
-		if (!blob) return;
-		var res = await api("/api/books/" + b.id + "/cover", { method: "PUT", body: blob });
-		if (!res.ok) return;
-		b.cover = "yes";
-		if (coverUrls[b.id]) URL.revokeObjectURL(coverUrls[b.id]);
-		coverUrls[b.id] = URL.createObjectURL(blob);
+		var blob = await pdfCoverBlob(sess.pdf.doc);
+		if (blob) await savePdfCover(b, blob);
 	} catch (e) {}
+}
+var pdfCoverLine = Promise.resolve(), pdfCoverTried = {};
+function queuePdfCover(b, cov) {
+	if (pdfCoverTried[b.id] || !b.size || !window.HTMLCanvasElement) return;
+	pdfCoverTried[b.id] = true;
+	pdfCoverLine = pdfCoverLine.then(function () { return pdfCoverFromFile(b, cov); }).catch(function () {});
+}
+async function pdfCoverFromFile(b, cov) {
+	if (b.cover === "yes" || state.libOffline) return;
+	var CHUNK = 65536, size = b.size, failed = null;
+	var part = async function (at, len) {
+		var res = await api("/api/books/" + b.id + "/part?at=" + at + "&len=" + len);
+		if (!res.ok) throw new Error("HTTP " + res.status);
+		return new Uint8Array(await res.arrayBuffer());
+	};
+	var lib = await loadPdfJs();
+	var range = new lib.PDFDataRangeTransport(size, await part(0, Math.min(CHUNK, size)));
+	range.requestDataRange = function (begin, end) {
+		part(begin, end - begin).then(function (d) { range.onDataRange(begin, d); }, function (e) { failed = e; });
+	};
+	var task = lib.getDocument({
+		range: range, length: size, rangeChunkSize: CHUNK, disableAutoFetch: true, disableStream: true,
+		isEvalSupported: false, useWorkerFetch: false,
+		cMapUrl: PDFJS_DATA + "cmaps/", cMapPacked: true, standardFontDataUrl: PDFJS_DATA + "standard_fonts/"
+	});
+	// A piece that never comes leaves pdf.js waiting: give up after a minute.
+	var timer, limit, giveUp = new Promise(function (_, no) {
+		timer = setInterval(function () { if (failed) no(failed); }, 500);
+		limit = setTimeout(function () { no(new Error("timed out")); }, 60000);
+	});
+	giveUp.catch(function () {});
+	try {
+		var blob = await Promise.race([task.promise.then(pdfCoverBlob), giveUp]);
+		if (blob && await savePdfCover(b, blob)) coverArrived(b, cov);
+	} finally {
+		clearInterval(timer);
+		clearTimeout(limit);
+		task.destroy();
+	}
 }
 $("libLayout").addEventListener("click", function () {
 	state.libView = state.libView === "covers" ? "list" : "covers";
