@@ -54,6 +54,9 @@
 //   PUT    /api/books/uploads?key=&upload_id=&n=  body = piece n (from 1) -> {part}
 //   POST   /api/books/uploads/done?name=&key=&upload_id=&tag=  {parts} -> as PUT /api/books
 //   DELETE /api/books/uploads?key=&upload_id=  gives up on an upload
+//   GET    /api/books/lookup?q=    Open Library's matches for a title (and author) -> {hits: [{title, author, year, thumb, work, cover_id}]}
+//   GET    /api/books/lookup/covers?work=&title=&author=&cover_id=  -> {covers: [image URLs]} (Google Books, then Open Library's editions)
+//   GET    /api/books/lookup/image?url=  one of those covers, fetched for the page (Open Library and Google Books only)
 //   GET    /api/books/:id/file     the file itself (?dl=1: saving it for offline, so not "opened")
 //   GET    /api/books/:id/part?at=&len=  len bytes of the file from byte at (up to 4 MB; for drawing a PDF's cover)
 //   GET    /api/books/:id/cover    the cover image (an EPUB's or a comic's first page is found the first time); 404 if none
@@ -215,6 +218,9 @@ async function api(request, env, url) {
 		if (m === "DELETE") return abortUpload(env, url);
 	}
 	if (p === "/api/books/uploads/done" && m === "POST") return finishUpload(request, env, url);
+	if (p === "/api/books/lookup" && m === "GET") return lookupBooks(url);
+	if (p === "/api/books/lookup/covers" && m === "GET") return lookupCovers(url);
+	if (p === "/api/books/lookup/image" && m === "GET") return lookupImage(url);
 	const file = p.match(/^\/api\/books\/(\d+)\/file$/);
 	if (file && m === "GET") return bookFile(env, toId(file[1]), url.searchParams.has("dl"));
 	const part = p.match(/^\/api\/books\/(\d+)\/part$/);
@@ -1849,6 +1855,83 @@ async function bookFile(env, id, download) {
 	});
 }
 
+// Looking a book up, as wr1t3r's book notes do: Open Library's search for the
+// match, then covers from Google Books (usually the sharpest) and Open
+// Library's editions. No keys needed.
+const LOOKUP_UA = "reader-book-lookup/1.0 (https://github.com/librarykaiju/reader)";
+async function lookupJSON(u) {
+	const res = await fetch(u, { headers: { "User-Agent": LOOKUP_UA, Accept: "application/json" } });
+	if (!res.ok) {
+		await res.body?.cancel();
+		throw new HttpError(502, `${new URL(u).hostname} answered ${res.status}`);
+	}
+	return res.json();
+}
+function looseTitle(s) {
+	return String(s || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/['’]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+}
+// Settles to fallback if fn fails or takes over ms.
+function within(fn, fallback, ms) {
+	return Promise.race([fn().catch(() => fallback), new Promise((r) => setTimeout(() => r(fallback), ms))]);
+}
+async function lookupBooks(url) {
+	const q = str(url.searchParams.get("q"), 300);
+	if (!q) throw new HttpError(400, "q is needed");
+	// As typed, then without punctuation, then folded right down: the first
+	// that finds anything. An exact title match goes first.
+	const plain = q.replace(/[^\p{L}\p{N}'’]+/gu, " ").replace(/\s+/g, " ").trim();
+	for (const v of [...new Set([q, plain, looseTitle(q)])].filter(Boolean)) {
+		const data = await lookupJSON("https://openlibrary.org/search.json?" + new URLSearchParams({
+			q: v, fields: "title,author_name,first_publish_year,cover_i,key", limit: "10",
+		}));
+		const hits = (data.docs || []).filter((d) => /^\/works\/OL\d+W$/.test(d.key || "")).map((d) => ({
+			title: String(d.title || ""),
+			author: (d.author_name || []).slice(0, 3).join(", "),
+			year: d.first_publish_year ? String(d.first_publish_year) : "",
+			thumb: d.cover_i ? `https://covers.openlibrary.org/b/id/${d.cover_i}-S.jpg` : "",
+			work: d.key,
+			cover_id: Number.isInteger(d.cover_i) ? d.cover_i : null,
+		}));
+		if (hits.length) {
+			// q is often "title author", so a title the query starts with counts too.
+			const want = looseTitle(q), rank = (h) => { const t = looseTitle(h.title); return t === want ? 2 : t && want.startsWith(t + " ") ? 1 : 0; };
+			hits.sort((a, b) => rank(b) - rank(a));
+			return json({ hits });
+		}
+	}
+	return json({ hits: [] });
+}
+async function lookupCovers(url) {
+	const work = url.searchParams.get("work") || "";
+	if (!/^\/works\/OL\d+W$/.test(work)) throw new HttpError(400, "work is needed");
+	const title = str(url.searchParams.get("title"), 300) || "", author = str(url.searchParams.get("author"), 200) || "";
+	const coverId = Number(url.searchParams.get("cover_id"));
+	const q = [`intitle:${title}`].concat(author ? [`inauthor:${author.split(",")[0]}`] : []).join(" ");
+	const [google, editions] = await Promise.all([
+		within(async () => ((await lookupJSON("https://www.googleapis.com/books/v1/volumes?" + new URLSearchParams({ q, maxResults: "5" }))).items || [])
+			.map((i) => i.volumeInfo?.imageLinks?.thumbnail || i.volumeInfo?.imageLinks?.smallThumbnail).filter(Boolean)
+			.map((u) => { const s = u.replace(/^http:/, "https:"); return /[?&]zoom=\d/.test(s) ? s.replace(/zoom=\d/, "zoom=3") : s + "&zoom=3"; }), [], 6000),
+		within(async () => [...new Set(((await lookupJSON(`https://openlibrary.org${work}/editions.json?limit=20`)).entries || [])
+			.map((e) => e.covers?.[0]).filter((c) => Number.isInteger(c) && c > 0))]
+			.map((c) => `https://covers.openlibrary.org/b/id/${c}-L.jpg`), [], 6000),
+	]);
+	const own = Number.isInteger(coverId) && coverId > 0 ? [`https://covers.openlibrary.org/b/id/${coverId}-L.jpg`] : [];
+	return json({ covers: [...new Set([...google, ...own, ...editions])].slice(0, 8) });
+}
+async function lookupImage(url) {
+	let u;
+	try { u = new URL(url.searchParams.get("url") || ""); } catch { throw new HttpError(400, "url is needed"); }
+	if (u.protocol !== "https:" || !/^(covers\.openlibrary\.org|books\.google\.com|books\.googleusercontent\.com)$/.test(u.hostname)) {
+		throw new HttpError(400, "Only Open Library and Google Books covers");
+	}
+	const res = await fetch(u, { headers: { "User-Agent": LOOKUP_UA } });
+	if (!res.ok) throw new HttpError(502, `${u.hostname} answered ${res.status}`);
+	const img = new Uint8Array(await res.arrayBuffer());
+	const kind = img.length <= MAX_COVER_BYTES && imageType(img);
+	if (!kind) throw new HttpError(502, "That cover isn't an image");
+	return new Response(img, { headers: { "Content-Type": kind, "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" } });
+}
+
 // A piece of a book's file, so the page can draw a PDF's first page without
 // downloading all of it (pdf.js asks for the pieces it needs).
 async function bookPart(env, id, url) {
@@ -2532,6 +2615,17 @@ const PAGE = String.raw`<!doctype html>
 	.details .gencover { gap: 6px; padding: 12% 8%; }
 	.details .gencover .gt { font-size: 11px; }
 	.details .gencover .ga, .details .gencover .gk { display: none; }
+	.details .dlook { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+	.lookhits { list-style: none; margin: 0 0 10px; padding: 0; border-top: 1px solid var(--line); }
+	.lookhits button { display: flex; gap: 10px; align-items: center; width: 100%; text-align: left; background: none; border: 0; border-bottom: 1px solid var(--line); padding: 8px 2px; color: inherit; font: inherit; cursor: pointer; }
+	.lookhits button:hover, .lookhits button[aria-pressed=true] { background: var(--sel); }
+	.lookhits img, .lookhits .noimg { width: 32px; height: 48px; object-fit: cover; border-radius: 3px; flex: none; background: var(--sel); }
+	.lookhits .lt { font-weight: 600; font-size: 14px; display: block; }
+	.lookhits .lm { font-size: 13px; color: var(--muted); display: block; }
+	.lookcovers { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+	.lookcovers button { padding: 0; border: 2px solid transparent; border-radius: 5px; background: none; cursor: pointer; line-height: 0; }
+	.lookcovers button[aria-pressed=true] { border-color: var(--accent); }
+	.lookcovers img { width: 56px; height: 84px; object-fit: cover; border-radius: 3px; }
 	.hlrow span { flex: 1; }
 	.hlitems { list-style: none; margin: 0; padding: 0; }
 	.hlitems li + li { border-top: 1px solid var(--line); }
@@ -3058,6 +3152,12 @@ const PAGE = String.raw`<!doctype html>
 				<input id="dCoverFile" class="vh" type="file" accept="image/jpeg,image/png,image/webp" tabindex="-1" aria-hidden="true">
 			</div>
 		</div>
+		<div class="dlook">
+			<button id="dLookup" class="btn small" type="button">Look up online</button>
+			<span id="dLookStatus" class="hint"></span>
+		</div>
+		<ul id="dHits" class="lookhits" hidden></ul>
+		<div id="dCovers" class="lookcovers" hidden></div>
 		<div id="dTags"></div>
 		<div class="hlrow">
 			<button id="dCancel" class="btn ghost" type="button">Cancel</button>
@@ -6264,6 +6364,11 @@ function openDetails(b) {
 	$("dSeries").value = b.series || "";
 	$("dVolume").value = b.volume || "";
 	$("dCoverFile").value = "";
+	$("dLookStatus").textContent = "";
+	$("dHits").textContent = "";
+	$("dCovers").textContent = "";
+	show($("dHits"), false);
+	show($("dCovers"), false);
 	renderDetailsCover();
 	renderDetailsTags();
 	show($("detailsBox"), true);
@@ -6313,6 +6418,83 @@ async function coverFromImage(file) {
 		return blob;
 	} finally { URL.revokeObjectURL(url); }
 }
+// Look up online: Open Library's matches for the title and author typed.
+// Picking one fills in its title and author and offers its covers.
+async function lookUpDetails() {
+	var d = details, q = [$("dTitle").value.trim(), $("dAuthor").value.trim()].filter(Boolean).join(" ");
+	if (!q) { $("dTitle").focus(); return; }
+	$("dLookStatus").textContent = "Looking…";
+	show($("dCovers"), false);
+	try {
+		var data = await apiJSON("/api/books/lookup?q=" + encodeURIComponent(q));
+		if (details !== d) return;
+		var ul = $("dHits");
+		ul.textContent = "";
+		data.hits.forEach(function (hit) {
+			var b = h("button"), li = h("li"), img = hit.thumb ? h("img") : h("span", "noimg"), txt = h("span");
+			b.type = "button";
+			if (hit.thumb) { img.src = hit.thumb; img.alt = ""; img.loading = "lazy"; }
+			txt.append(h("span", "lt", hit.title), h("span", "lm", [hit.author, hit.year].filter(Boolean).join(" · ")));
+			b.append(img, txt);
+			b.addEventListener("click", function (e) {
+				e.stopPropagation();
+				ul.querySelectorAll("button").forEach(function (x) { x.setAttribute("aria-pressed", String(x === b)); });
+				pickLookup(hit);
+			});
+			li.append(b);
+			ul.append(li);
+		});
+		show(ul, data.hits.length > 0);
+		$("dLookStatus").textContent = data.hits.length ? "Pick the right one:" : "No matches. Try just the title.";
+	} catch (e) { if (details === d) $("dLookStatus").textContent = e.message; }
+}
+async function pickLookup(hit) {
+	var d = details;
+	if (hit.title) $("dTitle").value = hit.title;
+	if (hit.author) $("dAuthor").value = hit.author;
+	renderDetailsCover();
+	var box = $("dCovers");
+	box.textContent = "";
+	show(box, false);
+	$("dLookStatus").textContent = "Finding covers…";
+	try {
+		var data = await apiJSON("/api/books/lookup/covers?" + new URLSearchParams({ work: hit.work, title: hit.title, author: hit.author, cover_id: hit.cover_id || "" }));
+		if (details !== d) return;
+		data.covers.forEach(function (u) {
+			var b = h("button"), img = h("img");
+			b.type = "button";
+			b.setAttribute("aria-label", "Use this cover");
+			img.src = u;
+			img.alt = "";
+			img.loading = "lazy";
+			// Google sends a "no cover" picture for some books: leave those out.
+			img.addEventListener("load", function () { if (img.naturalWidth < 40) b.remove(); });
+			img.addEventListener("error", function () { b.remove(); });
+			b.append(img);
+			b.addEventListener("click", function (e) {
+				e.stopPropagation();
+				box.querySelectorAll("button").forEach(function (x) { x.setAttribute("aria-pressed", String(x === b)); });
+				useLookupCover(u);
+			});
+			box.append(b);
+		});
+		show(box, data.covers.length > 0);
+		$("dLookStatus").textContent = data.covers.length ? "Pick a cover, or keep yours:" : "No covers found for that one.";
+	} catch (e) { if (details === d) $("dLookStatus").textContent = e.message; }
+}
+async function useLookupCover(u) {
+	var d = details;
+	try {
+		var res = await api("/api/books/lookup/image?url=" + encodeURIComponent(u));
+		if (!res.ok) throw new Error((await res.json().catch(function () { return {}; })).error || "HTTP " + res.status);
+		var blob = await coverFromImage(await res.blob());
+		if (details !== d) return;
+		if (d.url) URL.revokeObjectURL(d.url);
+		d.cover = blob;
+		d.url = URL.createObjectURL(blob);
+		renderDetailsCover();
+	} catch (e) { if (details === d) $("dLookStatus").textContent = e.message; }
+}
 async function saveDetails() {
 	var d = details, b = d.book, patch = {};
 	var vals = { title: $("dTitle").value.trim(), author: $("dAuthor").value.trim(), series: $("dSeries").value.trim(), volume: $("dVolume").value.trim() };
@@ -6341,6 +6523,7 @@ async function saveDetails() {
 }
 $("detailsForm").addEventListener("submit", function (e) { e.preventDefault(); saveDetails(); });
 $("dCancel").addEventListener("click", closeDetails);
+$("dLookup").addEventListener("click", function (e) { e.stopPropagation(); lookUpDetails(); });
 $("dCoverPick").addEventListener("click", function () { $("dCoverFile").click(); });
 $("dCoverFile").addEventListener("change", async function () {
 	var file = this.files[0];
@@ -7706,6 +7889,7 @@ async function openCbz(sess, pos) {
 	listen(sess, box, "touchcancel", function () { swipe = null; }, { passive: true });
 	listen(sess, document, "keydown", function (e) {
 		if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || !$("bookMenu").hidden || !$("settings").hidden) return;
+		if (e.target.closest && e.target.closest("input, textarea, select, [contenteditable]")) return;
 		var dir = e.key === "ArrowRight" || e.key === "j" || e.key === "PageDown" ? 1 : e.key === "ArrowLeft" || e.key === "k" || e.key === "PageUp" ? -1 : 0;
 		if (!dir) return;
 		e.preventDefault();
