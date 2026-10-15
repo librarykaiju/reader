@@ -173,6 +173,8 @@ npx wrangler d1 execute reader --remote --file migrations/0003_feed_tags.sql
 npx wrangler d1 execute reader --remote --file migrations/0004_podcasts.sql
 npx wrangler d1 execute reader --remote --file migrations/0005_book_tags_and_details.sql
 npx wrangler d1 execute reader --remote --file migrations/0006_stories.sql
+npx wrangler d1 execute reader --remote --file migrations/0007_highlights.sql
+npx wrangler d1 execute reader --remote --file migrations/0008_coverage.sql
 npx wrangler deploy
 ```
 
@@ -195,6 +197,7 @@ A migration that already ran stops with an error such as "duplicate column name"
 - **Reading:** tap an article to open it. If the feed only gives a summary, the reader fetches the full article and keeps a copy. **Original ↗** opens the real page. Opening an article marks it read. **Save** keeps it in **Saved** for good.
 - **Clean-up:** unsaved articles older than 90 days are removed once the feed stops listing them.
 - **Stories:** when a feed has several articles on the same story (AP often posts the news, a live page, photos and a profile), **Unread** and **All** show them as one entry: the newest headline, with the others listed under it. The story counts as one in the unread numbers, and opening any of its articles marks the whole story read (**Mark unread** brings it all back). If a new article on the story comes in later, the story shows as unread again with that one on top. Grouping only happens inside one feed, looks at the last three days, and goes by the words in the headlines and links, so it's approximate: now and then it will group two stories that only share a few words, or miss a match. **Saved** always shows articles one by one. (Update with migration 0006.)
+- **Compare coverage** (needs Part 7): when another feed has the same story from around the same time, a box above the article says **Also covered by** and names it. **Compare coverage** gets the full text of each article and asks Claude for a digest: **What the sources agree on** (only facts at least two of them report, with which ones) and **What the sources are saying** (per outlet, what it reports differently or alone). Each of those points quotes its article word for word, and the quote links to that passage on the original page; a point whose quote isn't really in the article is thrown out before you see it, and the digest says how many were. A paywalled article that only gave a teaser is marked as an excerpt, so it's never counted as leaving something out. The digest is saved: opening any of its articles shows **Show coverage digest** at no cost, and **Compare again** appears if a new source turns up. Matching goes by headline and opening words, two days either side, at most one article per feed, so it needs feeds that cover the same news. Claude also drops an article that turns out to be a different story.
 
 **Newsletters by email** (needs Part 6)
 - Subscribe to a newsletter with your reader address (`news@bkaijunews.org`). Each sender gets its own feed with an **email** tag, and each issue shows up as an article in **Unread** as soon as it arrives. **Refresh** doesn't touch these feeds.
@@ -283,6 +286,17 @@ Forwarded Patreon mail is still recognized as Patreon even if Proton puts your a
 
 > [!check] Checkpoint
 > From any email account, send a message to `news@bkaijunews.org`. Open the reader: a feed named after you, tagged **email**, should appear with the message in it. Remove it afterwards (that also ignores more mail from that address, see **Newsletters by email** above).
+
+## Part 7: Compare coverage
+
+This turns on the **Compare coverage** button. It calls the Anthropic API from the Worker, which you pay for per use. Do the Updating steps for migration `0008` first.
+
+1. Make an API key at [console.anthropic.com](https://console.anthropic.com) → **API keys** → **Create key**, and add some credit under **Billing**. Setting a monthly limit there is a good idea.
+2. Cloudflare dashboard → Workers → `reader` → **Settings** → **Variables and Secrets** → **Add**: type **Secret**, name `ANTHROPIC_API_KEY`, value the key → **Deploy**.
+
+Or from a terminal: `npx wrangler secret put ANTHROPIC_API_KEY`.
+
+Each comparison is one request to Claude Opus 5.5 with all the articles in it. Two or three news articles are usually under 10,000 tokens in, plus a few thousand out for the answer and its reasoning, so expect around 5 to 15 cents a comparison. Saved digests cost nothing to open again. Without the key, the box still names the other sources; the button says the key is missing.
 
 ## If something goes wrong
 

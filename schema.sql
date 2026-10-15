@@ -147,3 +147,19 @@ CREATE TABLE IF NOT EXISTS highlights (
 );
 
 CREATE INDEX IF NOT EXISTS highlights_by_book ON highlights (book_id, start_pos);
+
+-- Saved "Compare coverage" digests: how several feeds covered one story.
+-- item_ids is a JSON array of the articles compared (the one it was asked
+-- from first); digest is the JSON the page shows. No foreign key, so a
+-- digest outlives a pruned article; digests older than 90 days are deleted
+-- when the next one is saved.
+CREATE TABLE IF NOT EXISTS coverage (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	item_id INTEGER NOT NULL,
+	item_ids TEXT NOT NULL,
+	digest TEXT NOT NULL,
+	model TEXT NOT NULL,
+	created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS coverage_by_item ON coverage (item_id);

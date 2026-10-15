@@ -23,6 +23,7 @@ bucket_name = "reader-books"
 # Secret (not stored here) -- set with `npx wrangler secret put READER_TOKEN`:
 #   READER_TOKEN  -- any long random string; the page asks for it once per
 #                    device and sends it as a Bearer token
+#   ANTHROPIC_API_KEY -- optional; turns on "Compare coverage" (docs/setup.md, Part 7)
 #
 # Dev only (put it in .dev.vars, never in production):
 #   ALLOW_PRIVATE_FETCH = "1"  -- lets /api/fetch reach localhost/private IPs
