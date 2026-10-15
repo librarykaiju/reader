@@ -50,7 +50,12 @@
 //   GET    /api/books              -> {"books": [...each with tags: [book tag ids]]}
 //   PUT    /api/books?name=&tag=  body = a .txt, .pdf, .cbz or .epub file -> {"book"} (tag: a book tag id to put on it)
 //                                  (a file name already in the Library replaces that book's file: {"book", "replaced": true})
+//   POST   /api/books/uploads?name=  a file over 95 MB, sent in pieces -> {key, upload_id, part_size}
+//   PUT    /api/books/uploads?key=&upload_id=&n=  body = piece n (from 1) -> {part}
+//   POST   /api/books/uploads/done?name=&key=&upload_id=&tag=  {parts} -> as PUT /api/books
+//   DELETE /api/books/uploads?key=&upload_id=  gives up on an upload
 //   GET    /api/books/:id/file     the file itself (?dl=1: saving it for offline, so not "opened")
+//   GET    /api/books/:id/part?at=&len=  len bytes of the file from byte at (up to 4 MB; for drawing a PDF's cover)
 //   GET    /api/books/:id/cover    the cover image (an EPUB's or a comic's first page is found the first time); 404 if none
 //   PUT    /api/books/:id/cover    body = a JPEG/PNG/WebP the page drew (a PDF's first page)
 //   PATCH  /api/books/:id          {title?, author?, series?, volume?, position?, finished?, opened?, tags?, reread?}
@@ -203,8 +208,16 @@ async function api(request, env, url) {
 		if (m === "GET") return listBooks(env);
 		if (m === "PUT") return uploadBook(request, env, url);
 	}
+	if (p === "/api/books/uploads") {
+		if (m === "POST") return startUpload(env, url);
+		if (m === "PUT") return uploadPart(request, env, url);
+		if (m === "DELETE") return abortUpload(env, url);
+	}
+	if (p === "/api/books/uploads/done" && m === "POST") return finishUpload(request, env, url);
 	const file = p.match(/^\/api\/books\/(\d+)\/file$/);
 	if (file && m === "GET") return bookFile(env, toId(file[1]), url.searchParams.has("dl"));
+	const part = p.match(/^\/api\/books\/(\d+)\/part$/);
+	if (part && m === "GET") return bookPart(env, toId(part[1]), url);
 	const cover = p.match(/^\/api\/books\/(\d+)\/cover$/);
 	if (cover) {
 		if (m === "GET") return bookCover(env, toId(cover[1]));
@@ -1696,13 +1709,20 @@ async function listBooks(env) {
 	return json({ books: results });
 }
 
-async function uploadBook(request, env, url) {
+function uploadName(url) {
 	const filename = (url.searchParams.get("name") || "").split(/[\\/]/).pop().trim().slice(0, 300);
 	const dot = filename.lastIndexOf(".");
 	const ext = dot > 0 ? filename.slice(dot + 1).toLowerCase() : "";
 	if (!BOOK_TYPES[ext]) throw new HttpError(415, "Only .txt, .pdf, .cbz and .epub files");
+	return { filename, ext };
+}
+async function uploadTagsOf(env, url) {
 	const tagParam = url.searchParams.get("tag");
-	const uploadTags = tagParam ? await tagRefs(env, [tagParam], TAGS.books) : [];
+	return tagParam ? await tagRefs(env, [tagParam], TAGS.books) : [];
+}
+async function uploadBook(request, env, url) {
+	const { filename, ext } = uploadName(url);
+	const uploadTags = await uploadTagsOf(env, url);
 
 	const length = Number(request.headers.get("Content-Length"));
 	if (length > MAX_BOOK_BYTES) throw new HttpError(413, "File too large (95 MB max)");
@@ -1716,6 +1736,54 @@ async function uploadBook(request, env, url) {
 
 	const key = `books/${crypto.randomUUID()}.${ext}`;
 	const obj = await env.BOOKS.put(key, body, { httpMetadata: { contentType: BOOK_TYPES[ext] } });
+	return addBookFile(env, filename, ext, key, obj.size, uploadTags);
+}
+
+// A file over 95 MB (a Worker takes at most 100 MB a request) goes up in
+// pieces, as an R2 multipart upload: started, sent a piece at a time, then
+// put together and added like any other upload.
+const UPLOAD_PART_BYTES = 50 * 1024 * 1024;
+function uploadRef(url) {
+	const key = url.searchParams.get("key") || "", uploadId = url.searchParams.get("upload_id") || "";
+	if (!/^books\/[0-9a-f-]{36}\.(txt|pdf|cbz|epub)$/.test(key) || !uploadId) throw new HttpError(400, "key and upload_id are needed");
+	return { key, uploadId };
+}
+async function startUpload(env, url) {
+	const { ext } = uploadName(url);
+	const key = `books/${crypto.randomUUID()}.${ext}`;
+	const up = await env.BOOKS.createMultipartUpload(key, { httpMetadata: { contentType: BOOK_TYPES[ext] } });
+	return json({ key, upload_id: up.uploadId, part_size: UPLOAD_PART_BYTES }, 201);
+}
+async function uploadPart(request, env, url) {
+	const { key, uploadId } = uploadRef(url);
+	const n = Number(url.searchParams.get("n"));
+	if (!Number.isInteger(n) || n < 1 || n > 10000) throw new HttpError(400, "n must be a piece number from 1");
+	const length = Number(request.headers.get("Content-Length"));
+	if (!(length > 0) || length > UPLOAD_PART_BYTES) throw new HttpError(400, "Each piece needs a length, up to 50 MB");
+	const part = await env.BOOKS.resumeMultipartUpload(key, uploadId).uploadPart(n, request.body);
+	return json({ part: { partNumber: part.partNumber, etag: part.etag } });
+}
+async function abortUpload(env, url) {
+	const { key, uploadId } = uploadRef(url);
+	await env.BOOKS.resumeMultipartUpload(key, uploadId).abort().catch(() => {});
+	return json({ ok: true });
+}
+async function finishUpload(request, env, url) {
+	const { filename, ext } = uploadName(url);
+	const { key, uploadId } = uploadRef(url);
+	if (!key.endsWith("." + ext)) throw new HttpError(400, "That upload is for a different kind of file");
+	const uploadTags = await uploadTagsOf(env, url);
+	const body = await readJSON(request);
+	const parts = Array.isArray(body.parts) ? body.parts.map((p) => ({ partNumber: Number(p.partNumber), etag: String(p.etag || "") })) : [];
+	if (!parts.length || parts.some((p) => !Number.isInteger(p.partNumber) || !p.etag)) throw new HttpError(400, "parts: [{partNumber, etag}]");
+	const obj = await env.BOOKS.resumeMultipartUpload(key, uploadId).complete(parts);
+	return addBookFile(env, filename, ext, key, obj.size, uploadTags);
+}
+
+// A file now in R2 at key, as a book: a new one, or the new file of the book
+// with the same file name.
+async function addBookFile(env, filename, ext, key, size, uploadTags) {
+	const dot = filename.lastIndexOf(".");
 	// Same file name as a book already here: that book gets the new file.
 	// Its place, Finished and tags stay; a YAML header updates the details.
 	const old = await env.DB.prepare("SELECT id, r2_key FROM books WHERE filename = ? COLLATE NOCASE ORDER BY id DESC LIMIT 1")
@@ -1724,7 +1792,7 @@ async function uploadBook(request, env, url) {
 	if (old) {
 		try {
 			const book = await env.DB.prepare(`UPDATE books SET size = ?, r2_key = ? WHERE id = ? RETURNING ${BOOK_COLUMNS}`)
-				.bind(obj.size, key, old.id)
+				.bind(size, key, old.id)
 				.first();
 			await addBookTags(env, old.id, uploadTags);
 			const { results } = await env.DB.prepare("SELECT tag_id FROM book_tag_links WHERE book_id = ?").bind(old.id).all();
@@ -1745,7 +1813,7 @@ async function uploadBook(request, env, url) {
 			`INSERT INTO books (title, filename, type, size, r2_key, created_at)
 			VALUES (?, ?, ?, ?, ?, ?) RETURNING ${BOOK_COLUMNS}`,
 		)
-			.bind(title, filename, storedType(ext), obj.size, key, Date.now())
+			.bind(title, filename, storedType(ext), size, key, Date.now())
 			.first();
 		await addBookTags(env, book.id, uploadTags);
 		book.tags = uploadTags;
@@ -1776,6 +1844,19 @@ async function bookFile(env, id, download) {
 			"X-Content-Type-Options": "nosniff",
 			"Content-Security-Policy": "default-src 'none'; sandbox",
 		},
+	});
+}
+
+// A piece of a book's file, so the page can draw a PDF's first page without
+// downloading all of it (pdf.js asks for the pieces it needs).
+async function bookPart(env, id, url) {
+	const book = await getBook(env, id);
+	const at = Number(url.searchParams.get("at")), len = Number(url.searchParams.get("len"));
+	if (!Number.isInteger(at) || !Number.isInteger(len) || at < 0 || len < 1 || len > 4 * 1024 * 1024) throw new HttpError(400, "at and len must be whole numbers, len up to 4 MB");
+	const obj = await env.BOOKS.get(book.r2_key, { range: { offset: at, length: len } });
+	if (!obj) throw new HttpError(404, "The file is missing from storage");
+	return new Response(obj.body, {
+		headers: { "Content-Type": "application/octet-stream", "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" },
 	});
 }
 
@@ -2867,7 +2948,7 @@ const PAGE = String.raw`<!doctype html>
 			<button id="uploadBtn" class="btn primary" type="button">Upload</button>
 		</div>
 		<input id="bookFile" class="vh" type="file" accept=".txt,.pdf,.cbz,.epub,text/plain,application/pdf,application/vnd.comicbook+zip,application/x-cbz,application/zip,application/epub+zip" multiple tabindex="-1" aria-hidden="true">
-		<div class="hint">.txt, .pdf, DRM-free .epub, or .cbz comics, up to 95 MB each. A file with the same name as a book here replaces that book's file. ⤓ keeps a book on this device for reading offline.</div>
+		<div class="hint">.txt, .pdf, DRM-free .epub, or .cbz comics. A file with the same name as a book here replaces that book's file. ⤓ keeps a book on this device for reading offline.</div>
 		<ul id="uploads" class="uploads"></ul>
 	</div>
 	<p id="libNote" class="hint" hidden>You're offline. These are the books downloaded on this device; your place syncs when you're back online.</p>
@@ -6011,7 +6092,7 @@ function bookCard(b) {
 	if (pct) a.append(bar);
 	li.append(a);
 	if (coverUrls[b.id]) showCover(cov, coverUrls[b.id]);
-	else if (b.type !== "txt" && b.cover !== "none" && !(b.type === "pdf" && b.cover !== "yes")) watchCover(b, cov);
+	else if (b.type !== "txt" && b.cover !== "none") watchCover(b, cov);
 	return li;
 }
 function drawnCover(b) {
@@ -6044,40 +6125,95 @@ function watchCover(b, cov) {
 	cov.book = b;
 	coverIO.observe(cov);
 }
+// The Library may have been drawn again while the cover was on its way.
+function coverArrived(b, cov) {
+	if (!cov.isConnected) cov = document.querySelector('#books a[href="#/book/' + b.id + '"] .cover');
+	if (cov && !cov.querySelector("img")) showCover(cov, coverUrls[b.id]);
+}
 async function loadCover(b, cov) {
 	if (state.libOffline) return;
+	if (b.type === "pdf" && b.cover !== "yes") return queuePdfCover(b, cov);
 	try {
 		var res = await api("/api/books/" + b.id + "/cover");
 		if (res.status === 404) { b.cover = "none"; return; }
 		if (!res.ok) return;
-		var url = coverUrls[b.id] = URL.createObjectURL(await res.blob());
+		coverUrls[b.id] = URL.createObjectURL(await res.blob());
 		b.cover = "yes";
-		if (cov.isConnected) showCover(cov, url);
+		coverArrived(b, cov);
 	} catch (e) {}
 }
-// A PDF's cover: its first page, drawn small once it's open here, if the
-// Worker doesn't have one for this file yet.
+// A PDF's cover: its first page, drawn small and kept by the Worker. Drawn
+// when the PDF is opened here, or when its spot in the Covers view comes on
+// screen: then pdf.js reads only the parts of the file that page needs, one
+// PDF at a time. A PDF that can't be drawn keeps its drawn cover.
+async function pdfCoverBlob(doc) {
+	var page = await doc.getPage(1), vp1 = page.getViewport({ scale: 1 });
+	var vp = page.getViewport({ scale: 360 / vp1.width }), canvas = document.createElement("canvas");
+	canvas.width = Math.floor(vp.width);
+	canvas.height = Math.floor(vp.height);
+	var ctx = canvas.getContext("2d");
+	ctx.fillStyle = "#fff";
+	ctx.fillRect(0, 0, canvas.width, canvas.height);
+	await page.render({ canvasContext: ctx, viewport: vp }).promise;
+	var blob = await new Promise(function (ok) { canvas.toBlob(ok, "image/jpeg", 0.82); });
+	canvas.width = canvas.height = 0;
+	page.cleanup();
+	return blob;
+}
+async function savePdfCover(b, blob) {
+	var res = await api("/api/books/" + b.id + "/cover", { method: "PUT", body: blob });
+	if (!res.ok) return false;
+	b.cover = "yes";
+	if (coverUrls[b.id]) URL.revokeObjectURL(coverUrls[b.id]);
+	coverUrls[b.id] = URL.createObjectURL(blob);
+	return true;
+}
 async function sendPdfCover(sess) {
 	var b = sess.book;
 	if (b.cover === "yes" || state.libOffline || !window.HTMLCanvasElement) return;
 	try {
-		var page = await sess.pdf.doc.getPage(1), vp1 = page.getViewport({ scale: 1 });
-		var vp = page.getViewport({ scale: 360 / vp1.width }), canvas = document.createElement("canvas");
-		canvas.width = Math.floor(vp.width);
-		canvas.height = Math.floor(vp.height);
-		var ctx = canvas.getContext("2d");
-		ctx.fillStyle = "#fff";
-		ctx.fillRect(0, 0, canvas.width, canvas.height);
-		await page.render({ canvasContext: ctx, viewport: vp }).promise;
-		var blob = await new Promise(function (ok) { canvas.toBlob(ok, "image/jpeg", 0.82); });
-		canvas.width = canvas.height = 0;
-		if (!blob) return;
-		var res = await api("/api/books/" + b.id + "/cover", { method: "PUT", body: blob });
-		if (!res.ok) return;
-		b.cover = "yes";
-		if (coverUrls[b.id]) URL.revokeObjectURL(coverUrls[b.id]);
-		coverUrls[b.id] = URL.createObjectURL(blob);
+		var blob = await pdfCoverBlob(sess.pdf.doc);
+		if (blob) await savePdfCover(b, blob);
 	} catch (e) {}
+}
+var pdfCoverLine = Promise.resolve(), pdfCoverTried = {};
+function queuePdfCover(b, cov) {
+	if (pdfCoverTried[b.id] || !b.size || !window.HTMLCanvasElement) return;
+	pdfCoverTried[b.id] = true;
+	pdfCoverLine = pdfCoverLine.then(function () { return pdfCoverFromFile(b, cov); }).catch(function () {});
+}
+async function pdfCoverFromFile(b, cov) {
+	if (b.cover === "yes" || state.libOffline) return;
+	var CHUNK = 65536, size = b.size, failed = null;
+	var part = async function (at, len) {
+		var res = await api("/api/books/" + b.id + "/part?at=" + at + "&len=" + len);
+		if (!res.ok) throw new Error("HTTP " + res.status);
+		return new Uint8Array(await res.arrayBuffer());
+	};
+	var lib = await loadPdfJs();
+	var range = new lib.PDFDataRangeTransport(size, await part(0, Math.min(CHUNK, size)));
+	range.requestDataRange = function (begin, end) {
+		part(begin, end - begin).then(function (d) { range.onDataRange(begin, d); }, function (e) { failed = e; });
+	};
+	var task = lib.getDocument({
+		range: range, length: size, rangeChunkSize: CHUNK, disableAutoFetch: true, disableStream: true,
+		isEvalSupported: false, useWorkerFetch: false,
+		cMapUrl: PDFJS_DATA + "cmaps/", cMapPacked: true, standardFontDataUrl: PDFJS_DATA + "standard_fonts/"
+	});
+	// A piece that never comes leaves pdf.js waiting: give up after a minute.
+	var timer, limit, giveUp = new Promise(function (_, no) {
+		timer = setInterval(function () { if (failed) no(failed); }, 500);
+		limit = setTimeout(function () { no(new Error("timed out")); }, 60000);
+	});
+	giveUp.catch(function () {});
+	try {
+		var blob = await Promise.race([task.promise.then(pdfCoverBlob), giveUp]);
+		if (blob && await savePdfCover(b, blob)) coverArrived(b, cov);
+	} finally {
+		clearInterval(timer);
+		clearTimeout(limit);
+		task.destroy();
+	}
 }
 $("libLayout").addEventListener("click", function () {
 	state.libView = state.libView === "covers" ? "list" : "covers";
@@ -6125,14 +6261,14 @@ async function uploadFiles(files) {
 	for (var i = 0; i < files.length; i++) await uploadOne(files[i], tagId);
 	await Promise.all([loadBooks(), loadBookTags()]).catch(fail);
 }
-// XHR rather than fetch, for an upload progress readout on big PDFs.
 function uploadOne(file, tagId) {
 	return new Promise(function (resolve) {
 		var li = h("li", "", file.name + " …");
 		$("uploads").append(li);
 		var done = function (ok, msg) { li.textContent = (ok ? "✓ " : "✗ ") + file.name + (msg ? ": " + msg : ""); li.className = ok ? "" : "err"; resolve(); };
 		if (!/\.(txt|pdf|cbz|epub)$/i.test(file.name)) return done(false, "only .txt, .pdf, .cbz and .epub files");
-		if (file.size > 95 * 1024 * 1024) return done(false, "over 95 MB");
+		var q = "name=" + encodeURIComponent(file.name) + (tagId ? "&tag=" + tagId : "");
+		var progress = function (sent) { li.textContent = file.name + " … " + Math.round(sent / file.size * 100) + "%"; };
 		// An EPUB is opened here first: a locked (DRM) one is turned away,
 		// and its title, author and series go on the book once it's up.
 		var meta = null;
@@ -6151,30 +6287,68 @@ function uploadOne(file, tagId) {
 			}, function () { done(false, "couldn't read the file"); });
 		} else send();
 		function send() {
-			var xhr = new XMLHttpRequest();
-			xhr.open("PUT", "/api/books?name=" + encodeURIComponent(file.name) + (tagId ? "&tag=" + tagId : ""));
-			xhr.setRequestHeader("Authorization", "Bearer " + token());
-			xhr.upload.onprogress = function (e) { if (e.lengthComputable) li.textContent = file.name + " … " + Math.round(e.loaded / e.total * 100) + "%"; };
-			xhr.onload = function () {
-				if (xhr.status === 401) { store("readerToken", null); askToken("That token didn't work."); return done(false, "unauthorized"); }
-				var data = {};
-				try { data = JSON.parse(xhr.responseText); } catch (e) {}
-				if (xhr.status >= 300) return done(false, data.error || "HTTP " + xhr.status);
-				var details = meta ? epubDetails(data.book, meta).catch(function () {}) : Promise.resolve();
-				details.then(function () {
-					done(true, data.replaced ? "replaced the file of “" + data.book.title + "”" : "");
-					// A downloaded copy is the old file now: fetch the new one.
-					if (data.replaced && bookDownloads[data.book.id]) {
-						forgetBookDownload(data.book.id);
-						saveBookDownloads();
-						downloadBook(data.book);
-					}
-				});
-			};
-			xhr.onerror = function () { done(false, "network error"); };
-			xhr.send(file);
+			if (file.size > 90 * 1024 * 1024) {
+				sendInPieces(file, q, progress).then(added, function (e) { done(false, e.message); });
+				return;
+			}
+			xhrSend("PUT", "/api/books?" + q, file, function (loaded) { progress(loaded); }).then(added, function (e) { done(false, e.message); });
+		}
+		function added(data) {
+			var details = meta ? epubDetails(data.book, meta).catch(function () {}) : Promise.resolve();
+			details.then(function () {
+				done(true, data.replaced ? "replaced the file of “" + data.book.title + "”" : "");
+				// A downloaded copy is the old file now: fetch the new one.
+				if (data.replaced && bookDownloads[data.book.id]) {
+					forgetBookDownload(data.book.id);
+					saveBookDownloads();
+					downloadBook(data.book);
+				}
+			});
 		}
 	});
+}
+// XHR rather than fetch, for an upload progress readout on big files.
+// -> the JSON reply; an error says what the Worker said.
+function xhrSend(method, path, body, onProgress) {
+	return new Promise(function (resolve, reject) {
+		var xhr = new XMLHttpRequest();
+		xhr.open(method, path);
+		xhr.setRequestHeader("Authorization", "Bearer " + token());
+		if (onProgress) xhr.upload.onprogress = function (e) { if (e.lengthComputable) onProgress(e.loaded); };
+		xhr.onload = function () {
+			if (xhr.status === 401) { store("readerToken", null); askToken("That token didn't work."); return reject(new Error("unauthorized")); }
+			var data = {};
+			try { data = JSON.parse(xhr.responseText); } catch (e) {}
+			if (xhr.status >= 300) return reject(new Error(data.error || "HTTP " + xhr.status));
+			resolve(data);
+		};
+		xhr.onerror = function () { reject(new Error("network error")); };
+		xhr.send(body);
+	});
+}
+// A file over 90 MB goes up in pieces (a Worker takes at most 100 MB a
+// request), each tried again twice if the connection drops.
+async function sendInPieces(file, q, progress) {
+	var up = await xhrSend("POST", "/api/books/uploads?" + q, null);
+	var ref = "key=" + encodeURIComponent(up.key) + "&upload_id=" + encodeURIComponent(up.upload_id);
+	var parts = [], size = up.part_size;
+	try {
+		for (var n = 1, at = 0; at < file.size; n++, at += size) {
+			var piece = file.slice(at, Math.min(at + size, file.size)), base = at, res = null;
+			for (var tries = 0; !res; tries++) {
+				try {
+					res = await xhrSend("PUT", "/api/books/uploads?" + ref + "&n=" + n, piece, function (loaded) { progress(base + loaded); });
+				} catch (e) {
+					if (tries >= 2 || e.message === "unauthorized") throw e;
+				}
+			}
+			parts.push(res.part);
+		}
+		return await xhrSend("POST", "/api/books/uploads/done?" + q + "&" + ref, JSON.stringify({ parts: parts }));
+	} catch (e) {
+		api("/api/books/uploads?" + ref, { method: "DELETE" }).catch(function () {});
+		throw e;
+	}
 }
 
 // ---------- book reader (shared)
