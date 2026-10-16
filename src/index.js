@@ -60,6 +60,8 @@
 //   GET    /api/books/:id/file     the file itself (?dl=1: saving it for offline, so not "opened")
 //   GET    /api/books/:id/part?at=&len=  len bytes of the file from byte at (up to 4 MB; for drawing a PDF's cover)
 //   GET    /api/books/:id/cover    the cover image (an EPUB's or a comic's first page is found the first time); 404 if none
+//   POST   /api/books/:id/genres  {title?, author?, online?} -> {"book", "added": [tag names], "from": "file"|"online"|""}
+//                                  adds genre tags from the file's own subjects, else Open Library's (never removes any)
 //   PUT    /api/books/:id/cover    body = a JPEG/PNG/WebP: a PDF's first page the page drew, or one chosen in Edit details
 //   DELETE /api/books/:id/cover    back to the automatic cover (the file's own, or a PDF's first page)
 //   PATCH  /api/books/:id          {title?, author?, series?, volume?, position?, finished?, opened?, tags?, reread?}
@@ -226,6 +228,8 @@ async function api(request, env, url) {
 	if (file && m === "GET") return bookFile(env, toId(file[1]), url.searchParams.has("dl"));
 	const part = p.match(/^\/api\/books\/(\d+)\/part$/);
 	if (part && m === "GET") return bookPart(env, toId(part[1]), url);
+	const genres = p.match(/^\/api\/books\/(\d+)\/genres$/);
+	if (genres && m === "POST") return tagGenres(request, env, toId(genres[1]));
 	const cover = p.match(/^\/api\/books\/(\d+)\/cover$/);
 	if (cover) {
 		if (m === "GET") return bookCover(env, toId(cover[1]));
@@ -1789,10 +1793,23 @@ async function finishUpload(request, env, url) {
 	return addBookFile(env, filename, ext, key, obj.size, uploadTags);
 }
 
+// Genre tags from a new file's own details (no looking up online, so an
+// upload stays quick). Never stops the upload.
+async function uploadGenres(env, book, key) {
+	try {
+		if (!(await addGenreTags(env, Object.assign({}, book, { r2_key: key }), { online: false })).added.length) return;
+		const { results } = await env.DB.prepare("SELECT tag_id FROM book_tag_links WHERE book_id = ?").bind(book.id).all();
+		book.tags = results.map((r) => r.tag_id);
+	} catch (err) { console.warn("genres", book.id, err); }
+}
+// A new book's title, from its file name: "war_and_peace.txt" -> "war and peace".
+function madeTitle(filename) {
+	const dot = filename.lastIndexOf(".");
+	return filename.slice(0, dot > 0 ? dot : filename.length).replace(/[_]+/g, " ").replace(/\s+/g, " ").trim() || filename;
+}
 // A file now in R2 at key, as a book: a new one, or the new file of the book
 // with the same file name.
 async function addBookFile(env, filename, ext, key, size, uploadTags) {
-	const dot = filename.lastIndexOf(".");
 	// Same file name as a book already here: that book gets the new file.
 	// Its place, Finished and tags stay; a YAML header updates the details.
 	const old = await env.DB.prepare("SELECT id, r2_key FROM books WHERE filename = ? COLLATE NOCASE ORDER BY id DESC LIMIT 1")
@@ -1807,6 +1824,7 @@ async function addBookFile(env, filename, ext, key, size, uploadTags) {
 			const { results } = await env.DB.prepare("SELECT tag_id FROM book_tag_links WHERE book_id = ?").bind(old.id).all();
 			book.tags = results.map((r) => r.tag_id);
 			if (ext === "txt") await applyFrontMatter(env, Object.assign(book, { r2_key: key })).catch(() => {});
+			else await uploadGenres(env, book, key);
 			delete book.r2_key;
 			await env.BOOKS.delete(old.r2_key);
 			return json({ book, replaced: true });
@@ -1815,8 +1833,7 @@ async function addBookFile(env, filename, ext, key, size, uploadTags) {
 			throw err;
 		}
 	}
-	// "war_and_peace.txt" -> "war and peace"
-	const title = filename.slice(0, dot).replace(/[_]+/g, " ").replace(/\s+/g, " ").trim() || filename;
+	const title = madeTitle(filename);
 	try {
 		const book = await env.DB.prepare(
 			`INSERT INTO books (title, filename, type, size, r2_key, created_at)
@@ -1827,6 +1844,7 @@ async function addBookFile(env, filename, ext, key, size, uploadTags) {
 		await addBookTags(env, book.id, uploadTags);
 		book.tags = uploadTags;
 		if (ext === "txt") await applyFrontMatter(env, book).catch(() => {});
+		else await uploadGenres(env, book, key);
 		return json({ book }, 201);
 	} catch (err) {
 		await env.BOOKS.delete(key);
@@ -2050,18 +2068,214 @@ async function applyFrontMatter(env, book) {
 	).bind(fm.title, fm.author, fm.series, fm.volume, book.id).first();
 	Object.assign(book, row);
 	if (!fm.genres.length) return;
-	const ids = [];
-	for (const name of fm.genres) {
-		const tag = (await env.DB.prepare("SELECT id FROM book_tags WHERE name = ?").bind(name).first())
-			|| (await env.DB.prepare("INSERT INTO book_tags (name, created_at) VALUES (?, ?) RETURNING id").bind(name, Date.now()).first());
-		ids.push(tag.id);
-	}
+	const ids = await bookTagsNamed(env, fm.genres);
 	await addBookTags(env, book.id, ids);
 	book.tags = [...new Set([...(book.tags || []), ...ids])];
 }
 function addBookTags(env, bookId, ids) {
 	if (!ids.length) return;
 	return env.DB.batch(ids.map((t) => env.DB.prepare("INSERT OR IGNORE INTO book_tag_links (book_id, tag_id) VALUES (?, ?)").bind(bookId, t)));
+}
+// The ids of the book tags with these names (ignoring case), made if new.
+async function bookTagsNamed(env, names) {
+	const ids = [];
+	for (const name of names) {
+		const tag = (await env.DB.prepare("SELECT id FROM book_tags WHERE name = ?").bind(name).first())
+			|| (await env.DB.prepare("INSERT INTO book_tags (name, created_at) VALUES (?, ?) RETURNING id").bind(name, Date.now()).first());
+		ids.push(tag.id);
+	}
+	return ids;
+}
+
+// Genre tags. Subjects come from the book's own file first (an EPUB's
+// dc:subject, a comic's ComicInfo.xml Genre and Tags, a PDF's Keywords),
+// and, if those give nothing, from Open Library's subjects for the book.
+// Raw subjects are messy ("FICTION / Fantasy / Epic", "Fiction, fantasy,
+// general", "Wizards", "nyt:hardcover-fiction=2010-05-02"), so each is
+// matched against this short list and only these names become tags. A
+// subject from the file that's already a book tag's name counts as well.
+// Tags are only ever added; any the book has stay.
+const GENRES = [
+	["Urban Fantasy", /urban fantasy|fantasy urban|\bparanormal\b/],
+	["Science Fiction", /science fiction|\bsci ?fi\b|space opera|cyberpunk|dystopia|time travel/],
+	["Fantasy", /\bfantasy\b|sword and sorcery/],
+	["Horror", /\bhorror\b|ghost stories|vampire (?:fiction|stories)/],
+	["Mystery", /\bmyster(?:y|ies)\b|detective (?:and mystery )?(?:fiction|stories)|crime fiction/],
+	["Thriller", /\bthrillers?\b|\bsuspense\b|espionage|spy (?:fiction|stories)/],
+	["Romance", /\bromance\b|love stories/],
+	["Historical Fiction", /historical (?:fiction|novels?)|fiction historical/],
+	["Literary Fiction", /literary fiction|fiction literary|psychological fiction/],
+	["Young Adult", /young adult|juvenile fiction|\bteen\b/],
+	["Children's", /children s (?:fiction|stories|books|literature)|picture books|juvenile literature/],
+	["Humor", /\bhumou?r|\bcomedy\b|\bsatire\b|\bparod(?:y|ies)\b/],
+	["Short Fiction", /short (?:stories|fiction)|\banthologies\b|\bnovellas?\b/],
+	["Poetry", /\bpoetry\b|\bpoems\b/],
+	["Drama", /\bdrama\b|\bplays\b|\btragedies\b/],
+	["Classics", /\bclassics?\b|classic literature/],
+	["Mythology & Folklore", /mytholog|folklore|fairy tales|\bmyths\b|\blegends\b/],
+	["Comics", /\bcomics\b|comic (?:books?|strips)|graphic novels?|\bmanga\b/],
+	["Superheroes", /\bsuper ?heroe?s?\b/],
+	// Only for subjects that don't say fiction: "History" alone, not
+	// "Fiction, history" or "World War, 1939-1945 -- Fiction".
+	["History", /\bhistory\b/, true],
+	["Biography & Memoir", /\bbiograph|\bautobiograph|\bmemoirs?\b/, true],
+	["Philosophy", /\bphilosophy\b/, true],
+	["Religion", /\breligio|\btheology\b|\bbible\b|christianity|buddhism|\bislam\b/, true],
+	["Science", /^(?:science|physics|biology|chemistry|astronomy|cosmology|mathematics|evolution)\b/, true],
+];
+// A more exact genre stands in for the general one.
+const GENRE_OVER = { "Urban Fantasy": "Fantasy" };
+const FICTION_WORDS = /\bfiction\b|\bnovels?\b|\bstories\b/;
+function subjectKey(s) {
+	return " " + String(s).normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9&]+/g, " ").trim() + " ";
+}
+// Subjects -> up to max genre names, the ones the most subjects point to first.
+function genresOf(subjects, max) {
+	const hits = new Map();
+	for (const raw of subjects) {
+		const s = subjectKey(raw), fiction = FICTION_WORDS.test(s);
+		GENRES.forEach(([name, re, factOnly]) => {
+			if (factOnly && fiction) return;
+			if (re.test(factOnly ? s.trim() : s)) hits.set(name, (hits.get(name) || 0) + 1);
+		});
+	}
+	for (const [exact, general] of Object.entries(GENRE_OVER)) if (hits.has(exact)) hits.delete(general);
+	const order = GENRES.map((g) => g[0]);
+	return [...hits.keys()].sort((a, b) => hits.get(b) - hits.get(a) || order.indexOf(a) - order.indexOf(b)).slice(0, max);
+}
+
+// What the file says about itself: {subjects, title, author}.
+async function fileSubjects(env, book) {
+	const type = bookType(book), out = { subjects: [], title: "", author: "" };
+	if (type === "epub") {
+		const zip = await r2Zip(env, book.r2_key, book.size);
+		if (!zip) return out;
+		const { opf } = await epubPackage(env, zip);
+		const md = (/<(?:\w+:)?metadata\b[\s\S]*?<\/(?:\w+:)?metadata>/i.exec(opf) || [opf])[0];
+		const els = (name) => [...md.matchAll(new RegExp(`<dc:${name}\\b[^>]*>([\\s\\S]*?)</dc:${name}>`, "gi"))].map((m) => xmlText(m[1])).filter(Boolean);
+		out.subjects = els("subject");
+		out.title = els("title")[0] || "";
+		out.author = els("creator")[0] || "";
+	} else if (type === "cbz") {
+		const zip = await r2Zip(env, book.r2_key, book.size);
+		const info = zip && zip.files.find((f) => /(^|\/)comicinfo\.xml$/i.test(f.name));
+		const bytes = info && await r2ZipRead(env, zip, info);
+		if (!bytes) return out;
+		const xml = new TextDecoder().decode(bytes);
+		const el = (name) => xmlText((new RegExp(`<${name}>([\\s\\S]*?)</${name}>`, "i").exec(xml) || [])[1] || "");
+		out.subjects = [el("Genre"), el("Tags")].join(",").split(/[,;]/);
+		out.title = el("Series") || el("Title");
+		out.author = el("Writer").split(",")[0];
+	} else if (type === "pdf") {
+		// The document info and XMP are usually near the end or the start;
+		// in a compressed object stream they're missed.
+		const span = 256 * 1024, size = book.size || 0;
+		const parts = [await r2Bytes(env, book.r2_key, 0, Math.min(size, span))];
+		if (size > span) parts.push(await r2Bytes(env, book.r2_key, Math.max(span, size - span), Math.min(span, size - span)));
+		const text = parts.filter(Boolean).map((b) => new TextDecoder("latin1").decode(b)).join("\n");
+		const info = (key) => {
+			const m = new RegExp(`/${key}\\s*(\\((?:\\\\.|[^\\\\)])*\\)|<[0-9a-fA-F\\s]*>)`).exec(text);
+			return m ? pdfString(m[1]) : "";
+		};
+		const xmp = (/<dc:subject>([\s\S]*?)<\/dc:subject>/.exec(text) || [])[1] || "";
+		// Only Keywords: /Title is also on every bookmark, so it can't be trusted here.
+		out.subjects = [...info("Keywords").split(/[,;]/), ...[...xmp.matchAll(/<rdf:li[^>]*>([\s\S]*?)<\/rdf:li>/g)].map((m) => xmlText(m[1]))];
+	}
+	out.subjects = out.subjects.map((s) => s.replace(/\s+/g, " ").trim()).filter((s) => s && s.length <= 120).slice(0, 60);
+	return out;
+}
+function xmlText(s) {
+	return decodeXml(String(s).replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1").replace(/<[^>]+>/g, ""))
+		.replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+		.replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
+		.replace(/\s+/g, " ").trim();
+}
+// A PDF string, (literal) or <hex>, as text (UTF-16 when it starts FE FF).
+function pdfString(raw) {
+	let bytes = [];
+	if (raw[0] === "<") {
+		const hex = raw.slice(1, -1).replace(/\s+/g, "");
+		for (let i = 0; i < hex.length; i += 2) bytes.push(parseInt(hex.slice(i, i + 2).padEnd(2, "0"), 16));
+	} else {
+		const s = raw.slice(1, -1), esc = { n: 10, r: 13, t: 9, b: 8, f: 12 };
+		for (let i = 0; i < s.length; i++) {
+			if (s[i] !== "\\") { bytes.push(s.charCodeAt(i) & 255); continue; }
+			const c = s[++i];
+			if (c === undefined) break;
+			if (/[0-7]/.test(c)) {
+				let o = c;
+				while (o.length < 3 && /[0-7]/.test(s[i + 1] || "")) o += s[++i];
+				bytes.push(parseInt(o, 8) & 255);
+			} else if (c === "\r" || c === "\n") { if (c === "\r" && s[i + 1] === "\n") i++; }
+			else bytes.push(esc[c] ?? (c.charCodeAt(0) & 255));
+		}
+	}
+	const u8 = new Uint8Array(bytes);
+	return (u8[0] === 0xfe && u8[1] === 0xff ? new TextDecoder("utf-16be").decode(u8.subarray(2)) : new TextDecoder("latin1").decode(u8)).trim();
+}
+
+// Open Library's subjects for a title (and author): only from a match whose
+// title is the same, give or take a subtitle, and whose author shares a word
+// with the one given, so a near miss never tags a book.
+async function onlineSubjects(title, author) {
+	const want = looseTitle(title);
+	if (!want) return [];
+	const surname = looseTitle(author.split(/,|&| and /)[0]).split(" ").pop();
+	const same = (t) => { const a = looseTitle(t); return a === want || want.startsWith(a + " ") || a.startsWith(want + " "); };
+	for (const q of [...new Set([[title, author].filter(Boolean).join(" "), title])]) {
+		const data = await lookupJSON("https://openlibrary.org/search.json?" + new URLSearchParams({ q, fields: "title,author_name,subject", limit: "10" }));
+		const hit = (data.docs || []).find((d) => same(d.title) && Array.isArray(d.subject)
+			&& (!surname || (d.author_name || []).some((n) => looseTitle(n).split(" ").includes(surname))));
+		if (hit) return hit.subject.slice(0, 200).map(String);
+	}
+	return [];
+}
+
+// POST /api/books/:id/genres {title?, author?, online?}: tags the book with
+// its genres. title and author, when given, are what to look it up by
+// (Edit details sends what's typed). online: false reads only the file.
+async function tagGenres(request, env, id) {
+	const body = await readJSON(request);
+	const book = await getBook(env, id);
+	const { added, from } = await addGenreTags(env, book, {
+		title: str(body.title, 300), author: str(body.author, 300), online: body.online !== false,
+	});
+	const row = await env.DB.prepare(`SELECT ${BOOK_COLUMNS} FROM books WHERE id = ?`).bind(id).first();
+	const { results } = await env.DB.prepare("SELECT tag_id FROM book_tag_links WHERE book_id = ?").bind(id).all();
+	row.tags = results.map((r) => r.tag_id);
+	return json({ book: row, added, from });
+}
+// book: a books row (with r2_key). -> {added: [tag names], from: "file" | "online" | ""}
+async function addGenreTags(env, book, opts) {
+	let file = { subjects: [], title: "", author: "" };
+	if (book.type !== "txt") {
+		try { file = await fileSubjects(env, book); } catch (err) { console.warn("subjects", book.id, err); }
+	}
+	let names = genresOf(file.subjects, 5), from = "file";
+	if (file.subjects.length) {
+		const { results } = await env.DB.prepare("SELECT name FROM book_tags WHERE name IN (SELECT value FROM json_each(?))")
+			.bind(JSON.stringify(file.subjects)).all();
+		names = [...new Set([...names, ...results.map((r) => r.name)])];
+	}
+	if (!names.length && opts.online) {
+		// A title still made from the file name is a poor search; the file's own is better.
+		const title = opts.title || (book.title === madeTitle(book.filename) && file.title) || book.title;
+		const author = opts.author || book.author || file.author || "";
+		let subjects;
+		try { subjects = await onlineSubjects(title, author); } catch (err) {
+			throw err instanceof HttpError ? err : new HttpError(502, "Couldn't reach Open Library");
+		}
+		names = genresOf(subjects, 3);
+		from = "online";
+	}
+	// Every comic is a comic, whatever else it is.
+	if (bookType(book) === "cbz" && !names.some((n) => n.toLowerCase() === "comics")) names.unshift("Comics");
+	if (!names.length) return { added: [], from: "" };
+	const ids = await bookTagsNamed(env, names);
+	const { results } = await env.DB.prepare("SELECT tag_id FROM book_tag_links WHERE book_id = ?").bind(book.id).all();
+	const had = new Set(results.map((r) => r.tag_id));
+	await addBookTags(env, book.id, ids);
+	return { added: names.filter((_, i) => !had.has(ids[i])), from };
 }
 
 async function deleteBook(env, id) {
@@ -2214,16 +2428,9 @@ async function findZipCover(env, key, size, type) {
 		images.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
 		return r2ZipRead(env, zip, images[0]);
 	}
-	// EPUB: container.xml names the package file, whose manifest marks the
-	// cover (EPUB 3's properties="cover-image", or EPUB 2's <meta name="cover">).
-	const text = async (e) => {
-		const b = await r2ZipRead(env, zip, e);
-		return b ? new TextDecoder().decode(b) : "";
-	};
-	const container = await text(byName("META-INF/container.xml"));
-	const opfPath = decodeXml((/<rootfile\b[^>]*\bfull-path\s*=\s*["']([^"']+)/i.exec(container) || [])[1] || "");
-	const opf = opfPath ? await text(byName(opfPath)) : "";
-	const dir = opfPath.includes("/") ? opfPath.slice(0, opfPath.lastIndexOf("/") + 1) : "";
+	// EPUB: the package file's manifest marks the cover (EPUB 3's
+	// properties="cover-image", or EPUB 2's <meta name="cover">).
+	const { opf, dir } = await epubPackage(env, zip);
 	const items = [...opf.matchAll(/<(?:\w+:)?item\b[^>]*>/gi)].map((m) => ({
 		id: xmlAttr(m[0], "id"), href: xmlAttr(m[0], "href"), type: xmlAttr(m[0], "media-type"), props: xmlAttr(m[0], "properties"),
 	}));
@@ -2240,6 +2447,18 @@ async function findZipCover(env, key, size, type) {
 	}
 	const named = images.find((f) => /(^|\/)cover[^/]*$/i.test(f.name));
 	return named ? r2ZipRead(env, zip, named) : null;
+}
+// An EPUB's package file (its details and manifest), which container.xml names.
+async function epubPackage(env, zip) {
+	const text = async (n) => {
+		const e = zip.files.find((f) => f.name === n) || zip.files.find((f) => f.name.toLowerCase() === n.toLowerCase());
+		const b = await r2ZipRead(env, zip, e);
+		return b ? new TextDecoder().decode(b) : "";
+	};
+	const container = await text("META-INF/container.xml");
+	const opfPath = decodeXml((/<rootfile\b[^>]*\bfull-path\s*=\s*["']([^"']+)/i.exec(container) || [])[1] || "");
+	const opf = opfPath ? await text(opfPath) : "";
+	return { opf, dir: opfPath.includes("/") ? opfPath.slice(0, opfPath.lastIndexOf("/") + 1) : "" };
 }
 function decodeXml(s) {
 	return s.replace(/&(amp|lt|gt|quot|apos);/g, (_, e) => ({ amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" })[e]);
@@ -2716,6 +2935,7 @@ const PAGE = String.raw`<!doctype html>
 	.tagbar .chip .n { color: inherit; opacity: .7; }
 	.tagbar.filtering .chip:not([aria-current=true]) { background: var(--card); color: var(--fg); }
 	.tagbar.filtering .chip:not([aria-current=true])::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--tc); }
+	.tagbar.filtering .chip.clear::before { content: none; }
 	.chip[aria-current=true] { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--fg); font-weight: 600; }
 	.chip.untagged { --tc: var(--sel); color: var(--fg); }
 	.chip[aria-pressed=false]::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--tc); }
@@ -3112,6 +3332,7 @@ const PAGE = String.raw`<!doctype html>
 		<span id="libSelN" class="n"></span>
 		<button id="libSelAll" class="btn small" type="button">Select all</button>
 		<button id="libSelNone" class="btn small" type="button">Clear</button>
+		<button id="libSelGenres" class="btn small" type="button">Tag genres</button>
 		<button id="libSelDel" class="btn small danger" type="button">Delete</button>
 	</div>
 	<ul id="books" class="tree books flat"></ul>
@@ -3192,6 +3413,7 @@ const PAGE = String.raw`<!doctype html>
 		</div>
 		<div class="dlook">
 			<button id="dLookup" class="btn small" type="button">Look up online</button>
+			<button id="dGenres" class="btn small" type="button">Tag genres</button>
 			<span id="dLookStatus" class="hint"></span>
 		</div>
 		<ul id="dHits" class="lookhits" hidden></ul>
@@ -3234,7 +3456,7 @@ var state = {
 	route: null, prev: null, fromList: false, lastList: "#/unread",
 	view: "unread", feed: null, tag: null,
 	episodes: [], epNext: null, epTag: null, epOffline: false, epDownloadedOnly: false, epKind: "podcasts", itemEp: null, fromPodcasts: false,
-	feeds: [], tags: [], books: null, bookTags: readJSON("readerBookTags") || [], libTag: null, libSearch: "", libSort: read("readerBookSort") || "recent", libView: read("readerBookView") === "covers" ? "covers" : "list",
+	feeds: [], tags: [], books: null, bookTags: readJSON("readerBookTags") || [], libTag: null, libTags: [], libSearch: "", libSort: read("readerBookSort") || "recent", libView: read("readerBookView") === "covers" ? "covers" : "list",
 	items: [], next: null, listKey: "", listScroll: 0, stale: true,
 	refreshing: false, errors: {}, editFeeds: false, editBooks: false, libSel: {}, item: null
 };
@@ -4675,7 +4897,7 @@ function renderTabs(name) {
 	var sub = listQuery(state.feed, state.tag);
 	document.querySelectorAll("#tabs a").forEach(function (a) {
 		var v = a.dataset.view;
-		a.href = "#/" + v + (LIST_VIEWS[v] ? sub : v === "library" && state.libTag != null ? "?tag=" + state.libTag
+		a.href = "#/" + v + (LIST_VIEWS[v] ? sub : v === "library" && state.libTags.length ? "?tag=" + state.libTags.join(",")
 			: v === state.epKind && state.epTag != null ? "?tag=" + state.epTag : "");
 		if (v === name) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
 	});
@@ -4690,7 +4912,9 @@ function parseHash() {
 	var num = function (v) { return v != null && /^\d+$/.test(v) ? Number(v) : null; };
 	return {
 		name: parts[0] || "unread", id: num(parts[1]),
-		feed: num(params.get("feed")), tag: num(params.get("tag"))
+		feed: num(params.get("feed")), tag: num(params.get("tag")),
+		// The Library takes several: ?tag=3,7 is books with both.
+		tags: (params.get("tag") || "").split(",").map(num).filter(function (x) { return x != null; })
 	};
 }
 function showView(name) {
@@ -5832,8 +6056,10 @@ function parsePos(s) {
 	try { var p = JSON.parse(s); return p && typeof p === "object" ? p : null; } catch (e) { return null; }
 }
 async function showLibrary(r) {
-	state.libTag = r.tag;
-	fillUploadTag(r.tag);
+	// Untagged (0) can't be combined with a tag.
+	state.libTags = r.tags.indexOf(0) >= 0 ? [0] : r.tags.filter(function (x, i, a) { return a.indexOf(x) === i; });
+	state.libTag = state.libTags.length ? state.libTags[0] : null;
+	fillUploadTag(state.libTag);
 	showView("library");
 	renderTabs("library");
 	document.title = "Library — Reader";
@@ -5870,34 +6096,52 @@ function fillUploadTag(value) {
 	sel.add(new Option("New tag…", "new"));
 	sel.value = value && bookTagById(value) ? String(value) : "";
 }
+// Picking tags narrows, like a filter on a shop: the books are the ones
+// with every tag picked, and only the tags those books also carry stay in
+// the bar (with how many of them have each), so a second pick narrows
+// further. Tap a picked tag to drop it. Tags no book has are hidden except
+// in Edit, where they can be renamed or deleted.
+function libHash(ids) { return ids.length ? "#/library?tag=" + ids.join(",") : "#/library"; }
+function libFiltered(books) {
+	var sel = state.libTags;
+	return sel.length ? books.filter(function (b) { return sel.every(function (id) { return hasBookTag(b, id); }); }) : books;
+}
 function renderBookTags() {
 	fillUploadTag();
-	var box = $("bookTags"), edit = state.editBooks, sel = state.libTag, books = state.books || [];
+	var box = $("bookTags"), edit = state.editBooks, sel = state.libTags, books = state.books || [];
+	var pool = libFiltered(books);
 	box.textContent = "";
 	var list = state.bookTags.map(function (t) { return { id: t.id, name: t.name, cls: tagColor(t.id) }; });
-	if (list.length && books.some(function (b) { return !bookTagsOf(b).length; })) list.push({ id: 0, name: "Untagged", cls: "untagged" });
+	if (!sel.length && list.length && books.some(function (b) { return !bookTagsOf(b).length; })) list.push({ id: 0, name: "Untagged", cls: "untagged" });
+	list = list.map(function (x) { return Object.assign(x, { on: sel.indexOf(x.id) >= 0, n: pool.filter(function (b) { return hasBookTag(b, x.id); }).length }); })
+		.filter(function (x) { return x.on || x.n || (edit && !sel.length); });
+	list.sort(function (a, b) { return b.on - a.on; });
 	show(box, list.length > 0 || edit);
-	box.classList.toggle("filtering", sel != null);
+	box.classList.toggle("filtering", sel.length > 0);
 	var chips = h("div", "chips");
 	chips.setAttribute("aria-label", "Book tags");
 	list.forEach(function (x) {
-		var on = sameId(sel, x.id), c = chip(x.name, x.cls);
-		var n = books.filter(function (b) { return hasBookTag(b, x.id); }).length;
-		if (n) c.append(h("span", "n", String(n)));
-		c.href = on ? "#/library" : "#/library?tag=" + x.id;
-		if (on) c.setAttribute("aria-current", "true");
+		var c = chip(x.name, x.cls);
+		if (x.n) c.append(h("span", "n", String(x.n)));
+		c.href = libHash(x.on ? sel.filter(function (id) { return id !== x.id; }) : x.id === 0 ? [0] : sel.concat(x.id));
+		if (x.on) c.setAttribute("aria-current", "true");
 		chips.append(c);
 	});
+	if (sel.length > 1) {
+		var clear = chip("Clear", "untagged clear");
+		clear.href = "#/library";
+		chips.append(clear);
+	}
 	box.append(chips);
 	if (!edit) return;
-	var t = sel ? bookTagById(sel) : null, tools = h("div", "tools");
+	var t = sel.length === 1 && sel[0] ? bookTagById(sel[0]) : null, tools = h("div", "tools");
 	if (t) tools.append(
 		button("Rename “" + t.name + "”", "btn small", function () { renameBookTag(t); }),
 		button("Delete tag", "btn small", function () { deleteBookTag(t); })
 	);
 	tools.append(button("New tag", "btn small", function () { promptBookTag().then(function () { renderBooks(); }, fail); }));
 	box.append(tools);
-	if (!t && state.bookTags.length) box.append(h("div", "hint", "Pick a tag to rename or delete it."));
+	if (!t && state.bookTags.length) box.append(h("div", "hint", sel.length ? "Pick just one tag to rename or delete it." : "Pick a tag to rename or delete it."));
 }
 async function promptBookTag() {
 	var name = prompt("Name for the new book tag");
@@ -5917,7 +6161,7 @@ async function deleteBookTag(t) {
 	if (!confirm("Delete the tag “" + t.name + "”? " + what)) return;
 	try {
 		await apiJSON("/api/booktags/" + t.id, { method: "DELETE" });
-		if (sameId(state.libTag, t.id)) location.hash = "#/library";
+		if (state.libTags.indexOf(t.id) >= 0) location.hash = libHash(state.libTags.filter(function (id) { return id !== t.id; }));
 		await Promise.all([loadBookTags(), loadBooks()]);
 	} catch (e) { fail(e); }
 }
@@ -6156,7 +6400,7 @@ function repaintBook(id) {
 // The Library: one list, most recently opened first, narrowed to a tag if
 // one is picked.
 function renderBooks() {
-	var ul = $("books"), books = state.books || [], edit = state.editBooks, tag = state.libTag;
+	var ul = $("books"), books = state.books || [], edit = state.editBooks, sel = state.libTags;
 	var grid = state.libView === "covers" && !edit;
 	ul.textContent = "";
 	ul.className = grid ? "covers" : "tree books flat";
@@ -6164,16 +6408,16 @@ function renderBooks() {
 	$("libLayout").setAttribute("aria-pressed", String(state.libView === "covers"));
 	show($("libLayout"), !edit);
 	renderBookTags();
-	if (tag != null) books = books.filter(function (b) { return hasBookTag(b, tag); });
+	books = libFiltered(books);
 	var tagged = books.length;
 	books = sortBooks(books.filter(bookMatches(state.libSearch)), state.libSort);
-	$("libTitle").textContent = tag != null ? "Library · " + (tag === 0 ? "Untagged" : (bookTagById(tag) || {}).name || "") : "Library";
+	$("libTitle").textContent = sel.length ? "Library · " + sel.map(function (id) { return id === 0 ? "Untagged" : (bookTagById(id) || {}).name || ""; }).join(" + ") : "Library";
 	books.forEach(function (b) { ul.append(grid ? bookCard(b) : bookRow(b)); });
 	state.libShown = books;
 	renderLibSel();
 	var off = !!state.libOffline;
 	$("booksEmpty").textContent = tagged && !books.length ? "No books match “" + state.libSearch.trim() + "”."
-		: tag != null && (state.books || []).length ? "No books with this tag."
+		: sel.length && (state.books || []).length ? (sel.length > 1 ? "No books have all of these tags." : "No books with this tag.")
 		: off ? "You're offline, and no books are downloaded on this device." : "No books yet. Upload a .txt, .pdf, .epub or .cbz to start.";
 	show($("booksEmpty"), !books.length);
 	show($("libNote"), off && !!books.length);
@@ -6578,6 +6822,19 @@ async function saveDetails() {
 $("detailsForm").addEventListener("submit", function (e) { e.preventDefault(); saveDetails(); });
 $("dCancel").addEventListener("click", closeDetails);
 $("dLookup").addEventListener("click", function (e) { e.stopPropagation(); lookUpDetails(); });
+$("dGenres").addEventListener("click", async function (e) {
+	e.stopPropagation();
+	var d = details, btn = this;
+	btn.disabled = true;
+	$("dLookStatus").textContent = "Finding genres…";
+	try {
+		var data = await tagBookGenres(d.book, { title: $("dTitle").value.trim(), author: $("dAuthor").value.trim() });
+		if (details !== d) return;
+		$("dLookStatus").textContent = genresSaid(data);
+		renderDetailsTags();
+	} catch (err) { if (details === d) $("dLookStatus").textContent = err.message; }
+	finally { btn.disabled = false; }
+});
 $("dCoverPick").addEventListener("click", function () { $("dCoverFile").click(); });
 $("dCoverFile").addEventListener("change", async function () {
 	var file = this.files[0];
@@ -6635,10 +6892,11 @@ function selectedBooks() {
 function renderLibSel() {
 	var on = state.editBooks && !state.libOffline, n = on ? selectedBooks().length : 0, all = (state.libShown || []).length;
 	show($("libSelBar"), on && all > 0);
-	$("libSelN").textContent = n ? n + " selected" : "Tick books to delete several at once.";
+	$("libSelN").textContent = n ? n + " selected" : "Tick books to tag or delete several at once.";
 	show($("libSelNone"), n > 0);
 	show($("libSelAll"), n < all);
 	$("libSelDel").disabled = !n;
+	$("libSelGenres").disabled = !n;
 	$("libSelDel").textContent = n ? "Delete " + n : "Delete";
 }
 async function deleteSelected() {
@@ -6660,6 +6918,44 @@ async function deleteSelected() {
 	else toast(books.length === 1 ? "Deleted 1 book." : "Deleted " + books.length + " books.");
 }
 
+// Tag genres: the server adds genre tags from the book's own file, or else
+// from Open Library, and says which. hints: {title, author} to look it up by.
+async function tagBookGenres(b, hints) {
+	var data = await apiJSON("/api/books/" + b.id + "/genres", { method: "POST", json: hints || {} });
+	b.tags = data.book.tags;
+	keepBookDetails(b);
+	var known = {};
+	(state.bookTags || []).forEach(function (t) { known[t.name.toLowerCase()] = true; });
+	if (data.added.some(function (n) { return !known[n.toLowerCase()]; })) await loadBookTags();
+	return data;
+}
+function genresSaid(data) {
+	if (data.added.length) return "Added " + data.added.join(", ") + (data.from === "online" ? " (from Open Library)." : " (from the file).");
+	return data.from ? "It already has its genres." : "Found no genres for it.";
+}
+async function tagGenresSelected() {
+	var books = selectedBooks(), btn = $("libSelGenres");
+	if (!books.length) return;
+	btn.disabled = true;
+	var tagged = 0, had = 0, none = 0, failed = [];
+	for (var i = 0; i < books.length; i++) {
+		$("libSelN").textContent = "Tagging " + (i + 1) + " of " + books.length + "…";
+		try {
+			var data = await tagBookGenres(books[i]);
+			if (data.added.length) tagged++; else if (data.from) had++; else none++;
+		} catch (e) {
+			if (e.message === UNAUTH) return;
+			failed.push(books[i].title);
+		}
+	}
+	renderBooks();
+	var count = function (n) { return n + (n === 1 ? " book" : " books"); };
+	var msg = [tagged && "Added genres to " + count(tagged) + ".", had && count(had) + " already had theirs.",
+		none && "Found no genres for " + count(none) + "."].filter(Boolean).join(" ");
+	if (failed.length) fail(new Error((msg ? msg + " " : "") + "Couldn't tag " + failed.join(", ") + "."));
+	else toast(msg);
+}
+
 // Right-click (or long-press, where the browser sends it) on a book in the
 // Library: the book's actions in a small menu where the pointer is.
 var ctxBook = null;
@@ -6675,6 +6971,10 @@ function openBookCtx(b, x, y) {
 	item("Open", function () { location.hash = "#/book/" + b.id; });
 	if (!off) {
 		item("Edit details", function () { openDetails(b); });
+		item("Tag genres", async function () {
+			try { toast(genresSaid(await tagBookGenres(b))); } catch (e) { fail(e); }
+			renderBooks();
+		});
 		item(b.finished_at ? "Mark unfinished" : "Mark finished", async function () {
 			try { await setFinished(b, !b.finished_at); } catch (e) { fail(e); }
 			renderBooks();
@@ -8590,6 +8890,7 @@ $("editBooks").addEventListener("click", function () { state.editBooks = !state.
 $("libSelAll").addEventListener("click", function () { (state.libShown || []).forEach(function (b) { state.libSel[b.id] = true; }); renderBooks(); });
 $("libSelNone").addEventListener("click", function () { state.libSel = {}; renderBooks(); });
 $("libSelDel").addEventListener("click", deleteSelected);
+$("libSelGenres").addEventListener("click", tagGenresSelected);
 $("books").addEventListener("contextmenu", function (e) {
 	var a = e.target.closest && e.target.closest('a[href^="#/book/"]');
 	if (!a || e.shiftKey) return;
