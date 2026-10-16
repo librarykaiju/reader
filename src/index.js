@@ -3156,6 +3156,19 @@ const PAGE = String.raw`<!doctype html>
 	.prow .btn { min-width: 40px; padding-inline: 6px; font-variant-numeric: tabular-nums; }
 	#pPlay { min-width: 48px; border-radius: 50%; min-height: 44px; }
 	@media (max-width: 420px) { #pRate, #pClose { padding-inline: 2px; min-width: 32px; } .tabs a { font-size: 14px; } }
+	/* The bookmark button in a book's top bar: filled once one is set. */
+	#markBtn { padding-inline: 10px; display: flex; align-items: center; }
+	#markBtn svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linejoin: round; }
+	#markBtn.on { color: var(--accent); }
+	#markBtn.on svg { fill: currentColor; }
+	/* "Back to furthest": under the header, so it's clear of the player, the
+	   highlight bar and a comic's page bar. */
+	.farpill { position: fixed; z-index: 15; left: 50%; transform: translateX(-50%); top: calc(max(6px, env(safe-area-inset-top)) + 58px);
+		display: flex; align-items: center; background: var(--fg); color: var(--bg); border-radius: 999px; box-shadow: 0 4px 16px rgba(0,0,0,.2);
+		font-size: 14px; max-width: calc(100vw - 32px); }
+	.farpill button { background: none; border: 0; color: inherit; font: inherit; min-height: 40px; cursor: pointer; white-space: nowrap; }
+	#farGo { padding: 8px 6px 8px 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+	#farX { padding: 8px 14px 8px 8px; opacity: .7; }
 	.toast { position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 30;
 		background: var(--fg); color: var(--bg); padding: 10px 14px; border-radius: 10px; font-size: 14px; max-width: calc(100vw - 32px); }
 </style>
@@ -3178,6 +3191,7 @@ const PAGE = String.raw`<!doctype html>
 		<span id="wordmark" class="wordmark" role="img" aria-label="Reader">__WORDMARK__</span>
 		<h1 id="heading"></h1>
 		<span id="progress" class="progress" hidden></span>
+		<button id="markBtn" class="btn" type="button" aria-label="Bookmark this place" aria-pressed="false" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg></button>
 		<button id="refresh" class="btn" type="button">Refresh</button>
 		<button id="bookMenuBtn" class="btn" type="button" aria-label="Book options" aria-expanded="false" aria-controls="bookMenu" hidden>&#8943;</button>
 		<button id="settingsBtn" class="btn" type="button" aria-label="Display settings" aria-expanded="false" aria-controls="settings">Aa</button>
@@ -3219,6 +3233,9 @@ const PAGE = String.raw`<!doctype html>
 <div id="bookMenu" class="pop" hidden>
 	<h2>This book</h2>
 	<div class="menu">
+		<button id="bmToMark" class="btn" type="button" hidden>Go to bookmark</button>
+		<button id="bmToFar" class="btn" type="button" hidden>Go to furthest</button>
+		<button id="bmUnmark" class="btn" type="button" hidden>Remove bookmark</button>
 		<button id="bmContents" class="btn" type="button" hidden>Contents</button>
 		<button id="bmFind" class="btn" type="button" hidden>Search in book</button>
 		<button id="bmHighlights" class="btn" type="button" hidden>Highlights</button>
@@ -3434,6 +3451,7 @@ const PAGE = String.raw`<!doctype html>
 		<button id="tocClose" class="btn ghost" type="button">Close</button>
 	</div>
 </div>
+<div id="farPill" class="farpill" hidden><button id="farGo" type="button"></button><button id="farX" type="button" aria-label="Hide">&times;</button></div>
 <div id="toast" class="toast" role="status" hidden></div>
 </div>
 
@@ -4925,6 +4943,7 @@ function showView(name) {
 	show($("refresh"), name === "list" || name === "podcasts");
 	show($("progress"), name === "book");
 	show($("bookMenuBtn"), name === "book");
+	show($("markBtn"), name === "book");
 	$("heading").textContent = "";
 	show($("logo"), top);
 	show($("wordmark"), top);
@@ -7026,9 +7045,14 @@ function confirmStartOver(b) {
 	return confirm("Start “" + b.title + "” over? Your place goes back to the beginning." +
 		(b.finished_at ? " It stays marked Finished, since you've read it once." : ""));
 }
-// The beginning, as a saved place (with its time, so it syncs like one).
-async function resetPosition(b) {
-	setPosition(b, JSON.stringify({ at: Date.now() }));
+// The beginning, as a saved place (with its time, so it syncs like one). The
+// furthest place goes with it; a bookmark stays (mark: the open book's,
+// which may not be saved yet).
+async function resetPosition(b, mark) {
+	var p = { at: Date.now() };
+	if (mark === undefined) mark = (parsePos(b.position) || {}).mark;
+	if (mark) p.mark = mark;
+	setPosition(b, JSON.stringify(p));
 }
 async function uploadFiles(files) {
 	var tagId = Number($("uploadTag").value) || null;
@@ -7142,7 +7166,7 @@ async function openBook(id) {
 		location.replace("#/library");
 		return;
 	}
-	var sess = session = { id: id, book: book, alive: true, cleanup: [], dirty: false };
+	var sess = session = { id: id, book: book, alive: true, cleanup: [], dirty: false, start: parsePos(book.position) || {} };
 	$("heading").textContent = book.title;
 	document.title = book.title + " — Reader";
 	$("progress").textContent = "";
@@ -7151,6 +7175,7 @@ async function openBook(id) {
 		else if (book.type === "cbz") await openCbz(sess, parsePos(book.position) || {});
 		else if (book.type === "epub") await openEpub(sess, parsePos(book.position) || {});
 		else await openTxt(sess, parsePos(book.position) || {});
+		if (sess.alive) updateMarks(sess);
 	} catch (e) {
 		if (!sess.alive) return;
 		body.textContent = "";
@@ -7168,21 +7193,86 @@ function closeBook() {
 	$("findQ").value = "";
 	$("findItems").textContent = "";
 	findStatus("");
+	show($("farPill"), false);
 	$("bookBody").textContent = "";
 	document.title = "Reader";
 }
-function savePosition(sess, pos, label) {
-	sess.pos = Object.assign(pos, { at: Date.now() });
+// mark: a new bookmark ({} style spot), null to remove it, or left out to
+// keep the one there is.
+function savePosition(sess, pos, label, mark) {
+	var prev = here(sess), far = farOf(prev);
+	if (!far || (pos.f > far.f && pos.f - far.f <= 3 * screenF(sess))) far = spot(pos);
+	if (mark === undefined) mark = prev.mark;
+	sess.pos = Object.assign(pos, { at: Date.now(), far: far }, mark ? { mark: mark } : {});
 	sess.dirty = true;
 	$("progress").textContent = label;
 	clearTimeout(sess.timer);
 	sess.timer = setTimeout(function () { flushPosition(sess); }, 800);
+	updateMarks(sess);
 }
 function flushPosition(sess, keepalive) {
 	clearTimeout(sess.timer);
 	if (!sess.dirty) return;
 	sess.dirty = false;
 	setPosition(sess.book, JSON.stringify(sess.pos), keepalive);
+}
+
+// ---------- bookmark and furthest place
+// A saved place also carries two spots: far, the furthest the book's been
+// read, and mark, a bookmark set by hand. Both live in the same position
+// string, so they sync and work offline like the place itself. A spot is a
+// place without its time: {f} for text, {page, pf?, pages, f} for PDFs and
+// comics. far only moves on by reading on from it: a jump well past it (a
+// fling of the scrollbar, a chapter picked from Contents) leaves it where it
+// was, and scrolling back never moves it.
+
+function here(sess) { return sess.pos || sess.start || {}; }
+function spot(p) {
+	var s = { f: p.f || 0 };
+	if (p.page) { s.page = p.page; s.pages = p.pages; if (p.pf != null) s.pf = p.pf; }
+	return s;
+}
+// A place saved before there was a far is its own furthest.
+function farOf(p) { return p.far || (p.f != null ? spot(p) : null); }
+// About one screen of the book, as a fraction of it (a comic: one page).
+function screenF(sess) {
+	if (sess.cbz) return 1 / sess.cbz.n;
+	return window.innerHeight / Math.max(document.documentElement.scrollHeight, window.innerHeight);
+}
+function spotName(s) { return s.page ? "page " + s.page : Math.round(s.f * 100) + "%"; }
+function spotLabel(s) { return s.page ? s.page + " / " + s.pages : Math.round(s.f * 100) + "%"; }
+// The bookmark button's state, and "Back to furthest" while the place is
+// more than a screen and a half behind it.
+function updateMarks(sess) {
+	if (session !== sess) return;
+	var c = here(sess), far = farOf(c);
+	$("markBtn").classList.toggle("on", !!c.mark);
+	$("markBtn").setAttribute("aria-pressed", String(!!c.mark));
+	$("markBtn").setAttribute("aria-label", c.mark ? "Bookmarked (" + spotName(c.mark) + "). Tap to move it here" : "Bookmark this place");
+	var behind = !!far && far.f - (c.f || 0) > (sess.cbz ? 0.5 : 1.5) * screenF(sess);
+	if (!behind) sess.farHidden = false;
+	if (behind) $("farGo").textContent = "Back to furthest · " + spotName(far);
+	show($("farPill"), behind && !sess.farHidden);
+}
+// Take the open book to a spot, and save it as the place.
+function goToSpot(sess, s) {
+	if (!sess || !sess.jump || !s) return;
+	sess.farHidden = false;
+	sess.jump(s);
+	savePosition(sess, spot(s), spotLabel(s));
+}
+// Bookmark where the reader is; tapped again on the same spot, take it away.
+function toggleMark(sess) {
+	if (!sess || !sess.jump) return;
+	if (sess.track && !sess.restoring) sess.track();
+	var c = here(sess), s = spot(c);
+	if (c.mark && Math.abs(c.mark.f - s.f) < 1e-4 && c.mark.page === s.page) {
+		savePosition(sess, spot(c), $("progress").textContent, null);
+		toast("Bookmark removed.");
+		return;
+	}
+	savePosition(sess, spot(c), $("progress").textContent, s);
+	toast("Bookmarked at " + spotName(s) + ". Go back to it from ⋯.");
 }
 // Reaching the end marks a book finished: the last line of a .txt or .epub, the
 // bottom edge of a PDF's last page, or a comic's last page, brought onto the screen by the reader
@@ -7201,6 +7291,12 @@ function renderBookMenu() {
 	var b = session && session.book;
 	if (!b) return;
 	var n = session.hl ? session.hl.list.length : 0;
+	var c = here(session), far = farOf(c), canGo = !!session.jump;
+	show($("bmToMark"), canGo && !!c.mark);
+	show($("bmUnmark"), canGo && !!c.mark);
+	show($("bmToFar"), canGo && !!far && far.f > 0);
+	if (c.mark) $("bmToMark").textContent = "Go to bookmark · " + spotName(c.mark);
+	if (far) $("bmToFar").textContent = "Go to furthest · " + spotName(far);
 	show($("bmContents"), b.type === "epub" && !!(session.epub && session.epub.toc.length));
 	show($("bmHighlights"), b.type === "txt" || b.type === "epub");
 	show($("bmFind"), b.type === "txt" || b.type === "epub" || b.type === "pdf");
@@ -7228,7 +7324,10 @@ async function restartBook() {
 	setTimeout(function () { sess.restoring = false; }, 300);
 	if (sess.cbz) sess.cbz.go(1, false);
 	$("progress").textContent = sess.pdf ? "1 / " + sess.pdf.n : sess.cbz ? "1 / " + sess.cbz.n : "0%";
-	try { await resetPosition(sess.book); } catch (e) { fail(e); }
+	try { await resetPosition(sess.book, here(sess).mark || null); } catch (e) { fail(e); }
+	sess.pos = null;
+	sess.start = parsePos(sess.book.position) || {};
+	updateMarks(sess);
 }
 function onScrollFrame(fn) {
 	var queued = false;
@@ -7341,6 +7440,7 @@ function startText(sess, t, pos) {
 		checkEnd(sess, t.endIdx != null ? paraEl(t, t.endIdx) : chunks[chunks.length - 1].lastElementChild);
 	};
 	sess.track = track;
+	sess.jump = function (s) { if (s.f > 0) restoreTxt(sess, s.f); else window.scrollTo(0, 0); };
 	hlStart(sess);
 	restoreTxt(sess, pos.f || 0);
 	listen(sess, window, "scroll", onScrollFrame(track), { passive: true });
@@ -7998,13 +8098,17 @@ async function openPdf(sess, pos) {
 		clearTimeout(resizeTimer);
 		resizeTimer = setTimeout(function () { pages.forEach(function (p) { if (p.want) renderPdfPage(sess, p); }); }, 250);
 	});
+	sess.jump = function (s) {
+		var at = clamp(s.page || 1, 1, pdf.n);
+		aim(sess, function () {
+			var r = pages[at - 1].getBoundingClientRect();
+			return window.scrollY + r.top + (s.pf || 0) * r.height - headerBottom();
+		}, track);
+	};
 	var page = clamp(pos.page || 1, 1, pdf.n);
 	$("progress").textContent = page + " / " + pdf.n;
 	setTimeout(function () { if (sess.alive) sendPdfCover(sess); }, 1500);
-	if (page > 1 || pos.pf > 0) aim(sess, function () {
-		var r = pages[page - 1].getBoundingClientRect();
-		return window.scrollY + r.top + (pos.pf || 0) * r.height - headerBottom();
-	}, track);
+	if (page > 1 || pos.pf > 0) sess.jump(pos);
 }
 function pdfCurrent(pdf) {
 	var line = headerBottom() + 1, lo = 0, hi = pdf.pages.length - 1;
@@ -8317,6 +8421,7 @@ async function openCbz(sess, pos) {
 		if (on) guide(cur, false); else { g.panels = null; place(); $("progress").textContent = cur + " / " + n; }
 	}
 	sess.cbz = { n: n, go: go, setGuided: setGuided };
+	sess.jump = function (s) { go(s.page || Math.round(s.f * n) || 1, false); window.scrollTo(0, 0); };
 	function fit() { body.style.setProperty("--cbz-h", Math.max(200, window.innerHeight - headerBottom() - bar.offsetHeight - 24) + "px"); }
 	fit();
 	listen(sess, window, "resize", onScrollFrame(function () { fit(); place(); }));
@@ -8845,6 +8950,19 @@ $("bmFinish").addEventListener("click", async function () {
 	} catch (e) { fail(e); }
 });
 $("bmRestart").addEventListener("click", restartBook);
+$("markBtn").addEventListener("click", function () { toggleMark(session); });
+$("bmToMark").addEventListener("click", function () { openBookMenu(false); if (session) goToSpot(session, here(session).mark); });
+$("bmToFar").addEventListener("click", function () { openBookMenu(false); if (session) goToSpot(session, farOf(here(session))); });
+$("bmUnmark").addEventListener("click", function () {
+	var sess = session;
+	openBookMenu(false);
+	if (!sess) return;
+	var c = here(sess);
+	savePosition(sess, spot(c), $("progress").textContent, null);
+	toast("Bookmark removed.");
+});
+$("farGo").addEventListener("click", function () { if (session) goToSpot(session, farOf(here(session))); });
+$("farX").addEventListener("click", function () { if (!session) return; session.farHidden = true; show($("farPill"), false); });
 $("bmGuided").addEventListener("click", function () {
 	var on = !guidedOn();
 	openBookMenu(false);
