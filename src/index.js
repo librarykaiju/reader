@@ -2935,6 +2935,7 @@ const PAGE = String.raw`<!doctype html>
 	.tagbar .chip .n { color: inherit; opacity: .7; }
 	.tagbar.filtering .chip:not([aria-current=true]) { background: var(--card); color: var(--fg); }
 	.tagbar.filtering .chip:not([aria-current=true])::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--tc); }
+	.tagbar.filtering .chip.clear::before { content: none; }
 	.chip[aria-current=true] { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--fg); font-weight: 600; }
 	.chip.untagged { --tc: var(--sel); color: var(--fg); }
 	.chip[aria-pressed=false]::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--tc); }
@@ -3455,7 +3456,7 @@ var state = {
 	route: null, prev: null, fromList: false, lastList: "#/unread",
 	view: "unread", feed: null, tag: null,
 	episodes: [], epNext: null, epTag: null, epOffline: false, epDownloadedOnly: false, epKind: "podcasts", itemEp: null, fromPodcasts: false,
-	feeds: [], tags: [], books: null, bookTags: readJSON("readerBookTags") || [], libTag: null, libSearch: "", libSort: read("readerBookSort") || "recent", libView: read("readerBookView") === "covers" ? "covers" : "list",
+	feeds: [], tags: [], books: null, bookTags: readJSON("readerBookTags") || [], libTag: null, libTags: [], libSearch: "", libSort: read("readerBookSort") || "recent", libView: read("readerBookView") === "covers" ? "covers" : "list",
 	items: [], next: null, listKey: "", listScroll: 0, stale: true,
 	refreshing: false, errors: {}, editFeeds: false, editBooks: false, libSel: {}, item: null
 };
@@ -4896,7 +4897,7 @@ function renderTabs(name) {
 	var sub = listQuery(state.feed, state.tag);
 	document.querySelectorAll("#tabs a").forEach(function (a) {
 		var v = a.dataset.view;
-		a.href = "#/" + v + (LIST_VIEWS[v] ? sub : v === "library" && state.libTag != null ? "?tag=" + state.libTag
+		a.href = "#/" + v + (LIST_VIEWS[v] ? sub : v === "library" && state.libTags.length ? "?tag=" + state.libTags.join(",")
 			: v === state.epKind && state.epTag != null ? "?tag=" + state.epTag : "");
 		if (v === name) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
 	});
@@ -4911,7 +4912,9 @@ function parseHash() {
 	var num = function (v) { return v != null && /^\d+$/.test(v) ? Number(v) : null; };
 	return {
 		name: parts[0] || "unread", id: num(parts[1]),
-		feed: num(params.get("feed")), tag: num(params.get("tag"))
+		feed: num(params.get("feed")), tag: num(params.get("tag")),
+		// The Library takes several: ?tag=3,7 is books with both.
+		tags: (params.get("tag") || "").split(",").map(num).filter(function (x) { return x != null; })
 	};
 }
 function showView(name) {
@@ -6053,8 +6056,10 @@ function parsePos(s) {
 	try { var p = JSON.parse(s); return p && typeof p === "object" ? p : null; } catch (e) { return null; }
 }
 async function showLibrary(r) {
-	state.libTag = r.tag;
-	fillUploadTag(r.tag);
+	// Untagged (0) can't be combined with a tag.
+	state.libTags = r.tags.indexOf(0) >= 0 ? [0] : r.tags.filter(function (x, i, a) { return a.indexOf(x) === i; });
+	state.libTag = state.libTags.length ? state.libTags[0] : null;
+	fillUploadTag(state.libTag);
 	showView("library");
 	renderTabs("library");
 	document.title = "Library — Reader";
@@ -6091,34 +6096,52 @@ function fillUploadTag(value) {
 	sel.add(new Option("New tag…", "new"));
 	sel.value = value && bookTagById(value) ? String(value) : "";
 }
+// Picking tags narrows, like a filter on a shop: the books are the ones
+// with every tag picked, and only the tags those books also carry stay in
+// the bar (with how many of them have each), so a second pick narrows
+// further. Tap a picked tag to drop it. Tags no book has are hidden except
+// in Edit, where they can be renamed or deleted.
+function libHash(ids) { return ids.length ? "#/library?tag=" + ids.join(",") : "#/library"; }
+function libFiltered(books) {
+	var sel = state.libTags;
+	return sel.length ? books.filter(function (b) { return sel.every(function (id) { return hasBookTag(b, id); }); }) : books;
+}
 function renderBookTags() {
 	fillUploadTag();
-	var box = $("bookTags"), edit = state.editBooks, sel = state.libTag, books = state.books || [];
+	var box = $("bookTags"), edit = state.editBooks, sel = state.libTags, books = state.books || [];
+	var pool = libFiltered(books);
 	box.textContent = "";
 	var list = state.bookTags.map(function (t) { return { id: t.id, name: t.name, cls: tagColor(t.id) }; });
-	if (list.length && books.some(function (b) { return !bookTagsOf(b).length; })) list.push({ id: 0, name: "Untagged", cls: "untagged" });
+	if (!sel.length && list.length && books.some(function (b) { return !bookTagsOf(b).length; })) list.push({ id: 0, name: "Untagged", cls: "untagged" });
+	list = list.map(function (x) { return Object.assign(x, { on: sel.indexOf(x.id) >= 0, n: pool.filter(function (b) { return hasBookTag(b, x.id); }).length }); })
+		.filter(function (x) { return x.on || x.n || (edit && !sel.length); });
+	list.sort(function (a, b) { return b.on - a.on; });
 	show(box, list.length > 0 || edit);
-	box.classList.toggle("filtering", sel != null);
+	box.classList.toggle("filtering", sel.length > 0);
 	var chips = h("div", "chips");
 	chips.setAttribute("aria-label", "Book tags");
 	list.forEach(function (x) {
-		var on = sameId(sel, x.id), c = chip(x.name, x.cls);
-		var n = books.filter(function (b) { return hasBookTag(b, x.id); }).length;
-		if (n) c.append(h("span", "n", String(n)));
-		c.href = on ? "#/library" : "#/library?tag=" + x.id;
-		if (on) c.setAttribute("aria-current", "true");
+		var c = chip(x.name, x.cls);
+		if (x.n) c.append(h("span", "n", String(x.n)));
+		c.href = libHash(x.on ? sel.filter(function (id) { return id !== x.id; }) : x.id === 0 ? [0] : sel.concat(x.id));
+		if (x.on) c.setAttribute("aria-current", "true");
 		chips.append(c);
 	});
+	if (sel.length > 1) {
+		var clear = chip("Clear", "untagged clear");
+		clear.href = "#/library";
+		chips.append(clear);
+	}
 	box.append(chips);
 	if (!edit) return;
-	var t = sel ? bookTagById(sel) : null, tools = h("div", "tools");
+	var t = sel.length === 1 && sel[0] ? bookTagById(sel[0]) : null, tools = h("div", "tools");
 	if (t) tools.append(
 		button("Rename “" + t.name + "”", "btn small", function () { renameBookTag(t); }),
 		button("Delete tag", "btn small", function () { deleteBookTag(t); })
 	);
 	tools.append(button("New tag", "btn small", function () { promptBookTag().then(function () { renderBooks(); }, fail); }));
 	box.append(tools);
-	if (!t && state.bookTags.length) box.append(h("div", "hint", "Pick a tag to rename or delete it."));
+	if (!t && state.bookTags.length) box.append(h("div", "hint", sel.length ? "Pick just one tag to rename or delete it." : "Pick a tag to rename or delete it."));
 }
 async function promptBookTag() {
 	var name = prompt("Name for the new book tag");
@@ -6138,7 +6161,7 @@ async function deleteBookTag(t) {
 	if (!confirm("Delete the tag “" + t.name + "”? " + what)) return;
 	try {
 		await apiJSON("/api/booktags/" + t.id, { method: "DELETE" });
-		if (sameId(state.libTag, t.id)) location.hash = "#/library";
+		if (state.libTags.indexOf(t.id) >= 0) location.hash = libHash(state.libTags.filter(function (id) { return id !== t.id; }));
 		await Promise.all([loadBookTags(), loadBooks()]);
 	} catch (e) { fail(e); }
 }
@@ -6377,7 +6400,7 @@ function repaintBook(id) {
 // The Library: one list, most recently opened first, narrowed to a tag if
 // one is picked.
 function renderBooks() {
-	var ul = $("books"), books = state.books || [], edit = state.editBooks, tag = state.libTag;
+	var ul = $("books"), books = state.books || [], edit = state.editBooks, sel = state.libTags;
 	var grid = state.libView === "covers" && !edit;
 	ul.textContent = "";
 	ul.className = grid ? "covers" : "tree books flat";
@@ -6385,16 +6408,16 @@ function renderBooks() {
 	$("libLayout").setAttribute("aria-pressed", String(state.libView === "covers"));
 	show($("libLayout"), !edit);
 	renderBookTags();
-	if (tag != null) books = books.filter(function (b) { return hasBookTag(b, tag); });
+	books = libFiltered(books);
 	var tagged = books.length;
 	books = sortBooks(books.filter(bookMatches(state.libSearch)), state.libSort);
-	$("libTitle").textContent = tag != null ? "Library · " + (tag === 0 ? "Untagged" : (bookTagById(tag) || {}).name || "") : "Library";
+	$("libTitle").textContent = sel.length ? "Library · " + sel.map(function (id) { return id === 0 ? "Untagged" : (bookTagById(id) || {}).name || ""; }).join(" + ") : "Library";
 	books.forEach(function (b) { ul.append(grid ? bookCard(b) : bookRow(b)); });
 	state.libShown = books;
 	renderLibSel();
 	var off = !!state.libOffline;
 	$("booksEmpty").textContent = tagged && !books.length ? "No books match “" + state.libSearch.trim() + "”."
-		: tag != null && (state.books || []).length ? "No books with this tag."
+		: sel.length && (state.books || []).length ? (sel.length > 1 ? "No books have all of these tags." : "No books with this tag.")
 		: off ? "You're offline, and no books are downloaded on this device." : "No books yet. Upload a .txt, .pdf, .epub or .cbz to start.";
 	show($("booksEmpty"), !books.length);
 	show($("libNote"), off && !!books.length);
