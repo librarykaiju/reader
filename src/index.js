@@ -2589,12 +2589,12 @@ const PAGE = String.raw`<!doctype html>
 	.top { position: sticky; top: 0; z-index: 10; background: var(--bg); border-bottom: 1px solid var(--line); }
 	.bar { display: flex; align-items: center; gap: 8px; padding: 6px 16px; padding-top: max(6px, env(safe-area-inset-top));
 		min-height: 52px; max-width: 1100px; margin: 0 auto; }
-	.logo { width: 28px; height: 28px; border-radius: 7px; flex: none; display: block; }
+	.logo { width: 40px; height: 40px; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,.2); flex: none; display: block; }
 	.wordmark { display: block; flex: none; color: var(--fg); line-height: 0; }
-	.wordmark svg { height: 19px; width: auto; display: block; }
+	.wordmark svg { height: 28px; width: auto; display: block; }
 	.token h1 .wordmark { display: inline-block; vertical-align: middle; }
-	.token h1 .wordmark svg { height: 26px; }
-	.token h1 .logo { display: inline-block; width: 36px; height: 36px; border-radius: 9px; vertical-align: middle; margin-right: 10px; }
+	.token h1 .wordmark svg { height: 40px; }
+	.token h1 .logo { display: inline-block; width: 56px; height: 56px; border-radius: 13px; vertical-align: middle; margin-right: 12px; }
 	.bar h1 { flex: 1; min-width: 0; margin: 0; font-size: 18px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 	.bar .progress { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 	.tabs { display: flex; gap: 4px; padding: 0 16px 8px; max-width: 1100px; margin: 0 auto; }
