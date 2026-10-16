@@ -2805,6 +2805,14 @@ const PAGE = String.raw`<!doctype html>
 	.uploads li { padding: 4px 0; overflow-wrap: anywhere; }
 	.books .child > .row > a { flex-direction: column; align-items: stretch; gap: 2px; padding-left: 8px; }
 	.books .tools { padding-left: 8px; }
+	.books .row > .pick { flex: none; width: 20px; height: 20px; margin: 0 0 0 8px; align-self: center; accent-color: var(--accent); }
+	.selbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin: 0 0 8px; font-size: 14px; }
+	.selbar .n { color: var(--muted); margin-right: auto; }
+	.pop.ctx { right: auto; top: 0; left: 0; width: 220px; padding: 6px; }
+	.pop.ctx .menu { display: flex; flex-direction: column; gap: 2px; }
+	.pop.ctx .btn { text-align: left; justify-content: flex-start; border: 0; background: none; padding: 9px 10px; width: 100%; border-radius: 8px; }
+	.pop.ctx .btn:hover, .pop.ctx .btn:focus-visible { background: var(--line); }
+	.pop.ctx .sep { height: 1px; background: var(--line); margin: 4px 6px; }
 	.books .bt { font-weight: 600; overflow-wrap: anywhere; }
 	.badge { display: inline-block; margin-left: 2px; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; line-height: 1.45;
 		vertical-align: 2px; background: var(--ok-bg); color: var(--ok); white-space: nowrap; }
@@ -2964,6 +2972,8 @@ const PAGE = String.raw`<!doctype html>
 	<button id="forget" class="btn ghost small" type="button">Forget token on this device</button>
 </div>
 
+<div id="bookCtx" class="pop ctx" role="menu" hidden><div class="menu"></div></div>
+
 <div id="bookMenu" class="pop" hidden>
 	<h2>This book</h2>
 	<div class="menu">
@@ -3075,6 +3085,12 @@ const PAGE = String.raw`<!doctype html>
 			<option value="series">Series</option>
 		</select>
 		<button id="libLayout" class="btn small" type="button" aria-pressed="false">Covers</button>
+	</div>
+	<div id="libSelBar" class="selbar" hidden>
+		<span id="libSelN" class="n"></span>
+		<button id="libSelAll" class="btn small" type="button">Select all</button>
+		<button id="libSelNone" class="btn small" type="button">Clear</button>
+		<button id="libSelDel" class="btn small danger" type="button">Delete</button>
 	</div>
 	<ul id="books" class="tree books flat"></ul>
 	<p id="booksEmpty" class="empty" hidden>No books yet. Upload a .txt, .pdf, .epub or .cbz to start.</p>
@@ -3198,7 +3214,7 @@ var state = {
 	episodes: [], epNext: null, epTag: null, epOffline: false, epDownloadedOnly: false, epKind: "podcasts", itemEp: null, fromPodcasts: false,
 	feeds: [], tags: [], books: null, bookTags: readJSON("readerBookTags") || [], libTag: null, libSearch: "", libSort: read("readerBookSort") || "recent", libView: read("readerBookView") === "covers" ? "covers" : "list",
 	items: [], next: null, listKey: "", listScroll: 0, stale: true,
-	refreshing: false, errors: {}, editFeeds: false, editBooks: false, item: null
+	refreshing: false, errors: {}, editFeeds: false, editBooks: false, libSel: {}, item: null
 };
 var session = null; // the open book
 var started = false;
@@ -4680,6 +4696,7 @@ async function route() {
 	openSettings(false);
 	openBookMenu(false);
 	if (details) closeDetails();
+	closeBookCtx();
 	state.item = null;
 	try {
 		if (LIST_VIEWS[r.name]) return await showList(r, prev);
@@ -6128,6 +6145,8 @@ function renderBooks() {
 	books = sortBooks(books.filter(bookMatches(state.libSearch)), state.libSort);
 	$("libTitle").textContent = tag != null ? "Library · " + (tag === 0 ? "Untagged" : (bookTagById(tag) || {}).name || "") : "Library";
 	books.forEach(function (b) { ul.append(grid ? bookCard(b) : bookRow(b)); });
+	state.libShown = books;
+	renderLibSel();
 	var off = !!state.libOffline;
 	$("booksEmpty").textContent = tagged && !books.length ? "No books match “" + state.libSearch.trim() + "”."
 		: tag != null && (state.books || []).length ? "No books with this tag."
@@ -6187,6 +6206,17 @@ function bookRow(b) {
 	a.append(title);
 	if (about) a.append(h("span", "ba", about));
 	a.append(h("span", "bm", meta.join(" · ")), bar);
+	if (state.editBooks) {
+		var pick = h("input", "pick");
+		pick.type = "checkbox";
+		pick.checked = !!state.libSel[b.id];
+		pick.setAttribute("aria-label", "Select " + b.title);
+		pick.addEventListener("change", function () {
+			if (pick.checked) state.libSel[b.id] = true; else delete state.libSel[b.id];
+			renderLibSel();
+		});
+		row.append(pick);
+	}
 	row.append(a);
 	if (!state.editBooks && window.caches) row.append(bookDlButton(b));
 	li.append(row);
@@ -6560,14 +6590,98 @@ $("libLayout").addEventListener("click", function () {
 async function deleteBook(b) {
 	if (!confirm("Delete “" + b.title + "”? The file is removed for good, from every device.")) return false;
 	try {
-		await apiJSON("/api/books/" + b.id, { method: "DELETE" });
-		forgetBookDownload(b.id);
-		saveBookDownloads();
-		delete bookPending[b.id];
-		saveBookPending();
+		await dropBook(b);
 		await loadBooks();
 		return true;
 	} catch (e) { fail(e); return false; }
+}
+async function dropBook(b) {
+	await apiJSON("/api/books/" + b.id, { method: "DELETE" });
+	forgetBookDownload(b.id);
+	saveBookDownloads();
+	delete bookPending[b.id];
+	saveBookPending();
+	delete state.libSel[b.id];
+}
+// Picking books in Edit mode, to delete several at once. Only books the
+// current search and tag show count, so a hidden pick is never deleted.
+function selectedBooks() {
+	return (state.libShown || []).filter(function (b) { return state.libSel[b.id]; });
+}
+function renderLibSel() {
+	var on = state.editBooks && !state.libOffline, n = on ? selectedBooks().length : 0, all = (state.libShown || []).length;
+	show($("libSelBar"), on && all > 0);
+	$("libSelN").textContent = n ? n + " selected" : "Tick books to delete several at once.";
+	show($("libSelNone"), n > 0);
+	show($("libSelAll"), n < all);
+	$("libSelDel").disabled = !n;
+	$("libSelDel").textContent = n ? "Delete " + n : "Delete";
+}
+async function deleteSelected() {
+	var books = selectedBooks(), btn = $("libSelDel");
+	if (!books.length) return;
+	var names = books.slice(0, 5).map(function (b) { return "• " + b.title; }).join("\n") + (books.length > 5 ? "\n…and " + (books.length - 5) + " more" : "");
+	if (!confirm("Delete " + books.length + (books.length === 1 ? " book" : " books") + "? The files are removed for good, from every device.\n\n" + names)) return;
+	btn.disabled = true;
+	var failed = [];
+	for (var i = 0; i < books.length; i++) {
+		$("libSelN").textContent = "Deleting " + (i + 1) + " of " + books.length + "…";
+		try { await dropBook(books[i]); } catch (e) {
+			if (e.message === UNAUTH) return;
+			failed.push(books[i].title);
+		}
+	}
+	await loadBooks();
+	if (failed.length) fail(new Error("Couldn't delete " + failed.join(", ") + "."));
+	else toast(books.length === 1 ? "Deleted 1 book." : "Deleted " + books.length + " books.");
+}
+
+// Right-click (or long-press, where the browser sends it) on a book in the
+// Library: the book's actions in a small menu where the pointer is.
+var ctxBook = null;
+function openBookCtx(b, x, y) {
+	var box = $("bookCtx"), menu = box.querySelector(".menu"), off = !!state.libOffline;
+	ctxBook = b;
+	menu.textContent = "";
+	var item = function (label, fn, cls) {
+		var btn = button(label, "btn" + (cls ? " " + cls : ""), function (e) { e.stopPropagation(); closeBookCtx(); fn(); });
+		btn.setAttribute("role", "menuitem");
+		menu.append(btn);
+	};
+	item("Open", function () { location.hash = "#/book/" + b.id; });
+	if (!off) {
+		item("Edit details", function () { openDetails(b); });
+		item(b.finished_at ? "Mark unfinished" : "Mark finished", async function () {
+			try { await setFinished(b, !b.finished_at); } catch (e) { fail(e); }
+			renderBooks();
+		});
+		item("Start over", async function () {
+			if (!confirmStartOver(b)) return;
+			try { await resetPosition(b); } catch (e) { fail(e); }
+			renderBooks();
+		});
+	}
+	if (window.caches) item(bookDownloads[b.id] ? "Remove download" : "Download for offline", function () { toggleBookDownload(b); });
+	if (!off) {
+		item(state.editBooks && state.libSel[b.id] ? "Deselect" : "Select", function () {
+			if (state.libSel[b.id]) delete state.libSel[b.id]; else state.libSel[b.id] = true;
+			if (!state.editBooks) { state.editBooks = true; state.libSel = {}; state.libSel[b.id] = true; }
+			renderBooks();
+		});
+		menu.append(h("div", "sep"));
+		item("Delete", function () { deleteBook(b); }, "danger");
+	}
+	openSettings(false);
+	show(box, true);
+	var w = box.offsetWidth, ht = box.offsetHeight;
+	box.style.left = Math.max(8, Math.min(x, innerWidth - w - 8)) + "px";
+	box.style.top = Math.max(8, Math.min(y, innerHeight - ht - 8)) + "px";
+	menu.firstChild.focus({ preventScroll: true });
+}
+function closeBookCtx() {
+	if ($("bookCtx").hidden) return;
+	show($("bookCtx"), false);
+	ctxBook = null;
 }
 // Finished: set on reaching the end, or by hand. Start over keeps it.
 // Offline, it's kept here and sent later like a place in the book.
@@ -8448,7 +8562,30 @@ $("uploadTag").addEventListener("change", async function () {
 	} catch (e) { fillUploadTag(null); fail(e); }
 });
 $("editFeeds").addEventListener("click", function () { state.editFeeds = !state.editFeeds; renderFeeds(); });
-$("editBooks").addEventListener("click", function () { state.editBooks = !state.editBooks; renderBooks(); });
+$("editBooks").addEventListener("click", function () { state.editBooks = !state.editBooks; state.libSel = {}; renderBooks(); });
+$("libSelAll").addEventListener("click", function () { (state.libShown || []).forEach(function (b) { state.libSel[b.id] = true; }); renderBooks(); });
+$("libSelNone").addEventListener("click", function () { state.libSel = {}; renderBooks(); });
+$("libSelDel").addEventListener("click", deleteSelected);
+$("books").addEventListener("contextmenu", function (e) {
+	var a = e.target.closest && e.target.closest('a[href^="#/book/"]');
+	if (!a || e.shiftKey) return;
+	var id = Number(a.getAttribute("href").slice(7)), b = (state.books || []).filter(function (x) { return x.id === id; })[0];
+	if (!b) return;
+	e.preventDefault();
+	openBookCtx(b, e.clientX, e.clientY);
+});
+document.addEventListener("pointerdown", function (e) { if (!$("bookCtx").hidden && !$("bookCtx").contains(e.target)) closeBookCtx(); }, true);
+document.addEventListener("keydown", function (e) {
+	if ($("bookCtx").hidden) return;
+	if (e.key === "Escape") { e.preventDefault(); closeBookCtx(); return; }
+	if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+		e.preventDefault();
+		var items = Array.prototype.slice.call($("bookCtx").querySelectorAll("button")), i = items.indexOf(document.activeElement);
+		items[(i + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length].focus();
+	}
+}, true);
+window.addEventListener("scroll", closeBookCtx, { passive: true });
+window.addEventListener("resize", closeBookCtx);
 $("bookSearch").addEventListener("input", function () { state.libSearch = this.value; if (state.books) renderBooks(); });
 $("bookSort").value = state.libSort;
 $("bookSort").addEventListener("change", function () { state.libSort = this.value; store("readerBookSort", this.value === "recent" ? null : this.value); if (state.books) renderBooks(); });
