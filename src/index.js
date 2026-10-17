@@ -2707,7 +2707,7 @@ const PAGE = String.raw`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta id="vp" name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Reader">
 <meta name="color-scheme" content="light dark">
@@ -2777,8 +2777,11 @@ const PAGE = String.raw`<!doctype html>
 		color-scheme: dark;
 	}
 	* { box-sizing: border-box; }
-	html { -webkit-text-size-adjust: 100%; }
-	body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.45 var(--sans); }
+	/* The page never scrolls sideways or zooms (a PDF or comic can pinch-zoom,
+	   html.zoomable). clip, unlike hidden, leaves the sticky header working. */
+	html { -webkit-text-size-adjust: 100%; overflow-x: hidden; overflow-x: clip; touch-action: pan-x pan-y; }
+	html.zoomable { touch-action: auto; }
+	body { overflow-x: clip; margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.45 var(--sans); }
 	a { color: var(--accent); }
 	button, input, select { font: inherit; color: inherit; }
 	[hidden] { display: none !important; }
@@ -2954,7 +2957,7 @@ const PAGE = String.raw`<!doctype html>
 	.items .read .dot { visibility: hidden; }
 	.items .t { font-weight: 600; font-size: 17px; line-height: 1.3; overflow-wrap: anywhere; }
 	.items .read .t { font-weight: 400; color: var(--muted); }
-	.items .m { grid-column: 2; font-size: 13px; color: var(--muted); margin-top: 3px; }
+	.items .m { grid-column: 2; font-size: 13px; color: var(--muted); margin-top: 3px; overflow-wrap: anywhere; }
 	.items .story > a { border-bottom: 0; padding-bottom: 8px; }
 	.items .rel { list-style: none; margin: 0; padding: 0 0 12px 22px; border-bottom: 1px solid var(--line); }
 	.items .rel a { display: block; padding: 5px 0 5px 10px; border: 0; border-left: 2px solid var(--line); font-size: 15px; line-height: 1.3; overflow-wrap: anywhere; }
@@ -2968,7 +2971,7 @@ const PAGE = String.raw`<!doctype html>
 
 	.article { max-width: 68ch; margin: 0 auto; padding: 20px 16px 96px; font-family: var(--serif); font-size: var(--reader-size); line-height: 1.65; }
 	.article .title { font-size: 1.55em; line-height: 1.2; margin: 0 0 .35em; overflow-wrap: anywhere; }
-	.article .meta { font: 14px/1.4 var(--sans); color: var(--muted); }
+	.article .meta { font: 14px/1.4 var(--sans); color: var(--muted); overflow-wrap: anywhere; }
 	.actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 22px; font-family: var(--sans); }
 	.itemnav { display: flex; gap: 8px; margin-top: 32px; padding-top: 16px; border-top: 1px solid var(--line); font-family: var(--sans); }
 	.itemnav .btn { flex: 1; }
@@ -4826,6 +4829,14 @@ async function loadItems(append, keepScroll) {
 // rows mid-tap loses the tap: Safari drops a tap when the page changes under
 // it, and the row that was there is gone.
 var touchDown = 0, touchUp = 0;
+// No zooming, except in a PDF or comic, where a pinch is how small print gets
+// read. Safari in a tab ignores user-scalable, so its pinch gesture is
+// cancelled here too.
+function zoomable(on) {
+	document.documentElement.classList.toggle("zoomable", on);
+	$("vp").content = "width=device-width, initial-scale=1" + (on ? "" : ", maximum-scale=1, user-scalable=no") + ", viewport-fit=cover";
+}
+document.addEventListener("gesturestart", function (e) { if (!document.documentElement.classList.contains("zoomable")) e.preventDefault(); });
 ["touchstart", "pointerdown"].forEach(function (t) {
 	document.addEventListener(t, function (e) { if (t === "touchstart" || e.pointerType !== "mouse") touchDown = Date.now(); }, { capture: true, passive: true });
 });
@@ -7170,6 +7181,7 @@ async function openBook(id) {
 	$("heading").textContent = book.title;
 	document.title = book.title + " — Reader";
 	$("progress").textContent = "";
+	zoomable(book.type === "pdf" || book.type === "cbz");
 	try {
 		if (book.type === "pdf") await openPdf(sess, parsePos(book.position) || {});
 		else if (book.type === "cbz") await openCbz(sess, parsePos(book.position) || {});
@@ -7187,6 +7199,7 @@ function closeBook() {
 	if (!s) return;
 	session = null;
 	s.alive = false;
+	zoomable(false);
 	flushPosition(s);
 	s.cleanup.forEach(function (fn) { try { fn(); } catch (e) {} });
 	showFind(false);
