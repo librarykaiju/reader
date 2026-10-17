@@ -8380,6 +8380,7 @@ var EPUB_FONT_KEYS = /^http:\/\/(www\.idpf\.org\/2008\/embedding|ns\.adobe\.com\
 var EPUB_BLOCK = /^(p|h[1-6]|blockquote|pre|ul|ol|dl|table|figure|hr)$/;
 var EPUB_HAS_BLOCK = "p,div,h1,h2,h3,h4,h5,h6,blockquote,pre,ul,ol,dl,table,figure,hr,section,article,aside,header,footer,main,nav";
 var XLINK_NS = "http://www.w3.org/1999/xlink";
+var EPUB_DISPLAY_BLOCK = /(^|[;\s])display\s*:\s*(block|flow-root|list-item)\b/;
 
 function epubTags(node, name) { return node ? [].slice.call(node.getElementsByTagNameNS("*", name)) : []; }
 // A link inside the book as a zip path (plus its #fragment), from the file
@@ -8510,8 +8511,9 @@ async function epubLoad(buf) {
 	};
 }
 
-// The book's stylesheets, only for which classes mean italic, bold or
-// centered (calibre's "calibre5" and the like say so nowhere else).
+// The book's stylesheets, only for which classes mean italic, bold,
+// centered, or a line of its own (calibre's "calibre5" and the like say so
+// nowhere else; some books make every paragraph a span with display: block).
 // Only single-class rules are read: ".x" or "p.x".
 function epubCss(css, out) {
 	var re = /([^{}@]+)\{([^{}]*)\}/g, m;
@@ -8520,13 +8522,15 @@ function epubCss(css, out) {
 		var d = m[2].toLowerCase();
 		var it = /font-style\s*:\s*(italic|oblique)/.test(d), bd = /font-weight\s*:\s*(bold|bolder|[6-9]00)\b/.test(d);
 		var al = /text-align\s*:\s*center/.test(d) ? "ec" : /text-align\s*:\s*right/.test(d) ? "er" : "";
-		if (!it && !bd && !al) continue;
+		var bl = EPUB_DISPLAY_BLOCK.test(d);
+		if (!it && !bd && !al && !bl) continue;
 		m[1].split(",").forEach(function (sel) {
 			var c = /^[a-z0-9]*\.([\w-]+)$/i.exec(sel.trim());
 			if (!c) return;
 			if (it) out.i[c[1]] = 1;
 			if (bd) out.b[c[1]] = 1;
 			if (al) out.al[c[1]] = al;
+			if (bl) out.bl[c[1]] = 1;
 		});
 	}
 }
@@ -8539,7 +8543,8 @@ function epubFmt(n, css) {
 	return {
 		i: /font-style\s*:\s*(italic|oblique)/.test(st) || cls.some(function (c) { return css.i[c]; }) || named(/(^|[_-])(italic|ital|emph)([_-]|$)/i),
 		b: /font-weight\s*:\s*(bold|bolder|[6-9]00)\b/.test(st) || cls.some(function (c) { return css.b[c]; }) || named(/(^|[_-])(bold|strong)([_-]|$)/i),
-		al: al || (named(/^(center|centered|centre|centred)$/i) ? "ec" : "")
+		al: al || (named(/^(center|centered|centre|centred)$/i) ? "ec" : ""),
+		bl: EPUB_DISPLAY_BLOCK.test(st) || cls.some(function (c) { return css.bl[c]; })
 	};
 }
 
@@ -8562,7 +8567,13 @@ function epubClean(from, to, path, ep, css, depth, pre) {
 		if (tag === "img") { epubImg(n.getAttribute("src"), n.getAttribute("alt"), to, path, ep, eid); continue; }
 		if (DROP.test(tag)) continue;
 		if (AS_DIV.test(tag)) tag = "div";
-		var allowed = tag !== "span" && ALLOWED[tag], e = null, fmt = epubFmt(n, css);
+		var allowed = tag !== "span" && ALLOWED[tag], e = null, fmt = epubFmt(n, css), dest = to;
+		// An inline element the book's CSS shows as a block (a span per
+		// paragraph, say) gets a div around it, or its lines would run together.
+		if (fmt.bl && !EPUB_BLOCK.test(tag) && !/^(div|li|dt|dd|tr|td|th|thead|tbody|tfoot|caption|figcaption|br)$/.test(tag)) {
+			dest = to.appendChild(document.createElement("div"));
+			if (fmt.al) dest.className = fmt.al;
+		}
 		if (allowed) {
 			e = document.createElement(tag);
 			allowed.forEach(function (a) {
@@ -8573,13 +8584,13 @@ function epubClean(from, to, path, ep, css, depth, pre) {
 			if (tag === "a") epubLink(n, e, path);
 			if (eid) e.dataset.eid = eid;
 			if (fmt.al && /^(p|div|h[1-6]|blockquote)$/.test(tag)) e.className = fmt.al;
-			to.appendChild(e);
+			dest.appendChild(e);
 		} else if (eid) {
 			var spot = document.createElement("span");
 			spot.dataset.eid = eid;
-			to.appendChild(spot);
+			dest.appendChild(spot);
 		}
-		var inner = e || to;
+		var inner = e || dest;
 		// Italic or bold from a class or a style, on something holding only text.
 		if ((fmt.i || fmt.b) && !n.querySelector(EPUB_HAS_BLOCK)) {
 			if (fmt.i && !/^(em|i|cite)$/.test(tag)) inner = inner.appendChild(document.createElement("em"));
@@ -8621,7 +8632,7 @@ function epubImg(src, alt, to, path, ep, eid) {
 // last block of the book proper, before any notes kept out of the reading
 // order (linear="no")}.
 async function epubBlocks(ep, alive) {
-	var css = { i: {}, b: {}, al: {} };
+	var css = { i: {}, b: {}, al: {}, bl: {} };
 	for (var c = 0; c < ep.styles.length; c++) epubCss((await ep.text(ep.styles[c]).catch(function () { return ""; })) || "", css);
 	var out = { blocks: [], anchors: {}, starts: {}, end: null }, st = { run: null, pending: [] };
 	for (var s = 0; s < ep.spine.length; s++) {
@@ -8665,7 +8676,9 @@ function epubFlatten(from, out, st) {
 			continue;
 		}
 		epubEndRun(out, st);
-		if (tag === "div" && n.querySelector(EPUB_HAS_BLOCK)) {
+		// A paragraph holding blocks (the divs epubClean put around
+		// display: block spans) is opened up like a div.
+		if ((tag === "div" || tag === "p") && n.querySelector(tag === "p" ? "div" : EPUB_HAS_BLOCK)) {
 			if (n.dataset.eid) st.pending.push(n.dataset.eid);
 			epubFlatten(n, out, st);
 			epubEndRun(out, st);
