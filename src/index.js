@@ -67,7 +67,8 @@
 //   PUT    /api/books/:id/cover    body = a JPEG/PNG/WebP: a PDF's first page the page drew, or one chosen in Edit details
 //   DELETE /api/books/:id/cover    back to the automatic cover (the file's own, or a PDF's first page)
 //   PATCH  /api/books/:id          {title?, author?, series?, volume?, position?, finished?, opened?, tags?, reread?}
-//                                  (author/series/volume: the page reads them from an EPUB's own details)
+//                                  (author/series/volume: the page reads them from an EPUB's own details;
+//                                  reread: fill them in from a .txt's YAML header or a comic's ComicInfo.xml)
 //                                  (reread: fill the details again from a .txt's YAML header)
 //                                  (position null = start over)
 //   DELETE /api/books/:id          also deletes the file from R2
@@ -1827,7 +1828,10 @@ async function addBookFile(env, filename, ext, key, size, uploadTags) {
 			const { results } = await env.DB.prepare("SELECT tag_id FROM book_tag_links WHERE book_id = ?").bind(old.id).all();
 			book.tags = results.map((r) => r.tag_id);
 			if (ext === "txt") await applyFrontMatter(env, Object.assign(book, { r2_key: key })).catch(() => {});
-			else await uploadGenres(env, book, key);
+			else {
+				if (ext === "cbz") await applyComicInfo(env, Object.assign(book, { r2_key: key })).catch((err) => console.warn("comicinfo", book.id, err));
+				await uploadGenres(env, book, key);
+			}
 			delete book.r2_key;
 			await env.BOOKS.delete(old.r2_key);
 			return json({ book, replaced: true });
@@ -1847,7 +1851,11 @@ async function addBookFile(env, filename, ext, key, size, uploadTags) {
 		await addBookTags(env, book.id, uploadTags);
 		book.tags = uploadTags;
 		if (ext === "txt") await applyFrontMatter(env, book).catch(() => {});
-		else await uploadGenres(env, book, key);
+		else {
+			if (ext === "cbz") await applyComicInfo(env, Object.assign(book, { r2_key: key })).catch((err) => console.warn("comicinfo", book.id, err));
+			delete book.r2_key;
+			await uploadGenres(env, book, key);
+		}
 		return json({ book }, 201);
 	} catch (err) {
 		await env.BOOKS.delete(key);
@@ -2002,6 +2010,7 @@ async function updateBook(request, env, id) {
 	if (body.reread) {
 		const book = await getBook(env, id);
 		if (book.type === "txt") await applyFrontMatter(env, book);
+		else if (bookType(book) === "cbz") await applyComicInfo(env, book);
 	}
 	const tagIds = body.tags === undefined ? null : await tagRefs(env, body.tags, TAGS.books);
 	if (!sets.length && !tagIds && !body.reread) throw new HttpError(400, "Nothing to change");
@@ -2160,12 +2169,8 @@ async function fileSubjects(env, book) {
 		out.title = els("title")[0] || "";
 		out.author = els("creator")[0] || "";
 	} else if (type === "cbz") {
-		const zip = await r2Zip(env, book.r2_key, book.size);
-		const info = zip && zip.files.find((f) => /(^|\/)comicinfo\.xml$/i.test(f.name));
-		const bytes = info && await r2ZipRead(env, zip, info);
-		if (!bytes) return out;
-		const xml = new TextDecoder().decode(bytes);
-		const el = (name) => xmlText((new RegExp(`<${name}>([\\s\\S]*?)</${name}>`, "i").exec(xml) || [])[1] || "");
+		const el = await comicInfo(env, book);
+		if (!el) return out;
 		out.subjects = [el("Genre"), el("Tags")].join(",").split(/[,;]/);
 		out.title = el("Series") || el("Title");
 		out.author = el("Writer").split(",")[0];
@@ -2186,6 +2191,35 @@ async function fileSubjects(env, book) {
 	}
 	out.subjects = out.subjects.map((s) => s.replace(/\s+/g, " ").trim()).filter((s) => s && s.length <= 120).slice(0, 60);
 	return out;
+}
+// A comic's ComicInfo.xml, as a function from an element name to its text
+// ("" when it's missing), or null when the comic has none.
+async function comicInfo(env, book) {
+	const zip = await r2Zip(env, book.r2_key, book.size);
+	const info = zip && zip.files.find((f) => /(^|\/)comicinfo\.xml$/i.test(f.name));
+	const bytes = info && await r2ZipRead(env, zip, info);
+	if (!bytes) return null;
+	const xml = new TextDecoder().decode(bytes);
+	return (name) => xmlText((new RegExp(`<${name}>([\\s\\S]*?)</${name}>`, "i").exec(xml) || [])[1] || "");
+}
+// A comic's series, number and title from its ComicInfo.xml, onto the book.
+// Only blanks are filled, and the title only while it's still the one made
+// from the file name, so nothing typed in Edit details is replaced. With no
+// <Title>, the title becomes "Series #3". <Number> is the issue or volume;
+// <Volume> stands in when there's no number.
+async function applyComicInfo(env, book) {
+	const el = await comicInfo(env, book);
+	if (!el) return;
+	const cut = (v) => v.slice(0, 300) || null;
+	const series = cut(el("Series")), volume = cut(el("Number") || el("Volume"));
+	const title = cut(el("Title")) || (series ? cut(series + (volume ? " #" + volume : "")) : null);
+	const author = cut(el("Writer").split(",")[0].trim());
+	if (!series && !volume && !title && !author) return;
+	const row = await env.DB.prepare(
+		`UPDATE books SET series = COALESCE(NULLIF(series, ''), ?), volume = COALESCE(NULLIF(volume, ''), ?), author = COALESCE(NULLIF(author, ''), ?),
+		title = CASE WHEN title = ? THEN COALESCE(?, title) ELSE title END WHERE id = ? RETURNING ${BOOK_COLUMNS}`,
+	).bind(series, volume, author, madeTitle(book.filename), title, book.id).first();
+	if (row) Object.assign(book, row);
 }
 function xmlText(s) {
 	return decodeXml(String(s).replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1").replace(/<[^>]+>/g, ""))
@@ -3084,6 +3118,15 @@ const PAGE = String.raw`<!doctype html>
 	.pop.ctx .btn:hover, .pop.ctx .btn:focus-visible { background: var(--line); }
 	.pop.ctx .sep { height: 1px; background: var(--line); margin: 4px 6px; }
 	.books .bt { font-weight: 600; overflow-wrap: anywhere; }
+	/* A series in the Series sort: one entry that opens to its volumes. */
+	.books .series .bt::after { content: " ›"; color: var(--muted); }
+	.covers .series .cover { overflow: visible; }
+	.covers .series .cover::before, .covers .series .cover::after { content: ""; position: absolute; inset: 0; border-radius: 5px; background: var(--line);
+		box-shadow: 0 1px 3px rgba(0,0,0,.18); transform: translate(4px, -4px); z-index: -1; }
+	.covers .series .cover::after { transform: translate(8px, -8px); opacity: .7; z-index: -2; }
+	.covers .series .cover > * { border-radius: 5px; overflow: hidden; }
+	.covers .series .cover { isolation: isolate; }
+	.libup { display: inline-block; margin: 12px 0 -6px; font-size: 14px; color: var(--accent); text-decoration: none; }
 	.badge { display: inline-block; margin-left: 2px; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; line-height: 1.45;
 		vertical-align: 2px; background: var(--ok-bg); color: var(--ok); white-space: nowrap; }
 	.books .ba { font-size: 14px; overflow-wrap: anywhere; }
@@ -3201,6 +3244,8 @@ const PAGE = String.raw`<!doctype html>
 	#farX { padding: 8px 14px 8px 8px; opacity: .7; }
 	.toast { position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 30;
 		background: var(--fg); color: var(--bg); padding: 10px 14px; border-radius: 10px; font-size: 14px; max-width: calc(100vw - 32px); }
+	.toast.act { display: flex; align-items: center; width: max-content; }
+	.toast button { flex: none; white-space: nowrap; margin-left: 12px; border: 0; border-radius: 8px; padding: 6px 10px; background: var(--bg); color: var(--fg); font-weight: 600; font-size: 14px; cursor: pointer; }
 </style>
 </head>
 <body>
@@ -3352,6 +3397,7 @@ const PAGE = String.raw`<!doctype html>
 </section>
 
 <section id="libraryView" class="wrap" hidden>
+	<a id="libUp" class="libup" href="#/library" hidden>‹ Library</a>
 	<div class="listhead">
 		<h2 id="libTitle">Library</h2>
 		<button id="editBooks" class="btn ghost small" type="button">Edit</button>
@@ -3385,6 +3431,7 @@ const PAGE = String.raw`<!doctype html>
 		<button id="libSelAll" class="btn small" type="button">Select all</button>
 		<button id="libSelNone" class="btn small" type="button">Clear</button>
 		<button id="libSelGenres" class="btn small" type="button">Tag genres</button>
+		<button id="libSelFill" class="btn small" type="button" title="Series, volume and title from each comic's ComicInfo.xml">Fill in details</button>
 		<button id="libSelDel" class="btn small danger" type="button">Delete</button>
 	</div>
 	<ul id="books" class="tree books flat"></ul>
@@ -3541,12 +3588,15 @@ function pause() { return new Promise(function (r) { setTimeout(r, 0); }); }
 function sameId(a, b) { return a == null ? b == null : b != null && Number(a) === Number(b); }
 
 var toastTimer;
-function toast(msg) {
+// act: {label, fn} for a button after the message (it stays up longer).
+function toast(msg, act) {
 	var t = $("toast");
 	t.textContent = msg;
+	t.classList.toggle("act", !!act);
+	if (act) t.append(button(act.label, "tact", function () { show(t, false); act.fn(); }));
 	show(t, true);
 	clearTimeout(toastTimer);
-	toastTimer = setTimeout(function () { show(t, false); }, 4500);
+	toastTimer = setTimeout(function () { show(t, false); }, act ? 9000 : 4500);
 }
 function fail(err) { if (err && err.message !== UNAUTH) toast(err.message || String(err)); }
 
@@ -4982,7 +5032,7 @@ function parseHash() {
 	var num = function (v) { return v != null && /^\d+$/.test(v) ? Number(v) : null; };
 	return {
 		name: parts[0] || "unread", id: num(parts[1]),
-		feed: num(params.get("feed")), tag: num(params.get("tag")),
+		feed: num(params.get("feed")), tag: num(params.get("tag")), series: params.get("series"),
 		// The Library takes several: ?tag=3,7 is books with both.
 		tags: (params.get("tag") || "").split(",").map(num).filter(function (x) { return x != null; })
 	};
@@ -6130,6 +6180,8 @@ async function showLibrary(r) {
 	// Untagged (0) can't be combined with a tag.
 	state.libTags = r.tags.indexOf(0) >= 0 ? [0] : r.tags.filter(function (x, i, a) { return a.indexOf(x) === i; });
 	state.libTag = state.libTags.length ? state.libTags[0] : null;
+	if ((r.series || null) !== (state.libSeries || null)) window.scrollTo(0, 0);
+	state.libSeries = r.series || null;
 	fillUploadTag(state.libTag);
 	showView("library");
 	renderTabs("library");
@@ -6480,14 +6532,33 @@ function renderBooks() {
 	show($("libLayout"), !edit);
 	renderBookTags();
 	books = libFiltered(books);
+	var one = state.libSeries;
+	if (one) books = books.filter(function (b) { return fold(b.series) === fold(one); });
 	var tagged = books.length;
-	books = sortBooks(books.filter(bookMatches(state.libSearch)), state.libSort);
-	$("libTitle").textContent = sel.length ? "Library · " + sel.map(function (id) { return id === 0 ? "Untagged" : (bookTagById(id) || {}).name || ""; }).join(" + ") : "Library";
-	books.forEach(function (b) { ul.append(grid ? bookCard(b) : bookRow(b)); });
+	books = sortBooks(books.filter(bookMatches(state.libSearch)), one ? "series" : state.libSort);
+	var tagNames = sel.map(function (id) { return id === 0 ? "Untagged" : (bookTagById(id) || {}).name || ""; }).join(" + ");
+	$("libTitle").textContent = one ? (books[0] ? books[0].series : one) : sel.length ? "Library · " + tagNames : "Library";
+	$("libUp").href = libHash(sel);
+	$("libUp").textContent = "‹ " + (sel.length ? "Library · " + tagNames : "Library");
+	show($("libUp"), !!one);
+	// Sorted by series (and not searching or editing), each series is one
+	// entry that opens to its volumes; books in no series follow as they are.
+	if (!one && state.libSort === "series" && !edit && !state.libSearch.trim()) {
+		var seen = {};
+		books.forEach(function (b) {
+			if (!b.series) return ul.append(grid ? bookCard(b) : bookRow(b));
+			var k = fold(b.series);
+			if (seen[k]) return seen[k].books.push(b);
+			seen[k] = { name: b.series, books: [b] };
+			ul.append(seen[k].li = h("li"));
+		});
+		Object.keys(seen).forEach(function (k) { seen[k].li.replaceWith(grid ? seriesCard(seen[k]) : seriesRow(seen[k])); });
+	} else books.forEach(function (b) { ul.append(grid ? bookCard(b) : bookRow(b)); });
 	state.libShown = books;
 	renderLibSel();
 	var off = !!state.libOffline;
 	$("booksEmpty").textContent = tagged && !books.length ? "No books match “" + state.libSearch.trim() + "”."
+		: one ? "No books in this series" + (sel.length ? " with " + (sel.length > 1 ? "these tags." : "this tag.") : ".")
 		: sel.length && (state.books || []).length ? (sel.length > 1 ? "No books have all of these tags." : "No books with this tag.")
 		: off ? "You're offline, and no books are downloaded on this device." : "No books yet. Upload a .txt, .pdf, .epub or .cbz to start.";
 	show($("booksEmpty"), !books.length);
@@ -6586,10 +6657,9 @@ function bookRow(b) {
 var coverUrls = {}, coverIO = null;
 var COVER_COLORS = ["#7a3b2e", "#2f4f6f", "#3d5a3a", "#5b3f6e", "#8a6a1f", "#1f5e5e", "#6b2f45", "#4a4f63", "#7b4a1c", "#35524a"];
 function bookCard(b) {
-	var li = h("li"), a = h("a"), cov = h("div", "cover");
+	var li = h("li"), a = h("a"), cov = coverBox(b);
 	a.href = "#/book/" + b.id;
 	a.setAttribute("aria-label", b.title + (b.author ? ", " + b.author : ""));
-	cov.append(drawnCover(b));
 	if (b.finished_at) cov.append(h("span", "badge cdone", "Finished"));
 	var pos = parsePos(b.position), pct = pos && pos.f ? Math.round(pos.f * 100) : 0;
 	var bar = h("div", "bar-prog"), fill = h("span");
@@ -6599,8 +6669,49 @@ function bookCard(b) {
 	if (b.author) a.append(h("span", "ca", b.author));
 	if (pct) a.append(bar);
 	li.append(a);
+	return li;
+}
+// A book's cover: drawn at once, its real one loaded as it comes on screen.
+function coverBox(b) {
+	var cov = h("div", "cover");
+	cov.append(drawnCover(b));
 	if (coverUrls[b.id]) showCover(cov, coverUrls[b.id]);
 	else if (b.cover === "yes" || (b.type !== "txt" && b.cover !== "none")) watchCover(b, cov);
+	return cov;
+}
+// A series in the Series sort, g: {name, books (in volume order)}.
+function seriesHref(name) {
+	var sel = state.libTags;
+	return "#/library?" + (sel.length ? "tag=" + sel.join(",") + "&" : "") + "series=" + encodeURIComponent(name);
+}
+function seriesAbout(g) {
+	var n = g.books.length, read = g.books.filter(function (b) { return b.finished_at; }).length;
+	var authors = g.books.map(function (b) { return b.author; }).filter(Boolean);
+	return { read: read, n: n, author: authors[0] || "", said: read + " of " + n + " read" };
+}
+function seriesProg(x) {
+	var bar = h("div", "bar-prog"), fill = h("span");
+	fill.style.width = Math.round(x.read / x.n * 100) + "%";
+	bar.append(fill);
+	return bar;
+}
+function seriesRow(g) {
+	var li = h("li", "child series"), row = h("div", "row"), a = h("a"), x = seriesAbout(g);
+	a.href = seriesHref(g.name);
+	a.append(h("span", "bt", g.name));
+	if (x.author) a.append(h("span", "ba", x.author));
+	a.append(h("span", "bm", x.said), seriesProg(x));
+	row.append(a);
+	li.append(row);
+	return li;
+}
+function seriesCard(g) {
+	var li = h("li", "series"), a = h("a"), x = seriesAbout(g);
+	a.href = seriesHref(g.name);
+	a.setAttribute("aria-label", g.name + ", series, " + x.said);
+	a.append(coverBox(g.books[0]), h("span", "ct", g.name), h("span", "ca", x.said));
+	if (x.read) a.append(seriesProg(x));
+	li.append(a);
 	return li;
 }
 function drawnCover(b) {
@@ -6968,6 +7079,7 @@ function renderLibSel() {
 	show($("libSelAll"), n < all);
 	$("libSelDel").disabled = !n;
 	$("libSelGenres").disabled = !n;
+	$("libSelFill").disabled = !n;
 	$("libSelDel").textContent = n ? "Delete " + n : "Delete";
 }
 async function deleteSelected() {
@@ -7024,6 +7136,36 @@ async function tagGenresSelected() {
 	var msg = [tagged && "Added genres to " + count(tagged) + ".", had && count(had) + " already had theirs.",
 		none && "Found no genres for " + count(none) + "."].filter(Boolean).join(" ");
 	if (failed.length) fail(new Error((msg ? msg + " " : "") + "Couldn't tag " + failed.join(", ") + "."));
+	else toast(msg);
+}
+
+// Fill in details: title, series and volume from each selected comic's
+// ComicInfo.xml, for comics uploaded before it was read. Only blanks are
+// filled (and a title still made from the file name). Other books are left
+// alone: EPUBs fill theirs in when opened, and a .txt's header would replace
+// what was typed in Edit details.
+async function fillSelected() {
+	var books = selectedBooks().filter(function (b) { return b.type === "cbz"; }), btn = $("libSelFill");
+	if (!books.length) return toast("Fill in details reads comics' ComicInfo.xml. None of these are comics.");
+	btn.disabled = true;
+	var changed = 0, failed = [];
+	for (var i = 0; i < books.length; i++) {
+		var b = books[i], before = [b.title, b.author, b.series, b.volume].join("|");
+		$("libSelN").textContent = "Reading " + (i + 1) + " of " + books.length + "…";
+		try {
+			var d = await apiJSON("/api/books/" + b.id, { method: "PATCH", json: { reread: true } });
+			Object.assign(b, d.book);
+			keepBookDetails(b);
+			if ([b.title, b.author, b.series, b.volume].join("|") !== before) changed++;
+		} catch (e) {
+			if (e.message === UNAUTH) return;
+			failed.push(b.title);
+		}
+	}
+	await loadBookTags().catch(function () {});
+	renderBooks();
+	var msg = changed ? "Filled in details for " + changed + (changed === 1 ? " book." : " books.") : "Nothing new to fill in.";
+	if (failed.length) fail(new Error(msg + " Couldn't read " + failed.join(", ") + "."));
 	else toast(msg);
 }
 
@@ -7229,11 +7371,25 @@ async function openBook(id) {
 		else if (book.type === "epub") await openEpub(sess, parsePos(book.position) || {});
 		else await openTxt(sess, parsePos(book.position) || {});
 		if (sess.alive) updateMarks(sess);
+		if (book.type === "cbz") comicDetails(sess);
 	} catch (e) {
 		if (!sess.alive) return;
 		body.textContent = "";
 		body.append(h("p", "loading err", e.message));
 	}
+}
+// A comic uploaded before ComicInfo.xml was read: fill its details in now
+// (once per visit, since most comics have none).
+var comicTried = {};
+function comicDetails(sess) {
+	var b = sess.book;
+	if (b.series || b.volume || comicTried[b.id] || state.libOffline) return;
+	comicTried[b.id] = true;
+	apiJSON("/api/books/" + b.id, { method: "PATCH", json: { reread: true } }).then(function (d) {
+		Object.assign(b, d.book);
+		keepBookDetails(b);
+		if (sess.alive) $("heading").textContent = b.title;
+	}, function () {});
 }
 function closeBook() {
 	var s = session;
@@ -7339,7 +7495,21 @@ function checkEnd(sess, last) {
 function reachedEnd(sess) {
 	if (sess.book.finished_at || sess.noAuto) return;
 	sess.noAuto = true;
-	setFinished(sess.book, true).then(function () { if (sess.alive) toast("Marked as finished."); }, fail);
+	setFinished(sess.book, true).then(function () { if (sess.alive) finishedToast(sess.book); }, fail);
+}
+// The next volume not yet finished after b in its series, if there is one.
+function nextInSeries(b) {
+	if (!b.series) return null;
+	var k = fold(b.series), all = sortBooks((state.books || []).filter(function (x) { return fold(x.series) === k; }), "series");
+	var at = all.map(function (x) { return x.id; }).indexOf(b.id);
+	return all.slice(at + 1).filter(function (x) { return !x.finished_at; })[0] || null;
+}
+function finishedToast(b) {
+	var next = nextInSeries(b);
+	toast("Marked as finished.", next && {
+		label: "Up next: " + (next.volume ? "Vol. " + next.volume : next.title),
+		fn: function () { location.hash = "#/book/" + next.id; }
+	});
 }
 function renderBookMenu() {
 	var b = session && session.book;
@@ -9013,7 +9183,7 @@ $("bmFinish").addEventListener("click", async function () {
 	try {
 		await setFinished(sess.book, on);
 		if (!on) sess.noAuto = true;
-		toast(on ? "Marked as finished." : "Marked as not finished.");
+		if (on) finishedToast(sess.book); else toast("Marked as not finished.");
 	} catch (e) { fail(e); }
 });
 $("bmRestart").addEventListener("click", restartBook);
@@ -9082,6 +9252,7 @@ $("libSelAll").addEventListener("click", function () { (state.libShown || []).fo
 $("libSelNone").addEventListener("click", function () { state.libSel = {}; renderBooks(); });
 $("libSelDel").addEventListener("click", deleteSelected);
 $("libSelGenres").addEventListener("click", tagGenresSelected);
+$("libSelFill").addEventListener("click", fillSelected);
 $("books").addEventListener("contextmenu", function (e) {
 	var a = e.target.closest && e.target.closest('a[href^="#/book/"]');
 	if (!a || e.shiftKey) return;
