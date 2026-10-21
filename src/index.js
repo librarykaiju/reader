@@ -11,6 +11,8 @@
 //   AI                   Workers AI binding, optional; turns on "Compare coverage" (see Coverage below)
 //   ANTHROPIC_API_KEY    secret, optional; compares with Claude instead, when there's no AI binding
 //   OWNER_NAME           optional; your name on the family welcome page ("Welcome to Brandon's library")
+//   TURNSTILE_SITE_KEY   optional; with TURNSTILE_SECRET (a secret), a Cloudflare Turnstile check on the
+//                        library card request form (docs/setup.md, "Family library")
 //   ALLOW_PRIVATE_FETCH  dev only: "1" lets /api/fetch reach localhost and
 //                        private IPs, for local test fixtures. Never in production.
 //
@@ -91,7 +93,8 @@
 //                                  (on a request: approves it)
 //   DELETE /api/people/:id         removes them (and their download log); their sign-in stops at once
 //   POST   /api/family/redeem      {code} -> {"name"} and the sign-in cookie (no token needed; the code works once)
-//   POST   /api/family/request     {name, note?} -> {ok}: asks for a library card (no token needed); shows on the Family screen
+//   POST   /api/family/request     {name, note?, check?} -> {ok}: asks for a library card (no token needed; check is
+//                                  the Turnstile token when it's set up); shows on the Family screen
 //   GET    /api/people/:id/downloads -> {"downloads": [{at, book_id, title, author}]}, newest first
 //   GET    /api/family/me          -> {"name", "owner"} (name null for the owner; owner from OWNER_NAME); renews the cookie
 //   GET    /api/family/books       -> {"books": [...each with tags: [names]]}, without any tagged "Hide from family"
@@ -159,7 +162,7 @@ export default {
 	async fetch(request, env) {
 		const url = new URL(request.url);
 		if (url.pathname === "/" && (request.method === "GET" || request.method === "HEAD")) return page();
-		if (url.pathname === "/library" && (request.method === "GET" || request.method === "HEAD")) return familyPage();
+		if (url.pathname === "/library" && (request.method === "GET" || request.method === "HEAD")) return familyPage(env);
 		// Browsers keep the #invite=... part across a redirect, so old links still sign in.
 		if (url.pathname === "/family" && (request.method === "GET" || request.method === "HEAD")) return Response.redirect(new URL("/library" + url.search, url), 301);
 		if (url.pathname === "/sw.js" && request.method === "GET") return serviceWorker();
@@ -2774,20 +2777,46 @@ async function familyDownload(env, id, person) {
 	});
 }
 
-// Asking for a library card, from the landing page: anyone can, so it's kept
-// small. The request waits on the Family screen (and as a card atop Unread)
-// until approved, which makes their invite link, or declined. A filled-in
-// "website" field is a bot (people never see it), and past 25 waiting
-// requests new ones are turned away.
+// Asking for a library card, from the landing page: anyone can, so it's
+// guarded. The request waits on the Family screen (and as a card atop Unread)
+// until approved, which makes their invite link, or declined. In order:
+//   * a filled-in "website" field is a bot (people never see it): dropped quietly
+//   * Cloudflare Turnstile, when TURNSTILE_SITE_KEY and TURNSTILE_SECRET are
+//     set: the page's check token is confirmed with Cloudflare
+//   * 3 requests a day from one address (kept as a salted hash, never the address)
+//   * 25 waiting at once at most
+const REQUESTS_PER_IP_PER_DAY = 3;
+const REQUESTS_WAITING_MAX = 25;
+function turnstileOn(env) { return !!(env.TURNSTILE_SITE_KEY && env.TURNSTILE_SECRET); }
+async function turnstileOk(env, token, ip) {
+	if (!token) return false;
+	const form = new FormData();
+	form.append("secret", env.TURNSTILE_SECRET);
+	form.append("response", token);
+	if (ip) form.append("remoteip", ip);
+	try {
+		const res = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", { method: "POST", body: form });
+		return !!(await res.json()).success;
+	} catch {
+		return false;
+	}
+}
 async function requestCard(request, env) {
 	const data = await readJSON(request);
 	if (str(data.website, 200)) return json({ ok: true });
 	const name = str(data.name, 60);
 	if (!name) throw new HttpError(400, "Please give your name");
+	const ip = request.headers.get("CF-Connecting-IP") || "";
+	if (turnstileOn(env) && !(await turnstileOk(env, str(data.check, 4096), ip))) {
+		throw new HttpError(403, "The check didn't go through. Please try it again.");
+	}
+	const now = Date.now(), ipHash = await hashSecret(ip + "|" + (env.READER_TOKEN || ""));
+	const recent = await env.DB.prepare("SELECT COUNT(*) AS n FROM people WHERE request_ip = ? AND created_at > ?").bind(ipHash, now - 86400000).first("n");
+	if (recent >= REQUESTS_PER_IP_PER_DAY) throw new HttpError(429, "You've already sent a few requests today. Please wait for an answer.");
 	const waiting = await env.DB.prepare("SELECT COUNT(*) AS n FROM people WHERE requested_at IS NOT NULL").first("n");
-	if (waiting >= 25) throw new HttpError(429, "Too many requests are waiting right now. Please try again later.");
-	const now = Date.now();
-	await env.DB.prepare("INSERT INTO people (name, created_at, requested_at, request_note) VALUES (?, ?, ?, ?)").bind(name, now, now, str(data.note, 300)).run();
+	if (waiting >= REQUESTS_WAITING_MAX) throw new HttpError(429, "Too many requests are waiting right now. Please try again later.");
+	await env.DB.prepare("INSERT INTO people (name, created_at, requested_at, request_note, request_ip) VALUES (?, ?, ?, ?, ?)")
+		.bind(name, now, now, str(data.note, 300), ipHash).run();
 	return json({ ok: true }, 201);
 }
 
@@ -2966,20 +2995,24 @@ function page() {
 // reaches family. It signs in from the invite link, then shows the books as
 // covers (A-Z, a series in volume order) in the Sepia theme, with search and
 // a format filter. Tapping a book downloads it.
-function familyPage() {
+function familyPage(env) {
 	const nonce = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))));
+	// Turnstile (the library card form's check) runs from Cloudflare's own address, in a frame.
+	const ts = turnstileOn(env) ? " https://challenges.cloudflare.com" : "";
 	const csp = [
 		"default-src 'none'",
-		`script-src 'nonce-${nonce}'`,
+		`script-src 'nonce-${nonce}'${ts}`,
 		`style-src 'nonce-${nonce}'`,
 		"img-src 'self' data:",
 		"font-src 'self'",
 		"connect-src 'self'",
+		`frame-src${ts || " 'none'"}`,
 		"base-uri 'none'",
 		"form-action 'none'",
 		"frame-ancestors 'none'",
 	].join("; ");
-	return new Response(FAMILY_PAGE.replaceAll("__NONCE__", nonce).replaceAll("__ICON__", ICON_URI), {
+	const siteKey = turnstileOn(env) ? env.TURNSTILE_SITE_KEY.replace(/[^\w-]/g, "") : "";
+	return new Response(FAMILY_PAGE.replaceAll("__NONCE__", nonce).replaceAll("__ICON__", ICON_URI).replaceAll("__TURNSTILE__", siteKey), {
 		headers: {
 			"Content-Type": "text/html; charset=utf-8",
 			"Content-Security-Policy": csp,
@@ -3084,6 +3117,8 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.card input:focus, .card textarea:focus { outline: none; border-bottom-color: #8b2e1f; }
 	.card .msg { font: 400 15px/1.45 var(--sans); color: var(--muted); }
 	.card .msg.bad { color: #8b2e1f; }
+	.check { margin: 16px 0 4px; min-height: 0; }
+	.check:empty { margin: 0; }
 	.hp { position: absolute !important; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
 	footer { margin-top: 36px; padding-top: 14px; border-top: 1px solid var(--line); font-size: 14px; text-align: center; }
 </style>
@@ -3103,6 +3138,7 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 			<label for="lNote">How do I know you? <span class="muted">(optional)</span></label>
 			<textarea id="lNote" maxlength="300" placeholder="Cousin Jo, from book club…"></textarea>
 			<div class="hp" aria-hidden="true"><label for="lSite">Website</label><input id="lSite" type="text" tabindex="-1" autocomplete="off"></div>
+			<div id="lCheck" class="check"></div>
 			<button id="lSend" class="stamp" type="submit">Send my request</button>
 		</form>
 	</section>
@@ -3329,22 +3365,55 @@ function landing(msg) {
 	$("lMsg").hidden = !msg;
 	$("lAsk").textContent = asked ? "Request again" : "Request your library card";
 }
+// Cloudflare Turnstile, when it's set up: loaded only once the form opens, so
+// someone who just looks never gets it. Usually it passes without a click.
+var SITE_KEY = "__TURNSTILE__", checkToken = "", checkId = null;
+function startCheck() {
+	if (!SITE_KEY || checkId != null) return;
+	checkId = "loading";
+	window.onTurnstileLoad = function () {
+		checkId = window.turnstile.render("#lCheck", {
+			sitekey: SITE_KEY, theme: "light", action: "library-card",
+			callback: function (t) { checkToken = t; },
+			"expired-callback": function () { checkToken = ""; },
+			"error-callback": function () { checkToken = ""; }
+		});
+	};
+	var sc = document.createElement("script");
+	sc.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=onTurnstileLoad";
+	sc.async = true;
+	sc.nonce = "__NONCE__";
+	sc.onerror = function () { checkId = null; $("lCheck").textContent = "The check couldn't load. Turn off any blocker for this page, then reload."; };
+	document.head.append(sc);
+}
 $("lAsk").addEventListener("click", function () {
 	$("lAsk").hidden = true;
 	$("lMsg").hidden = true;
 	$("lForm").hidden = false;
+	startCheck();
 	$("lName").focus();
 });
 $("lForm").addEventListener("submit", async function (e) {
 	e.preventDefault();
 	var name = $("lName").value.trim();
 	if (!name) { $("lName").focus(); return; }
+	if (SITE_KEY && !checkToken) {
+		$("lMsg").className = "msg bad";
+		$("lMsg").textContent = "One moment: the check below isn't done yet.";
+		$("lMsg").hidden = false;
+		return;
+	}
 	$("lSend").disabled = true;
 	try {
 		var res = await fetch("/api/family/request", { method: "POST", headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ name: name, note: $("lNote").value.trim(), website: $("lSite").value }) });
+			body: JSON.stringify({ name: name, note: $("lNote").value.trim(), website: $("lSite").value, check: checkToken }) });
 		var d = await res.json().catch(function () { return {}; });
-		if (!res.ok) throw new Error(d.error || "That didn't go through. Please try again.");
+		if (!res.ok) {
+			// A token works once; a fresh one for the next try.
+			checkToken = "";
+			if (window.turnstile && checkId != null && checkId !== "loading") window.turnstile.reset(checkId);
+			throw new Error(d.error || "That didn't go through. Please try again.");
+		}
 		store("cardRequested", "1");
 		$("lForm").hidden = true;
 		$("lMsg").className = "msg";
@@ -3790,6 +3859,10 @@ const PAGE = String.raw`<!doctype html>
 	.people .who b { display: block; font: 500 18px/1.25 var(--display); }
 	.people .who span { color: var(--muted); font-size: 14px; }
 	.people .acts { display: flex; gap: 8px; flex: none; }
+	/* Library card requests waiting: a dot on Aa, a count on Family library. */
+	#settingsBtn { position: relative; }
+	.reqdot { position: absolute; top: -3px; right: -3px; width: 12px; height: 12px; border-radius: 50%; background: var(--bad); border: 2px solid var(--bg); }
+	.reqn { display: inline-block; min-width: 20px; margin-left: 6px; padding: 0 6px; border-radius: 999px; background: var(--bad); color: #fff; font-size: 12px; font-weight: 700; line-height: 20px; text-align: center; }
 	.people .req { background: var(--sel); border-radius: 10px; padding: 12px; margin-bottom: 8px; border-bottom: 0; }
 	.people .who q { display: block; margin-top: 4px; font-style: italic; font-size: 14px; overflow-wrap: anywhere; }
 	.people .dlbtn { padding: 0; min-height: 28px; font-size: 14px; }
@@ -3959,7 +4032,7 @@ const PAGE = String.raw`<!doctype html>
 		<button id="markBtn" class="btn" type="button" aria-label="Bookmark this place" aria-pressed="false" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg></button>
 		<button id="refresh" class="btn" type="button">Refresh</button>
 		<button id="bookMenuBtn" class="btn" type="button" aria-label="Book options" aria-expanded="false" aria-controls="bookMenu" hidden>&#8943;</button>
-		<button id="settingsBtn" class="btn" type="button" aria-label="Display settings" aria-expanded="false" aria-controls="settings">Aa</button>
+		<button id="settingsBtn" class="btn" type="button" aria-label="Display settings" aria-expanded="false" aria-controls="settings">Aa<span class="reqdot" hidden></span></button>
 	</div>
 	<nav id="tabs" class="tabs" aria-label="Views">
 		<a href="#/unread" data-view="unread">Unread</a>
@@ -3995,7 +4068,7 @@ const PAGE = String.raw`<!doctype html>
 		<button type="button" data-font="serif">System serif</button>
 		<button type="button" data-font="fraunces" class="fraunces">Fraunces</button>
 	</div>
-	<a href="#/family" id="familyLink" class="btn small">Family library</a>
+	<a href="#/family" id="familyLink" class="btn small">Family library<span class="reqn" hidden></span></a>
 	<button id="forget" class="btn ghost small" type="button">Forget token on this device</button>
 </div>
 
@@ -5929,6 +6002,7 @@ async function showFamily() {
 async function loadPeople() {
 	var data = await apiJSON("/api/people");
 	renderPeople(data.people || []);
+	showRequests(data.people || []);
 }
 function personStatus(p) {
 	var bits = [];
@@ -5937,6 +6011,31 @@ function personStatus(p) {
 	else bits.push("Link ran out");
 	return bits.join(" · ");
 }
+// Library card requests: checked when Reader opens, when it comes back to the
+// front, and every 5 minutes while it's showing. Waiting ones put a dot on Aa,
+// a count on Family library and (where the browser allows, as a Home Screen
+// app with notifications allowed) on the app icon; one that's new since this
+// device last looked gets a toast.
+var reqCheckedAt = 0;
+function showRequests(people) {
+	var reqs = people.filter(function (p) { return p.requested_at; }), n = reqs.length;
+	document.querySelectorAll(".reqdot").forEach(function (e) { show(e, n > 0); });
+	document.querySelectorAll(".reqn").forEach(function (e) { e.textContent = n; show(e, n > 0); });
+	try { if (navigator.setAppBadge) (n ? navigator.setAppBadge(n) : navigator.clearAppBadge()).catch(function () {}); } catch (e) {}
+	var seen = readJSON("readerReqSeen") || [], fresh = reqs.filter(function (p) { return seen.indexOf(p.id) < 0; });
+	store("readerReqSeen", JSON.stringify(reqs.map(function (p) { return p.id; })));
+	if (!fresh.length || (state.route && state.route.name === "family")) return;
+	toast(fresh.length === 1 ? fresh[0].name + " asked for a library card." : fresh.length + " new library card requests.",
+		{ label: "See", fn: function () { location.hash = "#/family"; } });
+}
+async function checkRequests(force) {
+	if (!token() || (!force && Date.now() - reqCheckedAt < 60000)) return;
+	reqCheckedAt = Date.now();
+	try { showRequests((await apiJSON("/api/people")).people || []); } catch (e) {}
+}
+document.addEventListener("visibilitychange", function () { if (document.visibilityState === "visible") checkRequests(false); });
+setInterval(function () { if (document.visibilityState === "visible") checkRequests(true); }, 5 * 60 * 1000);
+
 // A library card request from the landing page: Approve makes their link to send, Decline drops it.
 function requestRow(p) {
 	var li = h("li", "req"), who = h("div", "who"), acts = h("div", "acts");
@@ -10445,6 +10544,7 @@ async function start() {
 	if (!started) { started = true; window.addEventListener("hashchange", route); }
 	await route();
 	refreshAll(false);
+	checkRequests(true);
 	if (Object.keys(bookPending).length && !state.books) loadBooks().catch(function () {});
 }
 // Back online: send places saved while offline, and show the whole Library again.

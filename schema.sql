@@ -183,7 +183,9 @@ CREATE TABLE IF NOT EXISTS people (
 	-- A library card request from the /library landing page (migration 0011):
 	-- when they asked (NULL once approved) and what they wrote.
 	requested_at INTEGER,
-	request_note TEXT
+	request_note TEXT,
+	-- Where a request came from, as a salted hash, for 3 a day per address (migration 0012).
+	request_ip TEXT
 );
 
 -- Each download a family member made.

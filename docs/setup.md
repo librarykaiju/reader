@@ -178,6 +178,7 @@ npx wrangler d1 execute reader --remote --file migrations/0008_coverage.sql
 npx wrangler d1 execute reader --remote --file migrations/0009_comic_layout.sql
 npx wrangler d1 execute reader --remote --file migrations/0010_family.sql
 npx wrangler d1 execute reader --remote --file migrations/0011_library_card_requests.sql
+npx wrangler d1 execute reader --remote --file migrations/0012_request_limit.sql
 npx wrangler deploy
 ```
 
@@ -273,6 +274,11 @@ A migration that already ran stops with an error such as "duplicate column name"
 
 **Family library: The Back Alley Library** (update with migrations 0010 and 0011)
 - It lives at `reader.brandonj.ink/library` (the old `/family` address redirects there, invite links included). Anyone who opens it without a sign-in sees a landing page with **Request your library card**: they give their name and, if they like, how you know them. Requests show at the top of the Family screen, and as a card atop Unread. **Approve** makes their link to send them; **Decline** drops the request.
+- The request form is guarded: a hidden field that only bots fill in, at most 3 requests a day from one address, and at most 25 waiting at once. For a captcha as well, set up Cloudflare Turnstile (free):
+  1. Cloudflare dashboard → **Turnstile** → **Add widget**. Name it "Back Alley Library", add the hostname `reader.brandonj.ink`, mode **Managed** → **Create**.
+  2. Copy the **Site key** into `wrangler.toml` under `[vars]` as `TURNSTILE_SITE_KEY = "..."`.
+  3. Set the **Secret key** with `npx wrangler secret put TURNSTILE_SECRET` and paste it.
+  4. `npx wrangler deploy`. The check shows on the form once someone taps **Request your library card**, and usually passes by itself. Until both keys are set, the form works without it.
 - **Aa** → **Family library**. Type a name → **Make link**, then **Copy** or **Share** it to them. The link works once: opening it signs that browser in (a cookie that lasts a year and renews on each visit) and changes the address to the plain `reader.brandonj.ink/library`, which is the one to bookmark. An unused link runs out after 7 days.
 - The first time someone opens their link they get a welcome page: the plain address to keep and how to save it on their device (Home Screen or bookmark), then **Go to the library**. It's there again from **How to save this page** at the bottom. Set your name for it with `OWNER_NAME` in `wrangler.toml`.
 - Their page is always in the Sepia colors: covers (a series is one cover that opens to its volumes), search by title, author or series, and filters for format (EPUB, PDF, Comics, Text) and tag. Tapping a book downloads it, saved as `Title - Author.epub`. Nothing else is open to them: no feeds, places, highlights, Edit details, uploads or deletes. Put the tag **Hide from family** on any book to keep it out of their view.
