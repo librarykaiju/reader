@@ -3657,6 +3657,9 @@ const PAGE = String.raw`<!doctype html>
 	.pop.ctx .btn { text-align: left; justify-content: flex-start; border: 0; background: none; padding: 9px 10px; width: 100%; border-radius: 8px; }
 	.pop.ctx .btn:hover, .pop.ctx .btn:focus-visible { background: var(--line); }
 	.pop.ctx .sep { height: 1px; background: var(--line); margin: 4px 6px; }
+	.pop.ctx .menu { max-height: calc(100vh - 28px); overflow-y: auto; }
+	.pop.ctx .cap { font-size: 12px; color: var(--muted); padding: 4px 10px 2px; }
+	.pop.ctx .btn.vol { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 	.books .bt { font-weight: 600; overflow-wrap: anywhere; }
 	/* A series in the Series sort: one entry that opens to its volumes. */
 	.books .series .bt::after { content: " ›"; color: var(--muted); }
@@ -7430,8 +7433,9 @@ function seriesProg(x) {
 	return bar;
 }
 function seriesRow(g) {
-	var li = h("li", "child series"), row = h("div", "row"), a = h("a"), x = seriesAbout(g);
+	var li = h("li", "child series"), row = h("div", "row"), a = h("a", "sgroup"), x = seriesAbout(g);
 	a.href = seriesHref(g.name);
+	a.group = g;
 	a.append(h("span", "bt", g.name));
 	if (x.author) a.append(h("span", "ba", x.author));
 	a.append(h("span", "bm", x.said), seriesProg(x));
@@ -7440,8 +7444,9 @@ function seriesRow(g) {
 	return li;
 }
 function seriesCard(g) {
-	var li = h("li", "series"), a = h("a"), x = seriesAbout(g);
+	var li = h("li", "series"), a = h("a", "sgroup"), x = seriesAbout(g);
 	a.href = seriesHref(g.name);
+	a.group = g;
 	a.setAttribute("aria-label", g.name + ", series, " + x.said);
 	a.append(coverBox(g.books[0]), h("span", "ct", g.name), h("span", "ca", x.said));
 	if (x.read) a.append(seriesProg(x));
@@ -7906,15 +7911,26 @@ async function fillSelected() {
 // Right-click (or long-press, where the browser sends it) on a book in the
 // Library: the book's actions in a small menu where the pointer is.
 var ctxBook = null;
+function ctxItem(menu, label, fn, cls) {
+	var btn = button(label, "btn" + (cls ? " " + cls : ""), function (e) { e.stopPropagation(); closeBookCtx(); fn(); });
+	btn.setAttribute("role", "menuitem");
+	menu.append(btn);
+	return btn;
+}
+function showBookCtx(x, y) {
+	var box = $("bookCtx");
+	openSettings(false);
+	show(box, true);
+	var w = box.offsetWidth, ht = box.offsetHeight;
+	box.style.left = Math.max(8, Math.min(x, innerWidth - w - 8)) + "px";
+	box.style.top = Math.max(8, Math.min(y, innerHeight - ht - 8)) + "px";
+	box.querySelector(".menu button").focus({ preventScroll: true });
+}
 function openBookCtx(b, x, y) {
-	var box = $("bookCtx"), menu = box.querySelector(".menu"), off = !!state.libOffline;
+	var menu = $("bookCtx").querySelector(".menu"), off = !!state.libOffline;
+	var item = function (label, fn, cls) { ctxItem(menu, label, fn, cls); };
 	ctxBook = b;
 	menu.textContent = "";
-	var item = function (label, fn, cls) {
-		var btn = button(label, "btn" + (cls ? " " + cls : ""), function (e) { e.stopPropagation(); closeBookCtx(); fn(); });
-		btn.setAttribute("role", "menuitem");
-		menu.append(btn);
-	};
 	item("Open", function () { location.hash = "#/book/" + b.id; });
 	if (!off) {
 		item("Edit details", function () { openDetails(b); });
@@ -7942,12 +7958,30 @@ function openBookCtx(b, x, y) {
 		menu.append(h("div", "sep"));
 		item("Delete", function () { deleteBook(b); }, "danger");
 	}
-	openSettings(false);
-	show(box, true);
-	var w = box.offsetWidth, ht = box.offsetHeight;
-	box.style.left = Math.max(8, Math.min(x, innerWidth - w - 8)) + "px";
-	box.style.top = Math.max(8, Math.min(y, innerHeight - ht - 8)) + "px";
-	menu.firstChild.focus({ preventScroll: true });
+	showBookCtx(x, y);
+}
+// The same on a series in the Series sort, g: {name, books}. A series of one
+// gets its book's menu; a longer one lists its volumes to edit each.
+function openSeriesCtx(g, x, y) {
+	if (g.books.length === 1) return openBookCtx(g.books[0], x, y);
+	var menu = $("bookCtx").querySelector(".menu"), off = !!state.libOffline;
+	ctxBook = null;
+	menu.textContent = "";
+	ctxItem(menu, "Open series", function () { location.hash = seriesHref(g.name); });
+	if (!off) {
+		menu.append(h("div", "sep"), h("div", "cap", "Edit details"));
+		g.books.forEach(function (b) {
+			ctxItem(menu, (b.volume ? b.volume + " · " : "") + b.title, function () { openDetails(b); }, "vol").title = b.title;
+		});
+		menu.append(h("div", "sep"));
+		ctxItem(menu, "Select all volumes", function () {
+			state.editBooks = true;
+			state.libSel = {};
+			g.books.forEach(function (b) { state.libSel[b.id] = true; });
+			renderBooks();
+		});
+	}
+	showBookCtx(x, y);
 }
 function closeBookCtx() {
 	if ($("bookCtx").hidden) return;
@@ -10184,14 +10218,19 @@ $("libSelNone").addEventListener("click", function () { state.libSel = {}; rende
 $("libSelDel").addEventListener("click", deleteSelected);
 $("libSelGenres").addEventListener("click", tagGenresSelected);
 $("libSelFill").addEventListener("click", fillSelected);
-$("books").addEventListener("contextmenu", function (e) {
-	var a = e.target.closest && e.target.closest('a[href^="#/book/"]');
-	if (!a || e.shiftKey) return;
+function libCtx(e) {
+	if (e.shiftKey || !e.target.closest) return;
+	var s = e.target.closest("a.sgroup");
+	if (s && s.group) { e.preventDefault(); return openSeriesCtx(s.group, e.clientX, e.clientY); }
+	var a = e.target.closest('a[href^="#/book/"]');
+	if (!a) return;
 	var id = Number(a.getAttribute("href").slice(7)), b = (state.books || []).filter(function (x) { return x.id === id; })[0];
 	if (!b) return;
 	e.preventDefault();
 	openBookCtx(b, e.clientX, e.clientY);
-});
+}
+$("books").addEventListener("contextmenu", libCtx);
+$("libShelf").addEventListener("contextmenu", libCtx);
 document.addEventListener("pointerdown", function (e) { if (!$("bookCtx").hidden && !$("bookCtx").contains(e.target)) closeBookCtx(); }, true);
 document.addEventListener("keydown", function (e) {
 	if ($("bookCtx").hidden) return;
