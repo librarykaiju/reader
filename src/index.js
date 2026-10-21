@@ -18,7 +18,9 @@
 // except /api/family/, which a family member's sign-in cookie also opens; see
 // "Family library" below):
 //   GET    /                       the app page (no data in it; asks for the token)
-//   GET    /family                 the family library page (signs in from #invite=<code>)
+//   GET    /library                the family library: a landing page with "Request your library card",
+//                                  or the books once signed in (signs in from #invite=<code>)
+//   GET    /family                 its old address: redirects to /library (an invite's #code goes along)
 //   GET    /sw.js                  its service worker: keeps the page for offline use
 //   GET    /fonts/fraunces-soft(-italic).woff2
 //                                  the display and reading typeface (src/fonts/, OFL)
@@ -49,8 +51,9 @@
 //                                  covering it (null if none); new_sources counts matches that digest left out
 //   POST   /api/items/:id/coverage {sources: [{id, text}]} -> {"digest"}: compares them with Claude and saves it
 //                                  (ids from GET; text is each article's full text as the page extracted it)
-//   GET    /api/continue           -> {"episode", "book"}: the newest podcast episode part-way
-//                                  through, and the last opened book not finished (either may be null)
+//   GET    /api/continue           -> {"episode", "book", "requests"}: the newest podcast episode part-way
+//                                  through, the last opened book not finished (either may be null),
+//                                  and how many library card requests are waiting
 //   GET    /api/media?url=         a podcast episode's file, streamed through for
 //                                  downloading (podcast hosts rarely allow CORS)
 //   GET    /api/books              -> {"books": [...each with tags: [book tag ids]]}
@@ -81,11 +84,14 @@
 //   POST   /api/books/:id/highlights {start_pos, end_pos, text, note?} -> {"highlight"}
 //   PATCH  /api/highlights/:id     {note?, start_pos?, end_pos?} (note null or "" = no note)
 //   DELETE /api/highlights/:id
-//   GET    /api/people             -> {"people": [...each with signed_in, invite_expires_at, last_seen_at, downloads]}
+//   GET    /api/people             -> {"people": [...each with signed_in, invite_expires_at, last_seen_at, downloads,
+//                                  requested_at and request_note (a library card request not yet answered)]}
 //   POST   /api/people             {name} -> {"person", "code"}: a new family member and their invite code
 //   POST   /api/people/:id/link    -> {"person", "code"}: a fresh invite code; signs out their devices
+//                                  (on a request: approves it)
 //   DELETE /api/people/:id         removes them (and their download log); their sign-in stops at once
 //   POST   /api/family/redeem      {code} -> {"name"} and the sign-in cookie (no token needed; the code works once)
+//   POST   /api/family/request     {name, note?} -> {ok}: asks for a library card (no token needed); shows on the Family screen
 //   GET    /api/people/:id/downloads -> {"downloads": [{at, book_id, title, author}]}, newest first
 //   GET    /api/family/me          -> {"name", "owner"} (name null for the owner; owner from OWNER_NAME); renews the cookie
 //   GET    /api/family/books       -> {"books": [...each with tags: [names]]}, without any tagged "Hide from family"
@@ -153,7 +159,9 @@ export default {
 	async fetch(request, env) {
 		const url = new URL(request.url);
 		if (url.pathname === "/" && (request.method === "GET" || request.method === "HEAD")) return page();
-		if (url.pathname === "/family" && (request.method === "GET" || request.method === "HEAD")) return familyPage();
+		if (url.pathname === "/library" && (request.method === "GET" || request.method === "HEAD")) return familyPage();
+		// Browsers keep the #invite=... part across a redirect, so old links still sign in.
+		if (url.pathname === "/family" && (request.method === "GET" || request.method === "HEAD")) return Response.redirect(new URL("/library" + url.search, url), 301);
 		if (url.pathname === "/sw.js" && request.method === "GET") return serviceWorker();
 		if (url.pathname === "/apple-touch-icon.png" && request.method === "GET") return touchIcon();
 		if (FONTS[url.pathname] && request.method === "GET") return font(FONTS[url.pathname]);
@@ -161,6 +169,7 @@ export default {
 
 		try {
 			if (url.pathname === "/api/family/redeem" && request.method === "POST") return await redeemInvite(request, env);
+			if (url.pathname === "/api/family/request" && request.method === "POST") return await requestCard(request, env);
 			const who = await signedIn(request, env);
 			if (!who) return json({ error: "Unauthorized" }, 401);
 			// The role check: a family sign-in reaches the family routes and nothing else.
@@ -783,7 +792,7 @@ function notesPreview(html, max = 600) {
 // played, so it's the newest one part-way through (the page prefers the one
 // last played on this device).
 async function continueCards(env) {
-	const [episode, book] = await Promise.all([
+	const [episode, book, requests] = await Promise.all([
 		env.DB.prepare(
 			`SELECT ${ITEM_LIST_COLUMNS} FROM items i JOIN feeds f ON f.id = i.feed_id
 			WHERE ${VIEWS.podcasts} AND i.media_pos > 5 AND i.media_len > 60 AND i.media_pos < i.media_len - 30
@@ -793,8 +802,9 @@ async function continueCards(env) {
 			`SELECT ${BOOK_COLUMNS} FROM books WHERE finished_at IS NULL AND last_opened_at IS NOT NULL
 			ORDER BY last_opened_at DESC, id DESC LIMIT 1`,
 		).first(),
+		env.DB.prepare("SELECT COUNT(*) AS n FROM people WHERE requested_at IS NOT NULL").first("n").catch(() => 0),
 	]);
-	return json({ episode: episode || null, book: book || null });
+	return json({ episode: episode || null, book: book || null, requests: requests || 0 });
 }
 
 function itemPage(results, limit) {
@@ -2635,7 +2645,7 @@ async function deleteHighlight(env, id) {
 // ---------------------------------------------------------------------------
 // Family library. Family members browse the Library and download books;
 // nothing else of the owner's (feeds, places, highlights, Edit details) is
-// open to them. Each person has an invite link, /family#invite=<code>: the
+// open to them. Each person has an invite link, /library#invite=<code>: the
 // code works once and runs out after 7 days unused. Opening it trades the
 // code for the person's own token, which the Worker sets as a cookie
 // (HttpOnly, a year, renewed on each visit) rather than leaving it to the
@@ -2764,12 +2774,29 @@ async function familyDownload(env, id, person) {
 	});
 }
 
+// Asking for a library card, from the landing page: anyone can, so it's kept
+// small. The request waits on the Family screen (and as a card atop Unread)
+// until approved, which makes their invite link, or declined. A filled-in
+// "website" field is a bot (people never see it), and past 25 waiting
+// requests new ones are turned away.
+async function requestCard(request, env) {
+	const data = await readJSON(request);
+	if (str(data.website, 200)) return json({ ok: true });
+	const name = str(data.name, 60);
+	if (!name) throw new HttpError(400, "Please give your name");
+	const waiting = await env.DB.prepare("SELECT COUNT(*) AS n FROM people WHERE requested_at IS NOT NULL").first("n");
+	if (waiting >= 25) throw new HttpError(429, "Too many requests are waiting right now. Please try again later.");
+	const now = Date.now();
+	await env.DB.prepare("INSERT INTO people (name, created_at, requested_at, request_note) VALUES (?, ?, ?, ?)").bind(name, now, now, str(data.note, 300)).run();
+	return json({ ok: true }, 201);
+}
+
 // The owner's side: the Family screen.
-const PERSON_COLUMNS = `id, name, created_at, last_seen_at, invite_expires_at, token_hash IS NOT NULL AS signed_in,
+const PERSON_COLUMNS = `id, name, created_at, last_seen_at, invite_expires_at, requested_at, request_note, token_hash IS NOT NULL AS signed_in,
 	(SELECT COUNT(*) FROM downloads d WHERE d.person_id = people.id) AS downloads`;
 
 async function listPeople(env) {
-	const { results } = await env.DB.prepare(`SELECT ${PERSON_COLUMNS} FROM people ORDER BY name COLLATE NOCASE, id`).all();
+	const { results } = await env.DB.prepare(`SELECT ${PERSON_COLUMNS} FROM people ORDER BY requested_at IS NULL, name COLLATE NOCASE, id`).all();
 	for (const p of results) p.signed_in = !!p.signed_in;
 	return json({ people: results });
 }
@@ -2794,7 +2821,7 @@ async function addPerson(request, env) {
 // working and so does every device they signed in on.
 async function newInvite(env, id) {
 	const code = randomToken();
-	const { meta } = await env.DB.prepare("UPDATE people SET token_hash = NULL, invite_hash = ?, invite_expires_at = ? WHERE id = ?")
+	const { meta } = await env.DB.prepare("UPDATE people SET token_hash = NULL, invite_hash = ?, invite_expires_at = ?, requested_at = NULL WHERE id = ?")
 		.bind(await hashSecret(code), Date.now() + INVITE_DAYS * 86400000, id).run();
 	if (!meta.changes) throw new HttpError(404, "No such person");
 	return json({ person: await personRow(env, id), code });
@@ -2973,11 +3000,11 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 <meta name="color-scheme" content="light">
 <meta name="theme-color" content="#f4ecd8">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-title" content="Library">
+<meta name="apple-mobile-web-app-title" content="Back Alley">
 <link rel="icon" type="image/svg+xml" href="__ICON__">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="preload" href="/fonts/fraunces-soft.woff2" as="font" type="font/woff2" crossorigin>
-<title>Library</title>
+<title>The Back Alley Library</title>
 <style nonce="__NONCE__">
 	@font-face { font-family: "Fraunces"; src: url(/fonts/fraunces-soft.woff2) format("woff2"); font-weight: 300 700; font-display: swap; }
 	@font-face { font-family: "Fraunces"; src: url(/fonts/fraunces-soft-italic.woff2) format("woff2"); font-weight: 300 700; font-style: italic; font-display: swap; }
@@ -3031,12 +3058,56 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	details p { margin: 8px 0 0; }
 	summary { cursor: pointer; color: var(--accent); }
 	.go { appearance: none; width: 100%; border: 0; border-radius: 10px; background: var(--accent); color: var(--on-accent); font-weight: 600; font-size: 17px; min-height: 48px; margin-top: 10px; cursor: pointer; }
+	.sub { margin: -8px 0 14px; font-size: 14px; }
+	/* The landing page: a library card on a brick wall at dusk. */
+	body.landing { background-color: #3a2a22;
+		background-image: radial-gradient(ellipse at 50% 16%, rgba(255,196,120,.32), rgba(0,0,0,0) 62%), radial-gradient(ellipse at 50% 120%, rgba(0,0,0,.55), rgba(0,0,0,0) 70%),
+			url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='64' height='32'%3E%3Cg stroke='%23000' stroke-opacity='.4' stroke-width='2'%3E%3Cpath d='M0 1H64M0 17H64M1 1V17M33 17V33'/%3E%3C/g%3E%3C/svg%3E");
+		background-attachment: fixed; min-height: 100vh; }
+	body.landing main { min-height: 100vh; display: flex; flex-direction: column; justify-content: center; }
+	.card { position: relative; max-width: 440px; width: 100%; margin: 24px auto; background: #f7efdc; color: var(--fg); border-radius: 6px; padding: 30px 26px 26px;
+		box-shadow: 0 18px 40px rgba(0,0,0,.45), 0 2px 0 rgba(255,255,255,.4) inset; transform: rotate(-1.2deg);
+		background-image: repeating-linear-gradient(transparent 0 31px, rgba(138,75,20,.12) 31px 32px); background-position: 0 128px; }
+	.card::before { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 10px; border-radius: 6px 6px 0 0; background: #8b2e1f; }
+	.card .no { display: flex; justify-content: space-between; font: 600 11px/1 var(--sans); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+	.card h1 { font-size: 38px; line-height: 1.02; margin: 14px 0 6px; letter-spacing: -.02em; }
+	.card h1 span { display: block; font-size: 15px; font-weight: 400; font-style: italic; letter-spacing: .02em; color: var(--muted); margin-bottom: 4px; }
+	.card .rule { height: 0; border-top: 3px double rgba(59,48,36,.5); margin: 14px 0 16px; }
+	.card p { margin: 0 0 16px; font: 400 18px/1.55 var(--display); }
+	.stamp { appearance: none; display: block; width: 100%; margin-top: 8px; padding: 14px 16px; border: 2px solid #8b2e1f; border-radius: 6px; background: #8b2e1f; color: #fbf2df;
+		font: 700 15px/1.2 var(--sans); letter-spacing: .12em; text-transform: uppercase; cursor: pointer; box-shadow: 0 3px 0 #5e1d13; }
+	.stamp:active { transform: translateY(2px); box-shadow: 0 1px 0 #5e1d13; }
+	.stamp:disabled { opacity: .6; }
+	.card label { display: block; font: 600 13px/1.3 var(--sans); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 12px 0 6px; }
+	.card input[type=text], .card textarea { width: 100%; border: 0; border-bottom: 2px solid rgba(59,48,36,.45); background: transparent; padding: 6px 2px; font: 400 19px/1.4 var(--display); border-radius: 0; }
+	.card textarea { resize: vertical; min-height: 64px; }
+	.card input:focus, .card textarea:focus { outline: none; border-bottom-color: #8b2e1f; }
+	.card .msg { font: 400 15px/1.45 var(--sans); color: var(--muted); }
+	.card .msg.bad { color: #8b2e1f; }
+	.hp { position: absolute !important; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
 	footer { margin-top: 36px; padding-top: 14px; border-top: 1px solid var(--line); font-size: 14px; text-align: center; }
 </style>
 </head>
 <body>
 <main>
-	<h1 id="head">Library</h1>
+	<section id="landing" class="card" hidden>
+		<div class="no"><span>Library card</span><span>No. ____</span></div>
+		<h1><span>Welcome to</span>The Back Alley Library</h1>
+		<div class="rule"></div>
+		<p>The Back Alley Library is a secret between family and friends. Inside you will find my entire collection of books, comics, and audiobooks. Click the button below to request your library card.</p>
+		<p id="lMsg" class="msg" hidden></p>
+		<button id="lAsk" class="stamp" type="button">Request your library card</button>
+		<form id="lForm" hidden>
+			<label for="lName">Your name</label>
+			<input id="lName" type="text" maxlength="60" autocomplete="name" autocapitalize="words" required>
+			<label for="lNote">How do I know you? <span class="muted">(optional)</span></label>
+			<textarea id="lNote" maxlength="300" placeholder="Cousin Jo, from book club…"></textarea>
+			<div class="hp" aria-hidden="true"><label for="lSite">Website</label><input id="lSite" type="text" tabindex="-1" autocomplete="off"></div>
+			<button id="lSend" class="stamp" type="submit">Send my request</button>
+		</form>
+	</section>
+	<h1 id="head" hidden>The Back Alley Library</h1>
+	<p id="sub" class="sub muted" hidden></p>
 	<p id="note" class="muted">Loading…</p>
 	<section id="welcome" class="welcome" hidden>
 		<p id="wIntro">Browse, then download any book to read in Apple Books or your favorite app. They're yours to keep.</p>
@@ -3058,7 +3129,7 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 				<select id="tag"></select>
 			</div>
 		</div>
-		<a id="up" class="up" href="/family" hidden>‹ All books</a>
+		<a id="up" class="up" href="/library" hidden>‹ All books</a>
 		<p id="count" class="count muted"></p>
 		<ul id="books" class="covers"></ul>
 		<p id="none" class="empty" hidden>Nothing matches.</p>
@@ -3084,11 +3155,13 @@ function fold(s) { return String(s || "").normalize("NFKD").replace(/[̀-ͯ]/g, 
 async function signIn(code) {
 	var res = await fetch("/api/family/redeem", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: code }) });
 	// The link works once, so the address to keep is the plain one.
-	history.replaceState(null, "", "/family");
+	history.replaceState(null, "", "/library");
 	if (!res.ok) {
 		var d = await res.json().catch(function () { return {}; });
-		throw new Error(res.status === 410 ? "This link has already been used or has run out. If it was meant for you, ask for a new one." : d.error || "Couldn't sign in.");
+		if (res.status === 410) return "That link has already been used or has run out. If it was meant for you, request a new card below.";
+		throw new Error(d.error || "Couldn't sign in.");
 	}
+	return "";
 }
 
 function drawnCover(b) {
@@ -3170,7 +3243,8 @@ function render() {
 	var ul = $("books");
 	ul.textContent = "";
 	$("up").hidden = series == null;
-	if ($("welcome").hidden) $("head").textContent = series != null ? series : me.name ? "Welcome, " + me.name : "Library";
+	if ($("welcome").hidden) $("head").textContent = series != null ? series : "The Back Alley Library";
+	$("sub").hidden = series != null || !me.name || !$("welcome").hidden;
 	// Browsing (no search, not inside a series): a series is one cover that opens to its volumes.
 	var group = series == null && !words.length, seen = {};
 	shown.forEach(function (b) {
@@ -3188,12 +3262,13 @@ function render() {
 }
 
 async function load() {
-	var invite = /[#&]invite=([\w-]+)/.exec(location.hash);
-	if (invite) await signIn(invite[1]);
+	var invite = /[#&]invite=([\w-]+)/.exec(location.hash), used = invite ? await signIn(invite[1]) : "";
 	var res = await fetch("/api/family/me");
-	if (res.status === 401) throw new Error("You're not signed in on this device. Open the link you were sent.");
+	if (res.status === 401) return landing(used);
 	if (!res.ok) throw new Error("Couldn't reach the library.");
 	me = await res.json();
+	$("head").hidden = false;
+	if (me.name) { $("sub").textContent = "Signed in as " + me.name; $("sub").hidden = false; }
 	if (invite || !read("familyWelcomed")) welcome(true);
 	var data = await (await fetch("/api/family/books")).json();
 	books = (data.books || []).slice().sort(function (a, b) {
@@ -3230,8 +3305,9 @@ function welcome(on) {
 	$("lib").hidden = on;
 	if (!on) { render(); return; }
 	var mine = device();
-	$("head").textContent = (me.owner ? "Welcome to " + me.owner + "'s library" : "Welcome to the library") + (me.name ? ", " + me.name + "." : ".");
-	$("wAddr").textContent = location.host + "/family";
+	$("head").textContent = "Welcome to The Back Alley Library" + (me.name ? ", " + me.name + "." : ".");
+	$("sub").hidden = true;
+	$("wAddr").textContent = location.host + "/library";
 	$("wHow").innerHTML = DEVICES[mine];
 	var other = $("wOther");
 	other.textContent = "";
@@ -3241,6 +3317,46 @@ function welcome(on) {
 }
 $("wGo").addEventListener("click", function () { store("familyWelcomed", "1"); welcome(false); });
 $("howLink").addEventListener("click", function (e) { e.preventDefault(); welcome(true); });
+
+// Not signed in: the landing page, and a request for a library card.
+function landing(msg) {
+	say("");
+	document.body.classList.add("landing");
+	$("landing").hidden = false;
+	var asked = read("cardRequested");
+	if (asked && !msg) msg = "Your request is in. You'll get your own link once it's approved.";
+	$("lMsg").textContent = msg;
+	$("lMsg").hidden = !msg;
+	$("lAsk").textContent = asked ? "Request again" : "Request your library card";
+}
+$("lAsk").addEventListener("click", function () {
+	$("lAsk").hidden = true;
+	$("lMsg").hidden = true;
+	$("lForm").hidden = false;
+	$("lName").focus();
+});
+$("lForm").addEventListener("submit", async function (e) {
+	e.preventDefault();
+	var name = $("lName").value.trim();
+	if (!name) { $("lName").focus(); return; }
+	$("lSend").disabled = true;
+	try {
+		var res = await fetch("/api/family/request", { method: "POST", headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ name: name, note: $("lNote").value.trim(), website: $("lSite").value }) });
+		var d = await res.json().catch(function () { return {}; });
+		if (!res.ok) throw new Error(d.error || "That didn't go through. Please try again.");
+		store("cardRequested", "1");
+		$("lForm").hidden = true;
+		$("lMsg").className = "msg";
+		$("lMsg").textContent = "Thanks, " + name + ". Your request is in. You'll get your own link once it's approved.";
+		$("lMsg").hidden = false;
+	} catch (err) {
+		$("lMsg").className = "msg bad";
+		$("lMsg").textContent = err.message;
+		$("lMsg").hidden = false;
+	}
+	$("lSend").disabled = false;
+});
 load().catch(function (e) { say(e.message); });
 </script>
 </body>
@@ -3674,6 +3790,8 @@ const PAGE = String.raw`<!doctype html>
 	.people .who b { display: block; font: 500 18px/1.25 var(--display); }
 	.people .who span { color: var(--muted); font-size: 14px; }
 	.people .acts { display: flex; gap: 8px; flex: none; }
+	.people .req { background: var(--sel); border-radius: 10px; padding: 12px; margin-bottom: 8px; border-bottom: 0; }
+	.people .who q { display: block; margin-top: 4px; font-style: italic; font-size: 14px; overflow-wrap: anywhere; }
 	.people .dlbtn { padding: 0; min-height: 28px; font-size: 14px; }
 	.people .dlog { flex-basis: 100%; list-style: none; margin: 0; padding: 0 0 0 10px; border-left: 2px solid var(--line); font-size: 14px; }
 	.people .dlog li { padding: 3px 0; overflow-wrap: anywhere; }
@@ -4022,7 +4140,7 @@ const PAGE = String.raw`<!doctype html>
 </section>
 
 <section id="familyView" class="wrap" hidden>
-	<p class="hint">Each person gets their own link. It works once, on the device they open it on, and runs out after 7 days if it isn't used. They can browse the Library and download books; nothing else. Books tagged "Hide from family" stay out of it.</p>
+	<p class="hint">The Back Alley Library is at <a href="/library" target="_blank" rel="noopener">/library</a>. Anyone can ask for a library card there; requests show here first. Each person gets their own link. It works once, on the device they open it on, and runs out after 7 days if it isn't used. They can browse the Library and download books; nothing else. Books tagged "Hide from family" stay out of it.</p>
 	<form id="famForm" class="uploadrow">
 		<label class="vh" for="famName">Name</label>
 		<input id="famName" type="text" placeholder="Name" maxlength="60" autocomplete="off" autocapitalize="words">
@@ -5788,9 +5906,16 @@ function renderContinue() {
 		a.setAttribute("aria-label", "Continue reading: " + b.title);
 		box.append(a);
 	}
+	var asks = contData && contData.requests;
+	if (asks) {
+		var r = contCard("a", "Back Alley Library", asks === 1 ? "1 library card request" : asks + " library card requests", "Approve or decline on the Family screen", 0);
+		r.href = "#/family";
+		r.querySelector(".bar-prog").remove();
+		box.append(r);
+	}
 	var shelf = h("div", "shelfbox"), any = !!state.books && renderShelf(shelf);
 	if (any) box.append(shelf);
-	show(box, !!(ep || b || any));
+	show(box, !!(ep || b || any || asks));
 }
 // ---------- family library (the owner's side: who has a link)
 
@@ -5812,10 +5937,27 @@ function personStatus(p) {
 	else bits.push("Link ran out");
 	return bits.join(" · ");
 }
+// A library card request from the landing page: Approve makes their link to send, Decline drops it.
+function requestRow(p) {
+	var li = h("li", "req"), who = h("div", "who"), acts = h("div", "acts");
+	who.append(h("b", null, p.name), h("span", null, "Asked for a library card " + ago(p.requested_at)));
+	if (p.request_note) who.append(h("q", null, p.request_note));
+	acts.append(
+		button("Approve", "btn small primary", function () {
+			apiJSON("/api/people/" + p.id + "/link", { method: "POST" }).then(function (d) { showInvite(d.person, d.code); window.scrollTo(0, 0); return loadPeople(); }).catch(fail);
+		}),
+		button("Decline", "btn small danger", function () {
+			if (!confirm("Decline " + p.name + "'s request?")) return;
+			apiJSON("/api/people/" + p.id, { method: "DELETE" }).then(loadPeople).catch(fail);
+		}));
+	li.append(who, acts);
+	return li;
+}
 function renderPeople(people) {
 	var ul = $("people");
 	ul.textContent = "";
 	people.forEach(function (p) {
+		if (p.requested_at) { ul.append(requestRow(p)); return; }
 		var li = h("li"), who = h("div", "who");
 		who.append(h("b", null, p.name), h("span", null, personStatus(p)));
 		var log = h("ul", "dlog");
@@ -5852,7 +5994,7 @@ function renderPeople(people) {
 }
 // The link is shown once: only its hash is kept, so "New link" is the way to get another.
 function showInvite(person, code) {
-	var box = $("famLink"), link = location.origin + "/family#invite=" + code;
+	var box = $("famLink"), link = location.origin + "/library#invite=" + code;
 	box.textContent = "";
 	box.dataset.person = person.id;
 	var input = h("input");
