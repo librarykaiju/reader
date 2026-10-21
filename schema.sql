@@ -179,7 +179,11 @@ CREATE TABLE IF NOT EXISTS people (
 	invite_hash TEXT UNIQUE,
 	invite_expires_at INTEGER,
 	created_at INTEGER NOT NULL,
-	last_seen_at INTEGER
+	last_seen_at INTEGER,
+	-- A library card request from the /library landing page (migration 0011):
+	-- when they asked (NULL once approved) and what they wrote.
+	requested_at INTEGER,
+	request_note TEXT
 );
 
 -- Each download a family member made.
