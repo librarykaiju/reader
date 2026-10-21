@@ -175,6 +175,7 @@ npx wrangler d1 execute reader --remote --file migrations/0005_book_tags_and_det
 npx wrangler d1 execute reader --remote --file migrations/0006_stories.sql
 npx wrangler d1 execute reader --remote --file migrations/0007_highlights.sql
 npx wrangler d1 execute reader --remote --file migrations/0008_coverage.sql
+npx wrangler d1 execute reader --remote --file migrations/0009_comic_layout.sql
 npx wrangler deploy
 ```
 
@@ -225,6 +226,7 @@ A migration that already ran stops with an error such as "duplicate column name"
 
 **Books**
 - **Library** → **Upload**. The menu next to it puts a tag on the new books (it starts on the tag you're looking at; **New tag…** makes one). `.txt`, `.pdf`, `.epub` or `.cbz`, up to 95 MB each. A comic opens one page at a time: swipe or tap the sides to turn, tap the middle to switch between whole page and page width. CBR comics need converting to CBZ first.
+- **Comic layouts:** ⋯ → **Pages / Scroll / Right to left**. **Scroll** is for webtoons: every page stacked at full width with no gaps, so strips cut into slices join up, and your place is kept to the spot within a page. **Right to left** is for manga: tap or swipe the other way, the arrow keys and the slider are mirrored, and guided view reads panels right to left. The first time a comic opens it picks one by itself: **Scroll** when its ComicInfo.xml says `<Format>Webtoon</Format>` or its pages are about twice as tall as wide, **Right to left** when it says `<Manga>YesAndRightToLeft</Manga>`, otherwise **Pages**. The choice is saved on the book, so it's the same on every device. (Update with migration 0009.)
 - The reader remembers your place in each book across devices.
 - **EPUBs** read like a `.txt`: one long scroll in the reader's font, size and theme, with the book's italics, bold, headings and pictures kept and its own fonts and layout left out. **⋯** → **Contents** lists the chapters (the one you're in is marked), and links inside the book, such as footnotes, jump to their place. Highlights and notes work the same as in a `.txt`. The title, author and series come from the EPUB itself when you upload it; renaming the book afterwards sticks. Only DRM-free EPUBs open: a store copy with copy protection (Apple Books, Kobo, Google Play, Adobe) is turned away at upload with a message saying so.
 - Plain-text books with hard line breaks every ~70 characters (like Project Gutenberg files) are joined back into normal paragraphs.

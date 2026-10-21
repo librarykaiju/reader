@@ -66,7 +66,8 @@
 //                                  adds genre tags from the file's own subjects, else Open Library's (never removes any)
 //   PUT    /api/books/:id/cover    body = a JPEG/PNG/WebP: a PDF's first page the page drew, or one chosen in Edit details
 //   DELETE /api/books/:id/cover    back to the automatic cover (the file's own, or a PDF's first page)
-//   PATCH  /api/books/:id          {title?, author?, series?, volume?, position?, finished?, opened?, tags?, reread?}
+//   PATCH  /api/books/:id          {title?, author?, series?, volume?, position?, finished?, opened?, tags?, reread?, layout?}
+//                                  (layout, a comic's: "pages", "scroll" (webtoon), "rtl" (manga), or null)
 //                                  (author/series/volume: the page reads them from an EPUB's own details;
 //                                  reread: fill them in from a .txt's YAML header or a comic's ComicInfo.xml)
 //                                  (reread: fill the details again from a .txt's YAML header)
@@ -106,7 +107,7 @@ const BOOK_TYPE = "CASE WHEN filename LIKE '%.cbz' THEN 'cbz' WHEN filename LIKE
 function storedType(ext) { return ext === "cbz" || ext === "epub" ? "pdf" : ext; }
 function bookType(book) { const m = /\.(cbz|epub)$/i.exec(book.filename); return m ? m[1].toLowerCase() : book.type; }
 // Every book column but r2_key, which never leaves the Worker.
-const BOOK_COLUMNS = `id, title, filename, ${BOOK_TYPE} AS type, size, position, finished_at, created_at, last_opened_at, author, series, volume`;
+const BOOK_COLUMNS = `id, title, filename, ${BOOK_TYPE} AS type, size, position, finished_at, created_at, last_opened_at, author, series, volume, layout`;
 // An item with a media file is a podcast episode, or a video if the file is
 // video; YouTube, Twitch and Vimeo videos are stored as video/x-youtube etc.
 const VIEWS = {
@@ -1975,6 +1976,7 @@ async function bookPart(env, id, url) {
 	});
 }
 
+const COMIC_LAYOUTS = ["pages", "scroll", "rtl"];
 async function updateBook(request, env, id) {
 	const body = await readJSON(request);
 	const sets = [];
@@ -1989,6 +1991,11 @@ async function updateBook(request, env, id) {
 		if (body[key] === undefined) continue;
 		sets.push(key + " = ?");
 		params.push(str(body[key], 300));
+	}
+	if (body.layout !== undefined) {
+		if (body.layout !== null && !COMIC_LAYOUTS.includes(body.layout)) throw new HttpError(400, "layout: " + COMIC_LAYOUTS.join(", ") + " or null");
+		sets.push("layout = ?");
+		params.push(body.layout);
 	}
 	if (body.position !== undefined) {
 		const pos = body.position === null ? null : String(body.position);
@@ -3175,6 +3182,9 @@ const PAGE = String.raw`<!doctype html>
 	.cbz.guided .cbzpage { position: relative; height: var(--cbz-h, 80vh); overflow: hidden; touch-action: pan-y; }
 	.cbz.guided .cbzpage img { position: absolute; left: 0; top: 0; max-width: none; object-fit: fill; transform-origin: 0 0; transition: transform .3s ease; }
 	@media (prefers-reduced-motion: reduce) { .cbz.guided .cbzpage img { transition: none; } }
+	.cbz.scroll { padding: 0 0 24px; }
+	.cbzstrip { width: 100%; max-width: 800px; }
+	.cbzstrip img { display: block; width: 100%; height: 100%; }
 	.cbzbar { display: flex; align-items: center; gap: 10px; width: 100%; max-width: 640px; padding: 10px 16px 0; font-family: var(--sans); }
 	.cbzbar input { flex: 1; min-width: 0; }
 	.loading { color: var(--muted); text-align: center; padding: 40px 16px; font-family: var(--sans); }
@@ -3319,6 +3329,11 @@ const PAGE = String.raw`<!doctype html>
 		<button id="bmContents" class="btn" type="button" hidden>Contents</button>
 		<button id="bmFind" class="btn" type="button" hidden>Search in book</button>
 		<button id="bmHighlights" class="btn" type="button" hidden>Highlights</button>
+		<div id="bmLayout" class="seg" role="group" aria-label="Layout" hidden>
+			<button type="button" data-layout="pages">Pages</button>
+			<button type="button" data-layout="scroll">Scroll</button>
+			<button type="button" data-layout="rtl">Right to left</button>
+		</div>
 		<button id="bmGuided" class="btn" type="button" hidden aria-pressed="false">Guided view</button>
 		<button id="bmDetails" class="btn" type="button">Edit details</button>
 		<button id="bmFinish" class="btn" type="button">Mark finished</button>
@@ -6385,7 +6400,8 @@ function applyPending(books, fromServer) {
 			else if (fromServer) delete p.position;
 		}
 		if (p.finished !== undefined) b.finished_at = p.finished ? (b.finished_at || p.finished) : null;
-		if (p.position === undefined && p.finished === undefined && !p.opened) delete bookPending[b.id];
+		if (p.layout !== undefined) b.layout = p.layout;
+		if (p.position === undefined && p.finished === undefined && p.layout === undefined && !p.opened) delete bookPending[b.id];
 	});
 	saveBookPending();
 }
@@ -6394,6 +6410,7 @@ function pendingBody(p) {
 	if (p.position !== undefined) body.position = p.position;
 	if (p.finished !== undefined) body.finished = !!p.finished;
 	if (p.opened) body.opened = true;
+	if (p.layout !== undefined) body.layout = p.layout;
 	return body;
 }
 function queueBook(id, fields) {
@@ -7446,7 +7463,7 @@ function spot(p) {
 function farOf(p) { return p.far || (p.f != null ? spot(p) : null); }
 // About one screen of the book, as a fraction of it (a comic: one page).
 function screenF(sess) {
-	if (sess.cbz) return 1 / sess.cbz.n;
+	if (sess.cbz && !sess.cbz.scroll) return 1 / sess.cbz.n;
 	return window.innerHeight / Math.max(document.documentElement.scrollHeight, window.innerHeight);
 }
 function spotName(s) { return s.page ? "page " + s.page : Math.round(s.f * 100) + "%"; }
@@ -7459,7 +7476,7 @@ function updateMarks(sess) {
 	$("markBtn").classList.toggle("on", !!c.mark);
 	$("markBtn").setAttribute("aria-pressed", String(!!c.mark));
 	$("markBtn").setAttribute("aria-label", c.mark ? "Bookmarked (" + spotName(c.mark) + "). Tap to move it here" : "Bookmark this place");
-	var behind = !!far && far.f - (c.f || 0) > (sess.cbz ? 0.5 : 1.5) * screenF(sess);
+	var behind = !!far && far.f - (c.f || 0) > (sess.cbz && !sess.cbz.scroll ? 0.5 : 1.5) * screenF(sess);
 	if (!behind) sess.farHidden = false;
 	if (behind) $("farGo").textContent = "Back to furthest · " + spotName(far);
 	show($("farPill"), behind && !sess.farHidden);
@@ -7525,7 +7542,9 @@ function renderBookMenu() {
 	show($("bmHighlights"), b.type === "txt" || b.type === "epub");
 	show($("bmFind"), b.type === "txt" || b.type === "epub" || b.type === "pdf");
 	$("bmHighlights").textContent = n ? "Highlights (" + n + ")" : "Highlights";
-	show($("bmGuided"), b.type === "cbz");
+	show($("bmLayout"), b.type === "cbz" && !!session.cbz);
+	[].forEach.call($("bmLayout").children, function (x) { x.setAttribute("aria-pressed", String(x.dataset.layout === (b.layout || "pages"))); });
+	show($("bmGuided"), b.type === "cbz" && !(session.cbz && session.cbz.scroll));
 	$("bmGuided").textContent = "Guided view: " + (guidedOn() ? "on" : "off");
 	$("bmGuided").setAttribute("aria-pressed", String(guidedOn()));
 	$("bmFinish").textContent = b.finished_at ? "Mark unfinished" : "Mark finished";
@@ -8477,7 +8496,7 @@ async function zipEntryBlob(u8, e) {
 // find one panel or a mess, and those pages are shown whole.
 var GUIDED_KEY = "readerComicGuided";
 function guidedOn() { return read(GUIDED_KEY) === "on"; }
-function findPanels(img) {
+function findPanels(img, rtl) {
 	var nw = img.naturalWidth, nh = img.naturalHeight;
 	if (!nw || !nh) return null;
 	var sc = Math.min(1, 480 / Math.max(nw, nh)), w = Math.max(1, Math.round(nw * sc)), hgt = Math.max(1, Math.round(nh * sc));
@@ -8527,6 +8546,7 @@ function findPanels(img) {
 		var xs = runs(r.x, r.x + r.w, function (x) { return colClear(x, y0, y1); })
 			.filter(function (s) { return s[1] - s[0] >= minW; });
 		if (!xs.length) return [];
+		if (rtl) xs.reverse();
 		if (xs.length > 1 && depth < 6) return [].concat.apply([], xs.map(function (s) { return cut({ x: s[0], y: y0, w: s[1] - s[0], h: y1 - y0 }, depth + 1); }));
 		return [{ x: xs[0][0], y: y0, w: xs[0][1] - xs[0][0], h: y1 - y0 }];
 	};
@@ -8535,18 +8555,203 @@ function findPanels(img) {
 	if (found.length < 2 || found.length > 16 || area < w * hgt * 0.4) return null;
 	return found.map(function (r) { return { x: r.x / w, y: r.y / hgt, w: r.w / w, h: r.h / hgt }; });
 }
+// A comic's layout: "pages" (one at a time), "scroll" (webtoon: every page
+// in one long strip) or "rtl" (one at a time, right to left, for manga).
+// Saved on the book (migration 0009). A comic that has none yet gets one
+// the first time it's opened, from its ComicInfo.xml (<Format>Webtoon or
+// <Manga>YesAndRightToLeft) or else the shape of its first pages.
+var cbzKeep = null; // {id, buf}: the open comic's file, kept while it reopens in another layout
 async function openCbz(sess, pos) {
-	var res = await bookFileRes(sess.book);
-	var buf = await res.arrayBuffer();
+	var b = sess.book, buf;
+	if (cbzKeep && cbzKeep.id === b.id) buf = cbzKeep.buf;
+	else buf = await (await bookFileRes(b)).arrayBuffer();
+	cbzKeep = null;
 	if (!sess.alive) return;
 	var u8 = new Uint8Array(buf), pages = readZip(buf), n = pages.length;
 	if (!n) throw new Error("No page images in this comic.");
+	var layout = b.layout;
+	if (COMIC_LAYOUTS.indexOf(layout) < 0) {
+		layout = await cbzLayout(buf, u8, pages).catch(function () { return "pages"; });
+		if (!sess.alive) return;
+		saveLayout(b, layout);
+	}
+	if (layout === "scroll") return openCbzScroll(sess, pos, buf, u8, pages);
+	return openCbzPages(sess, pos, buf, u8, pages, layout === "rtl");
+}
+var COMIC_LAYOUTS = ["pages", "scroll", "rtl"];
+async function cbzLayout(buf, u8, pages) {
+	var info = zipEntries(buf, "a CBZ").filter(function (e) { return /(^|\/)comicinfo\.xml$/i.test(e.name); })[0];
+	if (info) {
+		var xml = await (await zipEntryBlob(u8, Object.assign({}, info, { type: "text/xml" }))).text();
+		var el = function (name) { return ((new RegExp("<" + name + ">\\s*([^<]*?)\\s*</" + name + ">", "i").exec(xml) || [])[1] || "").toLowerCase(); };
+		if (/web ?toon/.test(el("Format"))) return "scroll";
+		if (el("Manga") === "yesandrighttoleft") return "rtl";
+	}
+	// Much taller than wide (about 1:2 or more) is a webtoon's strips. The
+	// cover is skipped when there are pages enough, since it's often a
+	// normal shape.
+	var look = pages.length > 3 ? pages.slice(1, 4) : pages, tall = 0;
+	for (var i = 0; i < look.length; i++) {
+		var sz = imageSize(await zipEntryHead(u8, look[i]));
+		if (sz && sz.h >= 1.9 * sz.w) tall++;
+	}
+	return tall * 2 > look.length ? "scroll" : "pages";
+}
+// The book's layout, kept here and sent (or left waiting if offline).
+function saveLayout(b, layout) {
+	b.layout = layout;
+	if (bookDownloads[b.id]) { bookDownloads[b.id].layout = layout; saveBookDownloads(); }
+	queueBook(b.id, { layout: layout });
+	sendPending(b.id).catch(function () {});
+}
+// Switch the open comic's layout: it reopens at the same page, without
+// fetching the file again.
+function setLayout(layout) {
+	var sess = session;
+	if (!sess || !sess.cbz || sess.book.layout === layout) return;
+	if (sess.track && !sess.restoring) sess.track();
+	saveLayout(sess.book, layout);
+	cbzKeep = { id: sess.book.id, buf: sess.cbz.buf };
+	var id = sess.book.id;
+	closeBook();
+	openBook(id);
+}
+// The first bytes of a zip entry, unpacked (enough for an image's size).
+async function zipEntryHead(u8, e) {
+	var want = 256 * 1024, data = u8.subarray(e.offset, e.offset + e.csize);
+	if (e.method === 0) return data.subarray(0, want);
+	var reader = new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw")).getReader(), parts = [], got = 0;
+	try {
+		while (got < want) {
+			var r = await reader.read();
+			if (r.done) break;
+			parts.push(r.value);
+			got += r.value.length;
+		}
+	} catch (err) {} finally { reader.cancel().catch(function () {}); }
+	var out = new Uint8Array(got), at = 0;
+	parts.forEach(function (p) { out.set(p, at); at += p.length; });
+	return out;
+}
+// -> {w, h} from the start of a JPEG, PNG, GIF, WebP or BMP file; null when
+// it can't tell (the page's shape is then fixed once it's shown).
+function imageSize(b) {
+	var dv = new DataView(b.buffer, b.byteOffset, b.byteLength), len = b.length;
+	try {
+		if (b[0] === 0x89 && b[1] === 0x50 && len >= 24) return { w: dv.getUint32(16), h: dv.getUint32(20) };
+		if (b[0] === 0x47 && b[1] === 0x49 && len >= 10) return { w: dv.getUint16(6, true), h: dv.getUint16(8, true) };
+		if (b[0] === 0x42 && b[1] === 0x4d && len >= 26) return { w: dv.getInt32(18, true), h: Math.abs(dv.getInt32(22, true)) };
+		if (b[0] === 0x52 && b[8] === 0x57 && b[9] === 0x45 && len >= 30) {
+			var kind = String.fromCharCode(b[12], b[13], b[14], b[15]);
+			if (kind === "VP8 ") return { w: dv.getUint16(26, true) & 0x3fff, h: dv.getUint16(28, true) & 0x3fff };
+			if (kind === "VP8L") { var v = dv.getUint32(21, true); return { w: (v & 0x3fff) + 1, h: ((v >> 14) & 0x3fff) + 1 }; }
+			if (kind === "VP8X") return { w: 1 + (b[24] | b[25] << 8 | b[26] << 16), h: 1 + (b[27] | b[28] << 8 | b[29] << 16) };
+		}
+		if (b[0] === 0xff && b[1] === 0xd8) {
+			for (var i = 2; i + 9 < len;) {
+				if (b[i] !== 0xff) { i++; continue; }
+				var m = b[i + 1];
+				if (m === 0xff) { i++; continue; }
+				if (m === 0xd8 || m === 0x01 || (m >= 0xd0 && m <= 0xd7)) { i += 2; continue; }
+				if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) return { w: dv.getUint16(i + 7), h: dv.getUint16(i + 5) };
+				i += 2 + dv.getUint16(i + 2);
+			}
+		}
+	} catch (e) {}
+	return null;
+}
+// Webtoon: every page stacked at full width with no gaps, so strips cut
+// into slices join up again. Each page's box is sized from its image's
+// header before anything is shown, so a saved place lands where it should;
+// pages are unpacked as they come near the screen and let go far from it,
+// the way PDF pages are drawn. The place is a page and how far into it.
+async function openCbzScroll(sess, pos, buf, u8, pages) {
+	var n = pages.length, sizes = [];
+	for (var k = 0; k < n; k += 16) {
+		var batch = await Promise.all(pages.slice(k, k + 16).map(function (e) { return zipEntryHead(u8, e).then(imageSize, function () { return null; }); }));
+		if (!sess.alive) return;
+		sizes = sizes.concat(batch);
+	}
+	var body = $("bookBody"), strips = [], ratio = "2 / 3";
+	body.textContent = "";
+	body.className = "cbz scroll";
+	for (var i = 0; i < n; i++) {
+		var sz = sizes[i];
+		if (sz && sz.w > 0 && sz.h > 0) ratio = sz.w + " / " + sz.h;
+		var d = h("div", "cbzstrip"), img = h("img");
+		img.alt = "Page " + (i + 1);
+		img.decoding = "async";
+		d.style.aspectRatio = ratio;
+		d.dataset.n = i + 1;
+		d.append(img);
+		strips.push(d);
+		body.appendChild(d);
+	}
+	var urls = {};
+	function show(d) {
+		var i = Number(d.dataset.n), img = d.firstChild;
+		if (urls[i]) return;
+		urls[i] = zipEntryBlob(u8, pages[i - 1]).then(function (b) { return URL.createObjectURL(b); });
+		urls[i].then(function (src) {
+			if (!sess.alive || !d.want) return;
+			img.onload = function () {
+				// A page whose size wasn't in its header (or was turned by its
+				// EXIF) gets its real shape now.
+				var r = img.naturalWidth + " / " + img.naturalHeight;
+				if (img.naturalWidth && d.style.aspectRatio !== r && Math.abs(img.naturalWidth / img.naturalHeight - d.clientWidth / d.clientHeight) > 0.01) d.style.aspectRatio = r;
+			};
+			img.src = src;
+		}, function (e) { if (sess.alive) toast("Couldn't show page " + i + ": " + e.message); });
+	}
+	function hide(d) {
+		var i = Number(d.dataset.n);
+		if (!urls[i]) return;
+		urls[i].then(URL.revokeObjectURL, function () {});
+		delete urls[i];
+		d.firstChild.removeAttribute("src");
+	}
+	var io = new IntersectionObserver(function (entries) {
+		entries.forEach(function (e) {
+			e.target.want = e.isIntersecting;
+			if (e.isIntersecting) show(e.target); else hide(e.target);
+		});
+	}, { rootMargin: "200% 0px" });
+	strips.forEach(function (d) { io.observe(d); });
+	sess.cleanup.push(function () { io.disconnect(); strips.forEach(hide); });
+	var list = { pages: strips };
+	var track = function () {
+		if (sess.restoring) return;
+		var c = pdfCurrent(list);
+		savePosition(sess, { page: c.page, pf: Math.round(c.within * 1000) / 1000, pages: n, f: Math.round((c.page - 1 + c.within) / n * 1e4) / 1e4 },
+			c.page + " / " + n);
+		if (!sess.quietEnd) checkEnd(sess, strips[n - 1]);
+	};
+	sess.track = track;
+	listen(sess, window, "scroll", onScrollFrame(track), { passive: true });
+	sess.jump = function (s) {
+		var at = clamp(s.page || Math.round((s.f || 0) * n) || 1, 1, n);
+		aim(sess, function () {
+			var r = strips[at - 1].getBoundingClientRect();
+			return window.scrollY + r.top + (s.page ? s.pf || 0 : 0) * r.height - headerBottom();
+		}, track);
+	};
+	sess.cbz = { n: n, buf: buf, scroll: true, go: function (i) { sess.jump({ page: i }); }, setGuided: function () {} };
+	var page = clamp(pos.page || 1, 1, n);
+	$("progress").textContent = page + " / " + n;
+	if (page > 1 || pos.pf > 0) sess.jump(pos);
+}
+async function openCbzPages(sess, pos, buf, u8, pages, rtl) {
+	var n = pages.length;
 	var body = $("bookBody");
 	body.textContent = "";
 	body.className = "cbz" + (read("readerComicFit") === "width" ? " fitw" : "") + (guidedOn() ? " guided" : "");
 	var box = h("div", "cbzpage"), img = h("img");
 	img.alt = "";
 	box.append(img);
+	// Right to left: the bar is mirrored (so the next page's button is on
+	// the left, its arrow turned by the browser, and the slider starts on
+	// the right), and taps, swipes and
+	// arrow keys turn the other way.
 	var prev = button("‹", "btn", function () { step(-1); }), next = button("›", "btn", function () { step(1); });
 	prev.setAttribute("aria-label", "Previous page");
 	next.setAttribute("aria-label", "Next page");
@@ -8557,6 +8762,7 @@ async function openCbz(sess, pos) {
 	slider.setAttribute("aria-label", "Page");
 	slider.addEventListener("change", function () { go(Number(slider.value), true); });
 	var bar = h("div", "cbzbar");
+	if (rtl) bar.dir = "rtl";
 	bar.append(prev, slider, next);
 	body.append(box, bar);
 	var urls = {}, cur = 0;
@@ -8616,7 +8822,7 @@ async function openCbz(sess, pos) {
 			await new Promise(function (res) { img.onload = img.onerror = function () { img.onload = img.onerror = null; res(); }; });
 		}
 		if (!sess.alive || cur !== i) return;
-		if (!(i in g.found)) g.found[i] = findPanels(img);
+		if (!(i in g.found)) g.found[i] = findPanels(img, rtl);
 		g.panels = g.found[i];
 		g.at = g.panels && last ? g.panels.length - 1 : 0;
 		g.whole = false;
@@ -8644,7 +8850,7 @@ async function openCbz(sess, pos) {
 		g.whole = false;
 		if (on) guide(cur, false); else { g.panels = null; place(); $("progress").textContent = cur + " / " + n; }
 	}
-	sess.cbz = { n: n, go: go, setGuided: setGuided };
+	sess.cbz = { n: n, buf: buf, go: go, setGuided: setGuided };
 	sess.jump = function (s) { go(s.page || Math.round(s.f * n) || 1, false); window.scrollTo(0, 0); };
 	function fit() { body.style.setProperty("--cbz-h", Math.max(200, window.innerHeight - headerBottom() - bar.offsetHeight - 24) + "px"); }
 	fit();
@@ -8653,8 +8859,8 @@ async function openCbz(sess, pos) {
 	// whole page on screen and page width (scroll down for the rest).
 	listen(sess, box, "click", function (e) {
 		var x = e.clientX / window.innerWidth;
-		if (x < 0.35) step(-1);
-		else if (x > 0.65) step(1);
+		if (x < 0.35) step(rtl ? 1 : -1);
+		else if (x > 0.65) step(rtl ? -1 : 1);
 		else if (guidedOn()) {
 			// In guided view the middle pulls back to the whole page, and back in.
 			if (g.panels) { g.whole = !g.whole; place(); }
@@ -8674,13 +8880,14 @@ async function openCbz(sess, pos) {
 		swipe = null;
 		if (!quick || Math.abs(dx) < 50 || Math.abs(dx) < 2 * Math.abs(dy)) return;
 		e.preventDefault();
-		step(dx < 0 ? 1 : -1);
+		step((dx < 0) !== rtl ? 1 : -1);
 	});
 	listen(sess, box, "touchcancel", function () { swipe = null; }, { passive: true });
 	listen(sess, document, "keydown", function (e) {
 		if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || !$("bookMenu").hidden || !$("settings").hidden) return;
 		if (e.target.closest && e.target.closest("input, textarea, select, [contenteditable]")) return;
-		var dir = e.key === "ArrowRight" || e.key === "j" || e.key === "PageDown" ? 1 : e.key === "ArrowLeft" || e.key === "k" || e.key === "PageUp" ? -1 : 0;
+		var dir = e.key === "j" || e.key === "PageDown" ? 1 : e.key === "k" || e.key === "PageUp" ? -1
+			: e.key === "ArrowRight" ? (rtl ? -1 : 1) : e.key === "ArrowLeft" ? (rtl ? 1 : -1) : 0;
 		if (!dir) return;
 		e.preventDefault();
 		step(dir);
@@ -9200,6 +9407,12 @@ $("bmUnmark").addEventListener("click", function () {
 });
 $("farGo").addEventListener("click", function () { if (session) goToSpot(session, farOf(here(session))); });
 $("farX").addEventListener("click", function () { if (!session) return; session.farHidden = true; show($("farPill"), false); });
+$("bmLayout").addEventListener("click", function (e) {
+	var x = e.target.closest("button");
+	if (!x) return;
+	openBookMenu(false);
+	setLayout(x.dataset.layout);
+});
 $("bmGuided").addEventListener("click", function () {
 	var on = !guidedOn();
 	openBookMenu(false);
