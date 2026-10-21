@@ -3740,6 +3740,21 @@ const PAGE = String.raw`<!doctype html>
 	.eps .notes { flex: 1 0 100%; margin: -6px 0 0; padding: 0 0 12px 22px; border: 0; background: none; color: var(--muted); font: 14px/1.4 var(--sans);
 		text-align: left; cursor: pointer; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
 	.eps .notes.open { display: block; -webkit-line-clamp: none; line-clamp: none; }
+	.shelfbox { grid-column: 1 / -1; min-width: 0; margin: 4px 0 0; }
+	#libShelf { margin: 14px 0 6px; }
+	.shelfbox .cl { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--accent); }
+	.shelf { list-style: none; margin: 8px -16px 0; padding: 4px 16px 8px; display: flex; gap: 12px; overflow-x: auto; scroll-snap-type: x proximity;
+		-webkit-overflow-scrolling: touch; scrollbar-width: none; }
+	.shelf::-webkit-scrollbar { display: none; }
+	.shelf li { flex: none; width: 96px; scroll-snap-align: start; }
+	.shelf a { display: flex; flex-direction: column; gap: 2px; color: inherit; text-decoration: none; }
+	.shelf .gencover { gap: 6px; padding: 14% 9%; }
+	.shelf .gencover .gt { font-size: 12px; }
+	.shelf .gencover .ga { font-size: 10px; }
+	.shelf .gencover .gk { display: none; }
+	.shelf .ct { font-weight: 600; font-size: 13px; line-height: 1.25; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+	.shelf .ca { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+	.shelf .bar-prog { margin-top: 3px; }
 	.cont { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin: 16px 0 0; }
 	.ccard { display: grid; gap: 2px; min-width: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card);
 		color: inherit; text-decoration: none; text-align: left; font: 15px/1.35 var(--sans); cursor: pointer; }
@@ -3973,6 +3988,7 @@ const PAGE = String.raw`<!doctype html>
 		<ul id="uploads" class="uploads"></ul>
 	</div>
 	<p id="libNote" class="hint" hidden>You're offline. These are the books downloaded on this device; your place syncs when you're back online.</p>
+	<div id="libShelf" class="shelfbox" hidden></div>
 	<div id="bookTags" class="tagbar" hidden></div>
 	<div class="libfind">
 		<label class="vh" for="bookSearch">Search the Library</label>
@@ -5669,16 +5685,63 @@ async function showList(r, prev) {
 	await loadItems(false);
 	if (back && state.route === r) window.scrollTo(0, state.listScroll);
 }
-// Continue listening / Continue reading, atop Unread and All (not a feed or
-// tag): the episode part-way through (the one last played on this device if
-// it is, else the server's pick) and the last opened book not finished.
+// Continue listening and the Continue reading shelf, atop Unread and All (not
+// a feed or tag): the episode part-way through (the one last played on this
+// device if it is, else the server's pick), then every book opened and not
+// finished, most recent first, and after them the next volume of each series
+// you've finished one of. The shelf is worked out from the Library's list,
+// fetched here if the Library hasn't been opened yet; it shows atop the
+// Library too.
 var contData = null;
 function contShown() { return (state.view === "unread" || state.view === "all") && state.feed == null && state.tag == null; }
 async function loadContinue() {
 	renderContinue();
 	if (!contShown()) return;
+	var books = state.books ? null : loadBooks().catch(function () {});
 	try { contData = await apiJSON("/api/continue"); } catch (e) { if (e.message === UNAUTH) return; }
+	await books;
 	renderContinue();
+}
+var SHELF_MAX = 12;
+function shelfBooks(books) {
+	var reading = books.filter(function (b) { return b.last_opened_at && !b.finished_at; })
+		.sort(function (a, b) { return b.last_opened_at - a.last_opened_at || b.id - a.id; });
+	var series = {}, next = [];
+	books.forEach(function (b) { if (b.series) (series[fold(b.series)] = series[fold(b.series)] || []).push(b); });
+	Object.keys(series).forEach(function (k) {
+		var vols = sortBooks(series[k], "series"), last = -1, at = 0;
+		vols.forEach(function (b, i) { if (b.finished_at) { last = i; at = Math.max(at, b.finished_at); } });
+		if (last < 0 || vols.some(function (b) { return b.last_opened_at && !b.finished_at; })) return;
+		var n = vols.slice(last + 1).filter(function (b) { return !b.finished_at; })[0];
+		if (n) next.push({ book: n, at: at });
+	});
+	next.sort(function (a, b) { return b.at - a.at; });
+	return reading.map(function (b) { return { book: b }; })
+		.concat(next.map(function (x) { return { book: x.book, next: true }; })).slice(0, SHELF_MAX);
+}
+function shelfCard(x) {
+	var b = x.book, li = h("li"), a = h("a"), pos = parsePos(b.position), pct = pos && pos.f ? Math.round(pos.f * 100) : 0;
+	var where = x.next ? "Up next" + (b.volume ? " · Vol. " + b.volume : "")
+		: pos && b.type !== "txt" && pos.page ? "p. " + pos.page + (pos.pages ? " of " + pos.pages : "") : pct ? pct + "%" : "Started";
+	a.href = "#/book/" + b.id;
+	a.setAttribute("aria-label", (x.next ? "Up next: " : "Continue reading: ") + b.title + ", " + where);
+	var bar = h("div", "bar-prog"), fill = h("span");
+	fill.style.width = (x.next ? 0 : pct) + "%";
+	bar.append(fill);
+	a.append(coverBox(b), h("span", "ct", b.title), h("span", "ca", where), bar);
+	li.append(a);
+	return li;
+}
+// The shelf into box (#contShelf on Unread and All, #libShelf in the Library); hidden when empty.
+function renderShelf(box) {
+	box.textContent = "";
+	var list = shelfBooks(state.books || []);
+	if (!list.length) { show(box, false); return false; }
+	var ul = h("ul", "shelf");
+	list.forEach(function (x) { ul.append(shelfCard(x)); });
+	box.append(h("span", "cl", "Continue reading"), ul);
+	show(box, true);
+	return true;
 }
 function contEpisode() {
 	var mine = player.ep && isAudio(player.ep) ? player.ep : null;
@@ -5705,7 +5768,7 @@ function renderContinue() {
 	var box = $("cont");
 	box.textContent = "";
 	if (!contShown()) { show(box, false); return; }
-	var ep = contEpisode(), b = contBook();
+	var ep = contEpisode(), b = state.books ? null : contBook();
 	if (ep) {
 		var len = epLen(ep), c = contCard("button", "Continue listening", ep.title,
 			[ep.feed_title, epStatus(ep)].filter(Boolean).join(" · "), len ? epPos(ep) / len * 100 : 0);
@@ -5722,7 +5785,9 @@ function renderContinue() {
 		a.setAttribute("aria-label", "Continue reading: " + b.title);
 		box.append(a);
 	}
-	show(box, !!(ep || b));
+	var shelf = h("div", "shelfbox"), any = !!state.books && renderShelf(shelf);
+	if (any) box.append(shelf);
+	show(box, !!(ep || b || any));
 }
 // ---------- family library (the owner's side: who has a link)
 
@@ -7202,6 +7267,8 @@ function renderBooks() {
 	var one = state.libSeries;
 	if (one) books = books.filter(function (b) { return fold(b.series) === fold(one); });
 	var tagged = books.length;
+	if (!one && !sel.length && !edit && !state.libSearch.trim()) renderShelf($("libShelf"));
+	else show($("libShelf"), false);
 	books = sortBooks(books.filter(bookMatches(state.libSearch)), one ? "series" : state.libSort);
 	var tagNames = sel.map(function (id) { return id === 0 ? "Untagged" : (bookTagById(id) || {}).name || ""; }).join(" + ");
 	$("libTitle").textContent = one ? (books[0] ? books[0].series : one) : sel.length ? "Library · " + tagNames : "Library";
@@ -8027,6 +8094,7 @@ async function openBook(id) {
 		location.replace("#/library");
 		return;
 	}
+	book.last_opened_at = Date.now(); // the shelf's order, until the Library is next fetched
 	var sess = session = { id: id, book: book, alive: true, cleanup: [], dirty: false, start: parsePos(book.position) || {} };
 	$("heading").textContent = book.title;
 	document.title = book.title + " — Reader";
