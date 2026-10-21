@@ -95,7 +95,10 @@ CREATE TABLE IF NOT EXISTS books (
 	-- From a .txt book's YAML header (see parseFrontMatter in src/index.js).
 	author TEXT,
 	series TEXT,
-	volume TEXT
+	volume TEXT,
+	-- A comic's layout (migration 0009): NULL = decided on first opening,
+	-- 'pages', 'scroll' (webtoon) or 'rtl' (manga).
+	layout TEXT
 );
 
 -- Tags for feeds. A feed can carry any number of them, and the page filters
