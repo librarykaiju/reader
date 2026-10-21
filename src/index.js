@@ -7,14 +7,17 @@
 // Bindings / settings (Cloudflare dashboard -> this Worker -> Settings):
 //   DB                   D1 database binding -> "reader" (tables: schema.sql)
 //   BOOKS                R2 bucket binding -> "reader-books" (kept private)
-//   READER_TOKEN         secret; any long random string, entered once on the page
+//   READER_TOKEN         secret; any long random string, entered once on the page (the owner)
 //   AI                   Workers AI binding, optional; turns on "Compare coverage" (see Coverage below)
 //   ANTHROPIC_API_KEY    secret, optional; compares with Claude instead, when there's no AI binding
 //   ALLOW_PRIVATE_FETCH  dev only: "1" lets /api/fetch reach localhost and
 //                        private IPs, for local test fixtures. Never in production.
 //
-// Routes (everything under /api/ needs "Authorization: Bearer <READER_TOKEN>"):
+// Routes (everything under /api/ needs "Authorization: Bearer <READER_TOKEN>",
+// except /api/family/, which a family member's sign-in cookie also opens; see
+// "Family library" below):
 //   GET    /                       the app page (no data in it; asks for the token)
+//   GET    /family                 the family library page (signs in from #invite=<code>)
 //   GET    /sw.js                  its service worker: keeps the page for offline use
 //   GET    /fonts/fraunces-soft(-italic).woff2
 //                                  the display and reading typeface (src/fonts/, OFL)
@@ -77,6 +80,15 @@
 //   POST   /api/books/:id/highlights {start_pos, end_pos, text, note?} -> {"highlight"}
 //   PATCH  /api/highlights/:id     {note?, start_pos?, end_pos?} (note null or "" = no note)
 //   DELETE /api/highlights/:id
+//   GET    /api/people             -> {"people": [...each with signed_in, invite_expires_at, last_seen_at, downloads]}
+//   POST   /api/people             {name} -> {"person", "code"}: a new family member and their invite code
+//   POST   /api/people/:id/link    -> {"person", "code"}: a fresh invite code; signs out their devices
+//   DELETE /api/people/:id         removes them (and their download log); their sign-in stops at once
+//   POST   /api/family/redeem      {code} -> {"name"} and the sign-in cookie (no token needed; the code works once)
+//   GET    /api/family/me          -> {"name"} (null for the owner); renews the cookie
+//   GET    /api/family/books       -> {"books": [...each with tags: [names]]}, without any tagged "Hide from family"
+//   GET    /api/family/books/:id/cover   as /api/books/:id/cover
+//   GET    /api/family/books/:id/file    the file as a download named "Title - Author.ext" (logged for a family member)
 //
 // Email (Cloudflare Email Routing -> "Send to a Worker" -> this Worker):
 //   each message sent to the routed address (news@brandonj.ink, say) becomes
@@ -139,14 +151,19 @@ export default {
 	async fetch(request, env) {
 		const url = new URL(request.url);
 		if (url.pathname === "/" && (request.method === "GET" || request.method === "HEAD")) return page();
+		if (url.pathname === "/family" && (request.method === "GET" || request.method === "HEAD")) return familyPage();
 		if (url.pathname === "/sw.js" && request.method === "GET") return serviceWorker();
 		if (url.pathname === "/apple-touch-icon.png" && request.method === "GET") return touchIcon();
 		if (FONTS[url.pathname] && request.method === "GET") return font(FONTS[url.pathname]);
 		if (!url.pathname.startsWith("/api/")) return json({ error: "Not found" }, 404);
 
-		if (!(await authorized(request, env))) return json({ error: "Unauthorized" }, 401);
-
 		try {
+			if (url.pathname === "/api/family/redeem" && request.method === "POST") return await redeemInvite(request, env);
+			const who = await signedIn(request, env);
+			if (!who) return json({ error: "Unauthorized" }, 401);
+			// The role check: a family sign-in reaches the family routes and nothing else.
+			if (url.pathname.startsWith("/api/family/")) return (await familyApi(request, env, url, who)) || json({ error: "Not found" }, 404);
+			if (who.person) return json({ error: "Only the family library is open to this sign-in" }, 403);
 			return (await api(request, env, url)) || json({ error: "Not found" }, 404);
 		} catch (err) {
 			if (err instanceof HttpError) return json({ error: err.message }, err.status);
@@ -159,10 +176,18 @@ export default {
 	},
 };
 
-async function authorized(request, env) {
+// -> {owner: true} for READER_TOKEN, {person} for a family member's cookie, or null.
+async function signedIn(request, env) {
+	if (await isOwner(request, env)) return { owner: true };
+	const person = await familyPerson(request, env);
+	return person ? { person } : null;
+}
+
+async function isOwner(request, env) {
 	if (!env.READER_TOKEN) return false;
 	const header = request.headers.get("Authorization") || "";
 	const given = header.replace(/^Bearer\s+/i, "").trim();
+	if (!given) return false;
 	// Hash both sides so the constant-time compare always sees equal lengths.
 	const enc = new TextEncoder();
 	const [a, b] = await Promise.all([
@@ -254,6 +279,14 @@ async function api(request, env, url) {
 		if (m === "PATCH") return updateHighlight(request, env, id);
 		if (m === "DELETE") return deleteHighlight(env, id);
 	}
+
+	if (p === "/api/people") {
+		if (m === "GET") return listPeople(env);
+		if (m === "POST") return addPerson(request, env);
+	}
+	const link = p.match(/^\/api\/people\/(\d+)\/link$/);
+	if (link && m === "POST") return newInvite(env, toId(link[1]));
+	if ((id = matchId(p, "/api/people/")) && m === "DELETE") return removePerson(env, id);
 	return null;
 }
 
@@ -2596,6 +2629,180 @@ async function deleteHighlight(env, id) {
 }
 
 // ---------------------------------------------------------------------------
+// Family library. Family members browse the Library and download books;
+// nothing else of the owner's (feeds, places, highlights, Edit details) is
+// open to them. Each person has an invite link, /family#invite=<code>: the
+// code works once and runs out after 7 days unused. Opening it trades the
+// code for the person's own token, which the Worker sets as a cookie
+// (HttpOnly, a year, renewed on each visit) rather than leaving it to the
+// page: Safari deletes storage a page's script wrote after 7 days without a
+// visit, and family may come by once a month. Only SHA-256 hashes of codes
+// and tokens are stored. A book tagged "Hide from family" stays out of it.
+
+const FAMILY_COOKIE = "reader_family";
+const INVITE_DAYS = 7;
+const FAMILY_COOKIE_DAYS = 365;
+const HIDE_TAG = "Hide from family";
+
+function randomToken() {
+	return btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32)))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function hashSecret(s) {
+	return sha256Hex(new TextEncoder().encode(s));
+}
+function cookieValue(request, name) {
+	for (const part of (request.headers.get("Cookie") || "").split(";")) {
+		const eq = part.indexOf("=");
+		if (eq > 0 && part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim();
+	}
+	return null;
+}
+function familyCookie(token) {
+	return `${FAMILY_COOKIE}=${token}; Path=/; Max-Age=${FAMILY_COOKIE_DAYS * 86400}; HttpOnly; Secure; SameSite=Lax`;
+}
+
+async function familyPerson(request, env) {
+	const token = cookieValue(request, FAMILY_COOKIE);
+	if (!token || !/^[\w-]{20,100}$/.test(token)) return null;
+	const person = await env.DB.prepare("SELECT id, name, last_seen_at FROM people WHERE token_hash = ?").bind(await hashSecret(token)).first();
+	if (!person) return null;
+	const now = Date.now();
+	if (!person.last_seen_at || now - person.last_seen_at > 5 * 60 * 1000) {
+		await env.DB.prepare("UPDATE people SET last_seen_at = ? WHERE id = ?").bind(now, person.id).run();
+		person.last_seen_at = now;
+	}
+	person.token = token;
+	return person;
+}
+
+async function redeemInvite(request, env) {
+	const code = str((await readJSON(request)).code, 100);
+	if (!code) throw new HttpError(400, "No invite code");
+	const token = randomToken(), now = Date.now();
+	// One statement, so a code can't be used twice even by two devices at once.
+	const person = await env.DB.prepare(
+		`UPDATE people SET token_hash = ?, invite_hash = NULL, invite_expires_at = NULL, last_seen_at = ?
+		WHERE invite_hash = ? AND invite_expires_at > ? RETURNING name`,
+	).bind(await hashSecret(token), now, await hashSecret(code), now).first();
+	if (!person) throw new HttpError(410, "This link has already been used or has run out");
+	const res = json({ name: person.name });
+	res.headers.set("Set-Cookie", familyCookie(token));
+	return res;
+}
+
+async function familyApi(request, env, url, who) {
+	const m = request.method;
+	const p = url.pathname;
+	if (m !== "GET") return null;
+	if (p === "/api/family/me") {
+		const res = json({ name: who.person ? who.person.name : null });
+		if (who.person) res.headers.set("Set-Cookie", familyCookie(who.person.token));
+		return res;
+	}
+	if (p === "/api/family/books") return familyBooks(env);
+	const cover = p.match(/^\/api\/family\/books\/(\d+)\/cover$/);
+	if (cover) {
+		await familyBook(env, toId(cover[1]));
+		return bookCover(env, toId(cover[1]));
+	}
+	const file = p.match(/^\/api\/family\/books\/(\d+)\/file$/);
+	if (file) return familyDownload(env, toId(file[1]), who.person);
+	return null;
+}
+
+const NOT_HIDDEN = `NOT EXISTS (SELECT 1 FROM book_tag_links l JOIN book_tags t ON t.id = l.tag_id
+	WHERE l.book_id = books.id AND t.name = '${HIDE_TAG}' COLLATE NOCASE)`;
+
+async function familyBooks(env) {
+	const { results } = await env.DB.prepare(
+		`SELECT id, title, ${BOOK_TYPE} AS type, size, created_at, author, series, volume, r2_key,
+			(SELECT json_group_array(t.name) FROM book_tag_links l JOIN book_tags t ON t.id = l.tag_id WHERE l.book_id = books.id) AS tags
+		FROM books WHERE ${NOT_HIDDEN} ORDER BY created_at DESC, id DESC`,
+	).all();
+	const covers = await coverStates(env, new Map(results.map((b) => [b.id, b.r2_key])));
+	for (const b of results) {
+		b.tags = JSON.parse(b.tags || "[]");
+		b.cover = covers.get(b.id) || null;
+		delete b.r2_key;
+	}
+	return json({ books: results });
+}
+
+// A hidden book answers as if it weren't there.
+async function familyBook(env, id) {
+	const book = await env.DB.prepare(`SELECT * FROM books WHERE id = ? AND ${NOT_HIDDEN}`).bind(id).first();
+	if (!book) throw new HttpError(404, "No such book");
+	return book;
+}
+
+// "Title - Author.epub", with nothing a file system would refuse.
+function downloadName(book) {
+	const ext = bookType(book);
+	const base = [book.title, book.author].filter(Boolean).join(" - ").replace(/[\\/:*?"<>|\x00-\x1f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 150);
+	return (base || "Book") + "." + ext;
+}
+
+async function familyDownload(env, id, person) {
+	const book = await familyBook(env, id);
+	const obj = await env.BOOKS.get(book.r2_key);
+	if (!obj) throw new HttpError(404, "The file is missing from storage");
+	if (person) await env.DB.prepare("INSERT INTO downloads (person_id, book_id, at) VALUES (?, ?, ?)").bind(person.id, id, Date.now()).run();
+	const name = downloadName(book);
+	return new Response(obj.body, {
+		headers: {
+			"Content-Type": BOOK_TYPES[bookType(book)],
+			"Content-Length": String(obj.size),
+			"Content-Disposition": `attachment; filename="${name.replace(/[^\x20-\x7e]/g, "_").replace(/"/g, "'")}"; filename*=UTF-8''${encodeURIComponent(name)}`,
+			"Cache-Control": "private, no-store",
+			"X-Content-Type-Options": "nosniff",
+			"Content-Security-Policy": "default-src 'none'; sandbox",
+		},
+	});
+}
+
+// The owner's side: the Family screen.
+const PERSON_COLUMNS = `id, name, created_at, last_seen_at, invite_expires_at, token_hash IS NOT NULL AS signed_in,
+	(SELECT COUNT(*) FROM downloads d WHERE d.person_id = people.id) AS downloads`;
+
+async function listPeople(env) {
+	const { results } = await env.DB.prepare(`SELECT ${PERSON_COLUMNS} FROM people ORDER BY name COLLATE NOCASE, id`).all();
+	for (const p of results) p.signed_in = !!p.signed_in;
+	return json({ people: results });
+}
+
+async function personRow(env, id) {
+	const p = await env.DB.prepare(`SELECT ${PERSON_COLUMNS} FROM people WHERE id = ?`).bind(id).first();
+	if (!p) throw new HttpError(404, "No such person");
+	p.signed_in = !!p.signed_in;
+	return p;
+}
+
+async function addPerson(request, env) {
+	const name = str((await readJSON(request)).name, 60);
+	if (!name) throw new HttpError(400, "A name is needed");
+	const code = randomToken(), now = Date.now();
+	const row = await env.DB.prepare("INSERT INTO people (name, invite_hash, invite_expires_at, created_at) VALUES (?, ?, ?, ?) RETURNING id")
+		.bind(name, await hashSecret(code), now + INVITE_DAYS * 86400000, now).first();
+	return json({ person: await personRow(env, row.id), code }, 201);
+}
+
+// A fresh code, for a lost phone or a forwarded link: the old code stops
+// working and so does every device they signed in on.
+async function newInvite(env, id) {
+	const code = randomToken();
+	const { meta } = await env.DB.prepare("UPDATE people SET token_hash = NULL, invite_hash = ?, invite_expires_at = ? WHERE id = ?")
+		.bind(await hashSecret(code), Date.now() + INVITE_DAYS * 86400000, id).run();
+	if (!meta.changes) throw new HttpError(404, "No such person");
+	return json({ person: await personRow(env, id), code });
+}
+
+async function removePerson(env, id) {
+	const { meta } = await env.DB.prepare("DELETE FROM people WHERE id = ?").bind(id).run();
+	if (!meta.changes) throw new HttpError(404, "No such person");
+	return json({ ok: true });
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 
 function matchId(path, prefix) {
@@ -2713,6 +2920,113 @@ function page() {
 		},
 	});
 }
+
+// The family page: a separate small page, so none of the app's code or data
+// reaches family. For now it signs in from the invite link and lists the
+// books with a Download link each; the covers grid, search and welcome page
+// build on it.
+function familyPage() {
+	const nonce = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))));
+	const csp = [
+		"default-src 'none'",
+		`script-src 'nonce-${nonce}'`,
+		`style-src 'nonce-${nonce}'`,
+		"img-src 'self' data:",
+		"font-src 'self'",
+		"connect-src 'self'",
+		"base-uri 'none'",
+		"form-action 'none'",
+		"frame-ancestors 'none'",
+	].join("; ");
+	return new Response(FAMILY_PAGE.replaceAll("__NONCE__", nonce).replaceAll("__ICON__", ICON_URI), {
+		headers: {
+			"Content-Type": "text/html; charset=utf-8",
+			"Content-Security-Policy": csp,
+			// The invite code is in the hash, which is never sent anywhere, but no referrer either way.
+			"Referrer-Policy": "no-referrer",
+			"X-Content-Type-Options": "nosniff",
+			"X-Robots-Tag": "noindex",
+			"Cache-Control": "no-cache",
+		},
+	});
+}
+const FAMILY_PAGE = String.raw`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<meta name="color-scheme" content="light dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Library">
+<link rel="icon" type="image/svg+xml" href="__ICON__">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<title>Library</title>
+<style nonce="__NONCE__">
+	@font-face { font-family: "Fraunces"; src: url(/fonts/fraunces-soft.woff2) format("woff2"); font-weight: 300 700; font-display: swap; }
+	:root { --bg: #fbfaf7; --fg: #1d1c1a; --muted: #6d6a64; --line: #e4e1da; --accent: #2f5fd0;
+		--display: "Fraunces", ui-serif, Georgia, serif; --sans: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", sans-serif; }
+	@media (prefers-color-scheme: dark) { :root { --bg: #141414; --fg: #e7e4de; --muted: #9b978f; --line: #2d2c2a; --accent: #8fb0ff; } }
+	* { box-sizing: border-box; }
+	body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.45 var(--sans); }
+	main { max-width: 720px; margin: 0 auto; padding: 24px 16px max(24px, env(safe-area-inset-bottom)); }
+	h1 { font: 600 28px/1.2 var(--display); margin: 8px 0 16px; }
+	a { color: var(--accent); }
+	.muted { color: var(--muted); }
+	ul { list-style: none; margin: 0; padding: 0; }
+	li { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+	li .t { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+	li .t b { display: block; font: 500 18px/1.25 var(--display); }
+	li a { flex: none; }
+	[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+	<h1 id="head">Library</h1>
+	<p id="note" class="muted">Loading…</p>
+	<ul id="books"></ul>
+</main>
+<script nonce="__NONCE__">
+var $ = function (id) { return document.getElementById(id); };
+function h(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function say(msg) { $("note").textContent = msg; $("note").hidden = !msg; }
+
+async function signIn(code) {
+	var res = await fetch("/api/family/redeem", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: code }) });
+	// The link works once, so the address to keep is the plain one.
+	history.replaceState(null, "", "/family");
+	if (!res.ok) {
+		var d = await res.json().catch(function () { return {}; });
+		throw new Error(res.status === 410 ? "This link has already been used or has run out. If it was meant for you, ask for a new one." : d.error || "Couldn't sign in.");
+	}
+}
+
+async function load() {
+	var invite = /[#&]invite=([\w-]+)/.exec(location.hash);
+	if (invite) await signIn(invite[1]);
+	var res = await fetch("/api/family/me");
+	if (res.status === 401) throw new Error("You're not signed in on this device. Open the link you were sent.");
+	if (!res.ok) throw new Error("Couldn't reach the library.");
+	var me = await res.json();
+	if (me.name) $("head").textContent = "Welcome, " + me.name;
+	var data = await (await fetch("/api/family/books")).json();
+	var list = $("books");
+	(data.books || []).forEach(function (b) {
+		var li = h("li"), t = h("div", "t");
+		t.append(h("b", null, b.title), h("span", "muted", [b.author, b.series ? b.series + (b.volume ? " " + b.volume : "") : null].filter(Boolean).join(" · ")));
+		var a = h("a", null, "Download");
+		a.href = "/api/family/books/" + b.id + "/file";
+		li.append(t, a);
+		list.append(li);
+	});
+	say(list.children.length ? "" : "No books here yet.");
+}
+load().catch(function (e) { say(e.message); });
+</script>
+</body>
+</html>
+`;
 
 // Keeps a copy of the page so it opens with no connection (for downloaded
 // episodes and books). Network first, so a deploy shows up on the next load.
@@ -3133,6 +3447,13 @@ const PAGE = String.raw`<!doctype html>
 	.covers .series .cover::after { transform: translate(8px, -8px); opacity: .7; z-index: -2; }
 	.covers .series .cover > * { border-radius: 5px; overflow: hidden; }
 	.covers .series .cover { isolation: isolate; }
+	.people li { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+	.people .who { flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; }
+	.people .who b { display: block; font: 500 18px/1.25 var(--display); }
+	.people .who span { color: var(--muted); font-size: 14px; }
+	.famlink { border: 1px solid var(--line); background: var(--card); border-radius: 10px; padding: 12px; margin: 12px 0; }
+	.famlink input { margin: 8px 0; font-size: 14px; }
+	.famlink .row { display: flex; gap: 8px; }
 	.libup { display: inline-block; margin: 12px 0 -6px; font-size: 14px; color: var(--accent); text-decoration: none; }
 	.badge { display: inline-block; margin-left: 2px; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; line-height: 1.45;
 		vertical-align: 2px; background: var(--ok-bg); color: var(--ok); white-space: nowrap; }
@@ -3315,6 +3636,7 @@ const PAGE = String.raw`<!doctype html>
 		<button type="button" data-font="serif">System serif</button>
 		<button type="button" data-font="fraunces" class="fraunces">Fraunces</button>
 	</div>
+	<a href="#/family" id="familyLink" class="btn small">Family library</a>
 	<button id="forget" class="btn ghost small" type="button">Forget token on this device</button>
 </div>
 
@@ -3455,6 +3777,18 @@ const PAGE = String.raw`<!doctype html>
 
 <section id="bookView" hidden>
 	<div id="bookBody"></div>
+</section>
+
+<section id="familyView" class="wrap" hidden>
+	<p class="hint">Each person gets their own link. It works once, on the device they open it on, and runs out after 7 days if it isn't used. They can browse the Library and download books; nothing else. Books tagged "Hide from family" stay out of it.</p>
+	<form id="famForm" class="uploadrow">
+		<label class="vh" for="famName">Name</label>
+		<input id="famName" type="text" placeholder="Name" maxlength="60" autocomplete="off" autocapitalize="words">
+		<button id="famMake" class="btn primary" type="submit">Make link</button>
+	</form>
+	<div id="famLink" class="famlink" hidden></div>
+	<ul id="people" class="items people"></ul>
+	<p id="famEmpty" class="empty" hidden>No one yet.</p>
 </section>
 </main>
 <div id="pbar" class="pbar" hidden>
@@ -5053,7 +5387,7 @@ function parseHash() {
 	};
 }
 function showView(name) {
-	["list", "article", "podcasts", "library", "book"].forEach(function (v) { show($(v + "View"), v === name); });
+	["list", "article", "podcasts", "library", "book", "family"].forEach(function (v) { show($(v + "View"), v === name); });
 	var top = name === "list" || name === "podcasts" || name === "library";
 	show($("tabs"), top);
 	show($("back"), !top);
@@ -5088,6 +5422,7 @@ async function route() {
 		if (MEDIA_TABS[r.name]) return await showPodcasts(r);
 		if (r.name === "item" && r.id) return await openItem(r.id);
 		if (r.name === "book" && r.id) return await openBook(r.id);
+		if (r.name === "family") return await showFamily();
 		location.replace("#/unread");
 	} catch (e) { fail(e); }
 }
@@ -5166,6 +5501,83 @@ function renderContinue() {
 	}
 	show(box, !!(ep || b));
 }
+// ---------- family library (the owner's side: who has a link)
+
+async function showFamily() {
+	showView("family");
+	$("heading").textContent = "Family";
+	window.scrollTo(0, 0);
+	show($("famLink"), false);
+	await loadPeople();
+}
+async function loadPeople() {
+	var data = await apiJSON("/api/people");
+	renderPeople(data.people || []);
+}
+function personStatus(p) {
+	var bits = [];
+	if (p.signed_in) bits.push(p.last_seen_at ? "Last on " + ago(p.last_seen_at) : "Signed in");
+	else if (p.invite_expires_at > Date.now()) bits.push("Link not used yet, runs out " + new Date(p.invite_expires_at).toLocaleDateString(undefined, { month: "short", day: "numeric" }));
+	else bits.push("Link ran out");
+	if (p.downloads) bits.push(p.downloads + (p.downloads === 1 ? " download" : " downloads"));
+	return bits.join(" · ");
+}
+function renderPeople(people) {
+	var ul = $("people");
+	ul.textContent = "";
+	people.forEach(function (p) {
+		var li = h("li"), who = h("div", "who");
+		who.append(h("b", null, p.name), h("span", null, personStatus(p)));
+		li.append(who,
+			button("New link", "btn small", function () {
+				if (p.signed_in && !confirm("Make a new link for " + p.name + "? Their old link and every device they're signed in on stop working.")) return;
+				apiJSON("/api/people/" + p.id + "/link", { method: "POST" }).then(function (d) { showInvite(d.person, d.code); return loadPeople(); }).catch(fail);
+			}),
+			button("Remove", "btn small danger", function () {
+				if (!confirm("Remove " + p.name + "? They're signed out at once, and their download history goes too.")) return;
+				apiJSON("/api/people/" + p.id, { method: "DELETE" }).then(function () {
+					if ($("famLink").dataset.person === String(p.id)) show($("famLink"), false);
+					return loadPeople();
+				}).catch(fail);
+			}));
+		ul.append(li);
+	});
+	show($("famEmpty"), !people.length);
+}
+// The link is shown once: only its hash is kept, so "New link" is the way to get another.
+function showInvite(person, code) {
+	var box = $("famLink"), link = location.origin + "/family#invite=" + code;
+	box.textContent = "";
+	box.dataset.person = person.id;
+	var input = h("input");
+	input.type = "text";
+	input.readOnly = true;
+	input.value = link;
+	input.setAttribute("aria-label", "Link for " + person.name);
+	input.addEventListener("focus", function () { input.select(); });
+	var row = h("div", "row");
+	row.append(button("Copy", "btn small", function () {
+		navigator.clipboard.writeText(link).then(function () { toast("Link copied."); }, function () { input.select(); });
+	}));
+	if (navigator.share) row.append(button("Share", "btn small", function () {
+		navigator.share({ title: "Reader library", text: "Here's your link to my library. It works once, on the device you open it on.", url: link }).catch(function () {});
+	}));
+	box.append(h("b", null, "Link for " + person.name), input, row,
+		h("div", "hint", "Send it now; it isn't shown again. It works once and runs out in 7 days."));
+	show(box, true);
+}
+$("famForm").addEventListener("submit", function (e) {
+	e.preventDefault();
+	var name = $("famName").value.trim();
+	if (!name) { $("famName").focus(); return; }
+	$("famMake").disabled = true;
+	apiJSON("/api/people", { method: "POST", json: { name: name } }).then(function (d) {
+		$("famName").value = "";
+		showInvite(d.person, d.code);
+		return loadPeople();
+	}).catch(fail).then(function () { $("famMake").disabled = false; });
+});
+
 function goBack() {
 	if (state.fromList) history.back();
 	else location.hash = state.route && state.route.name === "book" ? "#/library" : state.lastList;
