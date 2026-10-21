@@ -10,6 +10,7 @@
 //   READER_TOKEN         secret; any long random string, entered once on the page (the owner)
 //   AI                   Workers AI binding, optional; turns on "Compare coverage" (see Coverage below)
 //   ANTHROPIC_API_KEY    secret, optional; compares with Claude instead, when there's no AI binding
+//   OWNER_NAME           optional; your name on the family welcome page ("Welcome to Brandon's library")
 //   ALLOW_PRIVATE_FETCH  dev only: "1" lets /api/fetch reach localhost and
 //                        private IPs, for local test fixtures. Never in production.
 //
@@ -85,7 +86,8 @@
 //   POST   /api/people/:id/link    -> {"person", "code"}: a fresh invite code; signs out their devices
 //   DELETE /api/people/:id         removes them (and their download log); their sign-in stops at once
 //   POST   /api/family/redeem      {code} -> {"name"} and the sign-in cookie (no token needed; the code works once)
-//   GET    /api/family/me          -> {"name"} (null for the owner); renews the cookie
+//   GET    /api/people/:id/downloads -> {"downloads": [{at, book_id, title, author}]}, newest first
+//   GET    /api/family/me          -> {"name", "owner"} (name null for the owner; owner from OWNER_NAME); renews the cookie
 //   GET    /api/family/books       -> {"books": [...each with tags: [names]]}, without any tagged "Hide from family"
 //   GET    /api/family/books/:id/cover   as /api/books/:id/cover
 //   GET    /api/family/books/:id/file    the file as a download named "Title - Author.ext" (logged for a family member)
@@ -286,6 +288,8 @@ async function api(request, env, url) {
 	}
 	const link = p.match(/^\/api\/people\/(\d+)\/link$/);
 	if (link && m === "POST") return newInvite(env, toId(link[1]));
+	const dls = p.match(/^\/api\/people\/(\d+)\/downloads$/);
+	if (dls && m === "GET") return listDownloads(env, toId(dls[1]));
 	if ((id = matchId(p, "/api/people/")) && m === "DELETE") return removePerson(env, id);
 	return null;
 }
@@ -2695,7 +2699,7 @@ async function familyApi(request, env, url, who) {
 	const p = url.pathname;
 	if (m !== "GET") return null;
 	if (p === "/api/family/me") {
-		const res = json({ name: who.person ? who.person.name : null });
+		const res = json({ name: who.person ? who.person.name : null, owner: str(env.OWNER_NAME, 60) });
 		if (who.person) res.headers.set("Set-Cookie", familyCookie(who.person.token));
 		return res;
 	}
@@ -2794,6 +2798,16 @@ async function newInvite(env, id) {
 		.bind(await hashSecret(code), Date.now() + INVITE_DAYS * 86400000, id).run();
 	if (!meta.changes) throw new HttpError(404, "No such person");
 	return json({ person: await personRow(env, id), code });
+}
+
+// What someone downloaded, newest first (a book since deleted takes its rows with it).
+async function listDownloads(env, id) {
+	await personRow(env, id);
+	const { results } = await env.DB.prepare(
+		`SELECT d.at, d.book_id, b.title, b.author FROM downloads d JOIN books b ON b.id = d.book_id
+		WHERE d.person_id = ? ORDER BY d.at DESC LIMIT 200`,
+	).bind(id).all();
+	return json({ downloads: results });
 }
 
 async function removePerson(env, id) {
@@ -2922,9 +2936,9 @@ function page() {
 }
 
 // The family page: a separate small page, so none of the app's code or data
-// reaches family. For now it signs in from the invite link and lists the
-// books with a Download link each; the covers grid, search and welcome page
-// build on it.
+// reaches family. It signs in from the invite link, then shows the books as
+// covers (A-Z, a series in volume order) in the Sepia theme, with search and
+// a format filter. Tapping a book downloads it.
 function familyPage() {
 	const nonce = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))));
 	const csp = [
@@ -2956,41 +2970,116 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex">
-<meta name="color-scheme" content="light dark">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#f4ecd8">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Library">
 <link rel="icon" type="image/svg+xml" href="__ICON__">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="preload" href="/fonts/fraunces-soft.woff2" as="font" type="font/woff2" crossorigin>
 <title>Library</title>
 <style nonce="__NONCE__">
 	@font-face { font-family: "Fraunces"; src: url(/fonts/fraunces-soft.woff2) format("woff2"); font-weight: 300 700; font-display: swap; }
-	:root { --bg: #fbfaf7; --fg: #1d1c1a; --muted: #6d6a64; --line: #e4e1da; --accent: #2f5fd0;
-		--display: "Fraunces", ui-serif, Georgia, serif; --sans: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", sans-serif; }
-	@media (prefers-color-scheme: dark) { :root { --bg: #141414; --fg: #e7e4de; --muted: #9b978f; --line: #2d2c2a; --accent: #8fb0ff; } }
+	@font-face { font-family: "Fraunces"; src: url(/fonts/fraunces-soft-italic.woff2) format("woff2"); font-weight: 300 700; font-style: italic; font-display: swap; }
+	/* Always the app's Sepia theme, whatever the device is set to. */
+	:root { --bg: #f4ecd8; --fg: #3b3024; --muted: #7b6c58; --line: #e2d6bb; --card: #f9f2e2; --sel: #eadfc4; --accent: #8a4b14; --on-accent: #fff;
+		--display: "Fraunces", ui-serif, Georgia, serif; --sans: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", sans-serif; color-scheme: light; }
 	* { box-sizing: border-box; }
-	body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.45 var(--sans); }
-	main { max-width: 720px; margin: 0 auto; padding: 24px 16px max(24px, env(safe-area-inset-bottom)); }
-	h1 { font: 600 28px/1.2 var(--display); margin: 8px 0 16px; }
+	html { -webkit-text-size-adjust: 100%; }
+	body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.45 var(--sans); overflow-x: hidden; }
+	main { max-width: 1000px; margin: 0 auto; padding: max(20px, env(safe-area-inset-top)) 16px max(32px, env(safe-area-inset-bottom)); }
+	h1 { font: 600 30px/1.15 var(--display); margin: 4px 0 14px; letter-spacing: -.01em; }
 	a { color: var(--accent); }
-	.muted { color: var(--muted); }
-	ul { list-style: none; margin: 0; padding: 0; }
-	li { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
-	li .t { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-	li .t b { display: block; font: 500 18px/1.25 var(--display); }
-	li a { flex: none; }
+	button, input { font: inherit; color: inherit; }
 	[hidden] { display: none !important; }
+	.vh { position: absolute !important; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+	.muted { color: var(--muted); }
+	input[type=search] { width: 100%; border: 1px solid var(--line); background: var(--card); border-radius: 10px; padding: 9px 12px; font-size: 16px; min-height: 42px; }
+	.formats { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 4px; }
+	.formats button { appearance: none; border: 1px solid var(--line); background: var(--card); border-radius: 999px; padding: 5px 12px; min-height: 34px; font-size: 14px; cursor: pointer; }
+	.formats button[aria-pressed=true] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+	.count { font-size: 14px; margin: 8px 0 0; }
+	.covers { list-style: none; margin: 14px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 22px 14px; }
+	.covers a { display: flex; flex-direction: column; gap: 3px; color: inherit; text-decoration: none; min-width: 0; }
+	.cover { position: relative; aspect-ratio: 2 / 3; border-radius: 5px; overflow: hidden; background: var(--sel); box-shadow: 0 1px 4px rgba(0,0,0,.22); margin-bottom: 5px; }
+	.cover img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; }
+	.gencover { position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: center; gap: 10px; padding: 16% 12%; text-align: center;
+		color: #fbf7ee; font-family: var(--display); outline: 1px solid rgba(255,255,255,.35); outline-offset: -7px;
+		background-image: linear-gradient(90deg, rgba(0,0,0,.28), rgba(0,0,0,0) 7%, rgba(255,255,255,.06) 9%, rgba(0,0,0,0) 12%); }
+	.gencover .gt { font-weight: 600; font-size: 15px; line-height: 1.2; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 6; overflow: hidden; }
+	.gencover .ga { font-size: 12px; font-style: italic; opacity: .85; overflow-wrap: anywhere; }
+	.ct { font: 600 15px/1.25 var(--display); overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+	.ca { font-size: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+	.dl { font-size: 13px; color: var(--accent); font-weight: 600; }
+	.empty { color: var(--muted); padding: 24px 0; text-align: center; }
+	.filters { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 10px 0 4px; }
+	.filters .formats { margin: 0; }
+	select { border: 1px solid var(--line); background: var(--card); border-radius: 999px; min-height: 34px; padding: 4px 10px; font-size: 14px; max-width: 100%; }
+	.up { display: inline-block; margin: 6px 0 0; font-size: 15px; text-decoration: none; }
+	/* A series: one cover with the rest of the volumes stacked behind it. */
+	.series .cover { overflow: visible; isolation: isolate; }
+	.series .cover::before, .series .cover::after { content: ""; position: absolute; inset: 0; border-radius: 5px; background: var(--line);
+		box-shadow: 0 1px 3px rgba(0,0,0,.18); transform: translate(4px, -4px); z-index: -1; }
+	.series .cover::after { transform: translate(8px, -8px); opacity: .7; z-index: -2; }
+	.series .cover > * { border-radius: 5px; overflow: hidden; }
+	.welcome { max-width: 520px; margin: 0 auto; }
+	.welcome p { margin: 0 0 14px; }
+	.welcome h2 { font: 600 20px/1.25 var(--display); margin: 22px 0 8px; }
+	.addr { font: 600 17px/1.3 var(--sans); background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; overflow-wrap: anywhere; user-select: all; -webkit-user-select: all; }
+	.how { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin: 10px 0; }
+	details { margin: 6px 0 14px; color: var(--muted); font-size: 15px; }
+	details p { margin: 8px 0 0; }
+	summary { cursor: pointer; color: var(--accent); }
+	.go { appearance: none; width: 100%; border: 0; border-radius: 10px; background: var(--accent); color: var(--on-accent); font-weight: 600; font-size: 17px; min-height: 48px; margin-top: 10px; cursor: pointer; }
+	footer { margin-top: 36px; padding-top: 14px; border-top: 1px solid var(--line); font-size: 14px; text-align: center; }
 </style>
 </head>
 <body>
 <main>
 	<h1 id="head">Library</h1>
 	<p id="note" class="muted">Loading…</p>
-	<ul id="books"></ul>
+	<section id="welcome" class="welcome" hidden>
+		<p id="wIntro">Browse, then download any book to read in Apple Books or your favorite app. They're yours to keep.</p>
+		<h2>Save this page so you can come back for new books</h2>
+		<p>The address to keep:</p>
+		<div id="wAddr" class="addr"></div>
+		<div id="wHow" class="how"></div>
+		<details><summary>Other devices</summary><div id="wOther"></div></details>
+		<p id="wOwner" class="muted"></p>
+		<button id="wGo" class="go" type="button">Go to the library</button>
+	</section>
+	<div id="lib" hidden>
+		<div id="tools">
+			<label class="vh" for="q">Search</label>
+			<input id="q" type="search" placeholder="Search title, author, series" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="search">
+			<div class="filters">
+				<div id="formats" class="formats" role="group" aria-label="Format"></div>
+				<label class="vh" for="tag">Tag</label>
+				<select id="tag"></select>
+			</div>
+		</div>
+		<a id="up" class="up" href="/family" hidden>‹ All books</a>
+		<p id="count" class="count muted"></p>
+		<ul id="books" class="covers"></ul>
+		<p id="none" class="empty" hidden>Nothing matches.</p>
+		<footer><a id="howLink" href="#">How to save this page</a></footer>
+	</div>
 </main>
 <script nonce="__NONCE__">
 var $ = function (id) { return document.getElementById(id); };
 function h(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
 function say(msg) { $("note").textContent = msg; $("note").hidden = !msg; }
+var FORMATS = { epub: "EPUB", pdf: "PDF", cbz: "Comics", txt: "Text" };
+var KIND = { epub: "EPUB", pdf: "PDF", cbz: "Comic", txt: "Text" };
+var COLORS = ["#7a3b2e", "#2f4f6f", "#3d5a3a", "#5b3f6e", "#8a6a1f", "#1f5e5e", "#6b2f45", "#4a4f63", "#7b4a1c", "#35524a"];
+var books = [], format = "", query = "", tag = "", me = {};
+// Showing one series' volumes: the address carries it (#series=Name) so Back returns to all books.
+function openSeries() { var m = /^#series=(.+)$/.exec(location.hash); return m ? decodeURIComponent(m[1]) : null; }
+function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+function read(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+
+function bytes(n) { return n < 1048576 ? Math.max(1, Math.round(n / 1024)) + " KB" : (n / 1048576).toFixed(n < 10485760 ? 1 : 0) + " MB"; }
+function fold(s) { return String(s || "").normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase(); }
 
 async function signIn(code) {
 	var res = await fetch("/api/family/redeem", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: code }) });
@@ -3002,26 +3091,156 @@ async function signIn(code) {
 	}
 }
 
+function drawnCover(b) {
+	var n = 0, key = (b.title || "") + (b.author || "");
+	for (var i = 0; i < key.length; i++) n = (n * 31 + key.charCodeAt(i)) >>> 0;
+	var g = h("div", "gencover");
+	g.style.backgroundColor = COLORS[n % COLORS.length];
+	g.setAttribute("aria-hidden", "true");
+	g.append(h("span", "gt", b.title));
+	if (b.author) g.append(h("span", "ga", b.author));
+	return g;
+}
+// The drawn cover sits underneath; a real one covers it once it loads.
+function card(b) {
+	var li = h("li"), a = h("a"), cov = h("div", "cover");
+	a.href = "/api/family/books/" + b.id + "/file";
+	a.setAttribute("aria-label", "Download " + b.title + (b.author ? " by " + b.author : "") + ", " + KIND[b.type]);
+	cov.append(drawnCover(b));
+	if (b.cover === "yes" || (b.cover !== "none" && (b.type === "epub" || b.type === "cbz"))) {
+		var img = h("img");
+		img.alt = "";
+		img.loading = "lazy";
+		img.decoding = "async";
+		img.addEventListener("error", function () { img.remove(); });
+		img.src = "/api/family/books/" + b.id + "/cover";
+		cov.append(img);
+	}
+	var by = [b.author, b.series ? b.series + (b.volume ? " " + b.volume : "") : null].filter(Boolean).join(" · ");
+	a.append(cov, h("span", "ct", b.title));
+	if (by) a.append(h("span", "ca", by));
+	a.append(h("span", "dl", "⤓ " + KIND[b.type] + " · " + bytes(b.size)));
+	li.append(a);
+	return li;
+}
+
+function renderFormats() {
+	var box = $("formats"), have = {};
+	books.forEach(function (b) { have[b.type] = (have[b.type] || 0) + 1; });
+	var kinds = Object.keys(FORMATS).filter(function (k) { return have[k]; });
+	box.textContent = "";
+	box.hidden = kinds.length < 2;
+	[""].concat(kinds).forEach(function (k) {
+		var btn = h("button", null, k ? FORMATS[k] : "All");
+		btn.type = "button";
+		btn.setAttribute("aria-pressed", String(k === format));
+		btn.addEventListener("click", function () { format = k; renderFormats(); render(); });
+		box.append(btn);
+	});
+}
+function seriesCard(name, vols) {
+	var li = h("li", "series"), a = h("a"), first = card(vols[0]).querySelector(".cover");
+	a.href = "#series=" + encodeURIComponent(name);
+	a.setAttribute("aria-label", name + ", series of " + vols.length);
+	a.append(first, h("span", "ct", name), h("span", "ca", vols.length + " books"));
+	li.append(a);
+	return li;
+}
+function renderTags() {
+	var sel = $("tag"), names = {};
+	books.forEach(function (b) { b.tags.forEach(function (t) { names[t] = 1; }); });
+	var list = Object.keys(names).sort(function (a, b) { return fold(a).localeCompare(fold(b)); });
+	sel.textContent = "";
+	var all = h("option", null, "All tags");
+	all.value = "";
+	sel.append(all);
+	list.forEach(function (t) { var o = h("option", null, t); o.value = t; sel.append(o); });
+	sel.value = tag;
+	sel.hidden = !list.length;
+}
+function render() {
+	var series = openSeries(), words = fold(query).split(/\s+/).filter(Boolean);
+	var shown = books.filter(function (b) {
+		if (series != null && b.series !== series) return false;
+		if (format && b.type !== format) return false;
+		if (tag && b.tags.indexOf(tag) < 0) return false;
+		var text = fold([b.title, b.author, b.series].join(" "));
+		return words.every(function (w) { return text.indexOf(w) >= 0; });
+	});
+	var ul = $("books");
+	ul.textContent = "";
+	$("up").hidden = series == null;
+	if ($("welcome").hidden) $("head").textContent = series != null ? series : me.name ? "Welcome, " + me.name : "Library";
+	// Browsing (no search, not inside a series): a series is one cover that opens to its volumes.
+	var group = series == null && !words.length, seen = {};
+	shown.forEach(function (b) {
+		if (group && b.series) {
+			if (seen[b.series]) return;
+			var vols = shown.filter(function (x) { return x.series === b.series; });
+			seen[b.series] = 1;
+			if (vols.length > 1) { ul.append(seriesCard(b.series, vols)); return; }
+		}
+		ul.append(card(b));
+	});
+	$("none").hidden = shown.length > 0;
+	$("count").textContent = series != null ? shown.length + (shown.length === 1 ? " volume" : " volumes")
+		: shown.length === books.length ? books.length + (books.length === 1 ? " book" : " books") : shown.length + " of " + books.length;
+}
+
 async function load() {
 	var invite = /[#&]invite=([\w-]+)/.exec(location.hash);
 	if (invite) await signIn(invite[1]);
 	var res = await fetch("/api/family/me");
 	if (res.status === 401) throw new Error("You're not signed in on this device. Open the link you were sent.");
 	if (!res.ok) throw new Error("Couldn't reach the library.");
-	var me = await res.json();
-	if (me.name) $("head").textContent = "Welcome, " + me.name;
+	me = await res.json();
+	if (invite || !read("familyWelcomed")) welcome(true);
 	var data = await (await fetch("/api/family/books")).json();
-	var list = $("books");
-	(data.books || []).forEach(function (b) {
-		var li = h("li"), t = h("div", "t");
-		t.append(h("b", null, b.title), h("span", "muted", [b.author, b.series ? b.series + (b.volume ? " " + b.volume : "") : null].filter(Boolean).join(" · ")));
-		var a = h("a", null, "Download");
-		a.href = "/api/family/books/" + b.id + "/file";
-		li.append(t, a);
-		list.append(li);
+	books = (data.books || []).slice().sort(function (a, b) {
+		return fold(a.series || a.title).localeCompare(fold(b.series || b.title)) || (parseFloat(a.volume) || 0) - (parseFloat(b.volume) || 0) || fold(a.title).localeCompare(fold(b.title));
 	});
-	say(list.children.length ? "" : "No books here yet.");
+	say("");
+	if ($("welcome").hidden) $("lib").hidden = false;
+	if (!books.length) $("tools").hidden = true;
+	renderFormats();
+	renderTags();
+	render();
+	if (!books.length) $("none").textContent = "No books here yet.";
 }
+$("q").addEventListener("input", function () { query = this.value; render(); });
+$("tag").addEventListener("change", function () { tag = this.value; render(); });
+window.addEventListener("hashchange", function () { render(); window.scrollTo(0, 0); });
+
+// The first time on a device: how to keep the page. The invite link works
+// only once, so the plain address is the one worth bookmarking.
+var DEVICES = {
+	ios: "<b>iPhone or iPad:</b> tap Share (the square with the arrow), then <b>Add to Home Screen</b>, or <b>Add Bookmark</b>.",
+	android: "<b>Android:</b> in Chrome, tap the ⋮ menu, then <b>Add to Home screen</b>, or the ☆ to bookmark it.",
+	mac: "<b>Mac:</b> press <b>⌘D</b> to bookmark this page.",
+	pc: "<b>Windows or other computers:</b> press <b>Ctrl+D</b> to bookmark this page."
+};
+function device() {
+	var ua = navigator.userAgent;
+	if (/iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1)) return "ios";
+	if (/Android/.test(ua)) return "android";
+	return /Macintosh/.test(ua) ? "mac" : "pc";
+}
+function welcome(on) {
+	$("welcome").hidden = !on;
+	$("lib").hidden = on;
+	if (!on) { render(); return; }
+	var mine = device();
+	$("head").textContent = (me.owner ? "Welcome to " + me.owner + "'s library" : "Welcome to the library") + (me.name ? ", " + me.name + "." : ".");
+	$("wAddr").textContent = location.host + "/family";
+	$("wHow").innerHTML = DEVICES[mine];
+	var other = $("wOther");
+	other.textContent = "";
+	Object.keys(DEVICES).forEach(function (k) { if (k !== mine) { var p = h("p"); p.innerHTML = DEVICES[k]; other.append(p); } });
+	$("wOwner").textContent = "This link is just for you. If you get a new phone or lose access, ask " + (me.owner ? me.owner + " " : "") + "for a new one.";
+	window.scrollTo(0, 0);
+}
+$("wGo").addEventListener("click", function () { store("familyWelcomed", "1"); welcome(false); });
+$("howLink").addEventListener("click", function (e) { e.preventDefault(); welcome(true); });
 load().catch(function (e) { say(e.message); });
 </script>
 </body>
@@ -3451,6 +3670,10 @@ const PAGE = String.raw`<!doctype html>
 	.people .who { flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; }
 	.people .who b { display: block; font: 500 18px/1.25 var(--display); }
 	.people .who span { color: var(--muted); font-size: 14px; }
+	.people .acts { display: flex; gap: 8px; flex: none; }
+	.people .dlbtn { padding: 0; min-height: 28px; font-size: 14px; }
+	.people .dlog { flex-basis: 100%; list-style: none; margin: 0; padding: 0 0 0 10px; border-left: 2px solid var(--line); font-size: 14px; }
+	.people .dlog li { padding: 3px 0; overflow-wrap: anywhere; }
 	.famlink { border: 1px solid var(--line); background: var(--card); border-radius: 10px; padding: 12px; margin: 12px 0; }
 	.famlink input { margin: 8px 0; font-size: 14px; }
 	.famlink .row { display: flex; gap: 8px; }
@@ -5519,7 +5742,6 @@ function personStatus(p) {
 	if (p.signed_in) bits.push(p.last_seen_at ? "Last on " + ago(p.last_seen_at) : "Signed in");
 	else if (p.invite_expires_at > Date.now()) bits.push("Link not used yet, runs out " + new Date(p.invite_expires_at).toLocaleDateString(undefined, { month: "short", day: "numeric" }));
 	else bits.push("Link ran out");
-	if (p.downloads) bits.push(p.downloads + (p.downloads === 1 ? " download" : " downloads"));
 	return bits.join(" · ");
 }
 function renderPeople(people) {
@@ -5528,7 +5750,22 @@ function renderPeople(people) {
 	people.forEach(function (p) {
 		var li = h("li"), who = h("div", "who");
 		who.append(h("b", null, p.name), h("span", null, personStatus(p)));
-		li.append(who,
+		var log = h("ul", "dlog");
+		log.hidden = true;
+		if (p.downloads) who.append(h("br"), button(p.downloads + (p.downloads === 1 ? " download" : " downloads") + " ›", "btn ghost small dlbtn", function () {
+			if (!log.hidden) { log.hidden = true; return; }
+			apiJSON("/api/people/" + p.id + "/downloads").then(function (d) {
+				log.textContent = "";
+				d.downloads.forEach(function (x) {
+					var row = h("li");
+					row.append(h("span", "dt", x.title), h("span", "muted", " " + [x.author, ago(x.at)].filter(Boolean).join(" · ")));
+					log.append(row);
+				});
+				log.hidden = false;
+			}).catch(fail);
+		}));
+		var acts = h("div", "acts");
+		acts.append(
 			button("New link", "btn small", function () {
 				if (p.signed_in && !confirm("Make a new link for " + p.name + "? Their old link and every device they're signed in on stop working.")) return;
 				apiJSON("/api/people/" + p.id + "/link", { method: "POST" }).then(function (d) { showInvite(d.person, d.code); return loadPeople(); }).catch(fail);
@@ -5540,6 +5777,7 @@ function renderPeople(people) {
 					return loadPeople();
 				}).catch(fail);
 			}));
+		li.append(who, acts, log);
 		ul.append(li);
 	});
 	show($("famEmpty"), !people.length);
