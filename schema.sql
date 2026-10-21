@@ -166,3 +166,28 @@ CREATE TABLE IF NOT EXISTS coverage (
 );
 
 CREATE INDEX IF NOT EXISTS coverage_by_item ON coverage (item_id);
+
+-- The family library (migration 0010). A family member signs in with their
+-- own token, kept in a cookie, and reaches only /api/family/. They start with
+-- a single-use invite code (7 days); only hashes of the code and the token
+-- are stored. token_hash NULL = not signed in anywhere (link not used yet, or
+-- "New link" signed their devices out).
+CREATE TABLE IF NOT EXISTS people (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	name TEXT NOT NULL,
+	token_hash TEXT UNIQUE,
+	invite_hash TEXT UNIQUE,
+	invite_expires_at INTEGER,
+	created_at INTEGER NOT NULL,
+	last_seen_at INTEGER
+);
+
+-- Each download a family member made.
+CREATE TABLE IF NOT EXISTS downloads (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	person_id INTEGER NOT NULL REFERENCES people (id) ON DELETE CASCADE,
+	book_id INTEGER NOT NULL REFERENCES books (id) ON DELETE CASCADE,
+	at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS downloads_by_person ON downloads (person_id, at DESC);

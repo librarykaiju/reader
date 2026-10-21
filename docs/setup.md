@@ -176,6 +176,7 @@ npx wrangler d1 execute reader --remote --file migrations/0006_stories.sql
 npx wrangler d1 execute reader --remote --file migrations/0007_highlights.sql
 npx wrangler d1 execute reader --remote --file migrations/0008_coverage.sql
 npx wrangler d1 execute reader --remote --file migrations/0009_comic_layout.sql
+npx wrangler d1 execute reader --remote --file migrations/0010_family.sql
 npx wrangler deploy
 ```
 
@@ -267,6 +268,11 @@ A migration that already ran stops with an error such as "duplicate column name"
 - **Edit** on the feed list shows every tag under each feed: tap one to put it on or take it off. **+ Tag** makes a new tag and puts it on that feed. **New tag** at the bottom makes one without using it yet.
 - To rename or delete a tag, pick it above the list while in **Edit**. Deleting a tag only takes it off its feeds.
 - The menu next to **Add** puts one tag on a new feed. It starts on the tag you're looking at.
+
+**Family library** (update with migration 0010)
+- **Aa** → **Family library**. Type a name → **Make link**, then **Copy** or **Share** it to them. The link works once: opening it signs that browser in (a cookie that lasts a year and renews on each visit) and changes the address to the plain `reader.brandonj.ink/family`, which is the one to bookmark. An unused link runs out after 7 days.
+- A family member can browse the Library and download books, saved as `Title - Author.epub`. Nothing else is open to them: no feeds, places, highlights, Edit details, uploads or deletes. Put the tag **Hide from family** on any book to keep it out of their view.
+- **New link** makes a fresh link and signs them out everywhere (a lost phone, a forwarded link). **Remove** cuts them off at once. Links are shown only when made, since only a scrambled copy is stored; if one gets lost, make a new one.
 
 **Display:** **Aa** switches the theme and text size, remembered per device. **Auto** follows the phone's light or dark setting. In Dark and Sepia, PDF pages are re-tinted to match.
 
