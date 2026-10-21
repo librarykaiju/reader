@@ -271,7 +271,9 @@ A migration that already ran stops with an error such as "duplicate column name"
 
 **Family library** (update with migration 0010)
 - **Aa** → **Family library**. Type a name → **Make link**, then **Copy** or **Share** it to them. The link works once: opening it signs that browser in (a cookie that lasts a year and renews on each visit) and changes the address to the plain `reader.brandonj.ink/family`, which is the one to bookmark. An unused link runs out after 7 days.
-- A family member can browse the Library and download books, saved as `Title - Author.epub`. Nothing else is open to them: no feeds, places, highlights, Edit details, uploads or deletes. Put the tag **Hide from family** on any book to keep it out of their view.
+- The first time someone opens their link they get a welcome page: the plain address to keep and how to save it on their device (Home Screen or bookmark), then **Go to the library**. It's there again from **How to save this page** at the bottom. Set your name for it with `OWNER_NAME` in `wrangler.toml`.
+- Their page is always in the Sepia colors: covers (a series is one cover that opens to its volumes), search by title, author or series, and filters for format (EPUB, PDF, Comics, Text) and tag. Tapping a book downloads it, saved as `Title - Author.epub`. Nothing else is open to them: no feeds, places, highlights, Edit details, uploads or deletes. Put the tag **Hide from family** on any book to keep it out of their view.
+- On the Family screen, **N downloads ›** under a person lists what they downloaded and when.
 - **New link** makes a fresh link and signs them out everywhere (a lost phone, a forwarded link). **Remove** cuts them off at once. Links are shown only when made, since only a scrambled copy is stored; if one gets lost, make a new one.
 
 **Display:** **Aa** switches the theme and text size, remembered per device. **Auto** follows the phone's light or dark setting. In Dark and Sepia, PDF pages are re-tinted to match.

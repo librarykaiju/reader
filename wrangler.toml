@@ -20,6 +20,11 @@ database_id = "0001e946-d815-406b-8d8e-b8863b8dc2db"
 binding = "BOOKS"
 bucket_name = "reader-books"
 
+# Your name, on the family library's welcome page ("Welcome to Brandon's
+# library"). Leave it out and the page just says "the library".
+[vars]
+OWNER_NAME = "Brandon"
+
 # Workers AI, for "Compare coverage" (docs/setup.md, Part 7). In the
 # dashboard: Settings -> Bindings -> Add binding -> Workers AI, name AI.
 [ai]
