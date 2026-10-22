@@ -3591,7 +3591,7 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 				<p id="rBlurbNote" class="note" hidden></p>
 			</section>
 			<section id="rAppealSec" class="rsec" hidden>
-				<h2>Appeal</h2>
+				<h2>Appeal factors</h2>
 				<dl id="rAppeal" class="appeal"></dl>
 				<p id="rAppealNote" class="note" hidden></p>
 			</section>
