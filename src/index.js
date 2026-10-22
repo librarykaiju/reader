@@ -3318,18 +3318,63 @@ var ART = {
 		+ '<path d="M34 52c6-4 12 3 20-2" fill="none" stroke="' + GOLD + '" stroke-width="2" stroke-linecap="round"/>'],
 	book: ["#2f4f6f", '<path d="M40 18c-6-5-15-6-22-4v32c7-2 16-1 22 4 6-5 15-6 22-4V14c-7-2-16-1-22 4z" fill="' + INK + '"/>'
 		+ '<path d="M40 18v32" stroke="#2f4f6f" stroke-width="1.5"/><g stroke="#2f4f6f" stroke-width="1" opacity=".5"><path d="M23 22c4-1 9 0 13 2M23 28c4-1 9 0 13 2M44 24c4-2 9-3 13-2M44 30c4-2 9-3 13-2"/></g>'
-		+ '<path d="M53 12v12l3-2 3 2V12" fill="' + EMBER + '"/>']
+		+ '<path d="M53 12v12l3-2 3 2V12" fill="' + EMBER + '"/>'],
+	horror: ["#2b2a33", '<circle cx="58" cy="17" r="10" fill="' + GOLD + '"/><g fill="#2b2a33"><path d="M50 13l3-2 1.5 1.5L56 11l3 2-2 .3-1 1.5-1.5-.8-1.5.8-1-1.5z"/></g>'
+		+ '<g fill="' + INK + '" opacity=".75"><path d="M10 18l4-3 2 1.6 2-1.6 4 3-2.4.2-1 1.8-2.6-1-2.6 1-1-1.8z"/><path d="M22 9l3-2 1.4 1.2L27.8 7l3 2-1.8.2-.8 1.3-1.8-.7-1.8.7-.8-1.3z"/></g>'
+		+ '<path d="M28 52V31a11 11 0 0 1 22 0v21l-3.7-3-3.6 3-3.7-3-3.7 3-3.6-3z" fill="' + INK + '"/>'
+		+ '<g fill="#2b2a33"><ellipse cx="34.5" cy="31" rx="2.2" ry="3.2"/><ellipse cx="43.5" cy="31" rx="2.2" ry="3.2"/><ellipse cx="39" cy="40" rx="2.4" ry="3"/></g>'],
+	ya: ["#7a3b2e", '<path d="M10 46c10 2 16-6 26-4" fill="none" stroke="' + INK + '" stroke-width="1.8" stroke-dasharray="3 3" stroke-linecap="round" opacity=".7"/>'
+		+ '<path d="M30 36L66 14 50 46 43 38z" fill="' + INK + '"/><path d="M43 38l23-24-19 28z" fill="#000" opacity=".18"/><path d="M43 38v8l4-4" fill="' + INK + '"/>'
+		+ '<circle cx="18" cy="16" r="5" fill="' + GOLD + '"/>'],
+	kids: ["#3b6d8f", '<g font-family="ui-rounded, system-ui, sans-serif" font-weight="800" font-size="13" text-anchor="middle" fill="#3b3024">'
+		+ '<rect x="16" y="34" width="18" height="18" rx="2" fill="' + GOLD + '"/><text x="25" y="48">A</text>'
+		+ '<rect x="36" y="34" width="18" height="18" rx="2" fill="' + EMBER + '"/><text x="45" y="48">B</text>'
+		+ '<rect x="26" y="15" width="18" height="18" rx="2" fill="' + INK + '" transform="rotate(-8 35 24)"/><text x="35" y="29" transform="rotate(-8 35 24)">C</text></g>'
+		+ '<path d="M58 22l1.5 3.5 3.5 1.5-3.5 1.5L58 32l-1.5-3.5L53 27l3.5-1.5z" fill="' + GOLD + '"/>'],
+	palette: ["#8a4b5e", '<path d="M40 12c-15 0-26 9-26 19 0 9 8 15 16 13 4-1 4-6 8-6 3 0 3 4 7 4 9 0 17-5 17-13 0-10-10-17-22-17z" fill="' + INK + '"/>'
+		+ '<circle cx="31" cy="37" r="3.6" fill="#8a4b5e"/><circle cx="27" cy="26" r="3.4" fill="#c8322c"/><circle cx="36" cy="19" r="3.4" fill="' + GOLD + '"/>'
+		+ '<circle cx="47" cy="20" r="3.4" fill="#5f9e8f"/><circle cx="54" cy="29" r="3.4" fill="#3b6d8f"/>'
+		+ '<path d="M66 8L50 36" stroke="' + EMBER + '" stroke-width="3" stroke-linecap="round"/><path d="M50 36l-3 6 5-3z" fill="#3b3024"/>'],
+	smile: ["#2f6b4f", '<circle cx="40" cy="30" r="19" fill="' + GOLD + '"/><g fill="none" stroke="#3b3024" stroke-width="2.6" stroke-linecap="round"><path d="M30 25q3-4 6 0M44 25q3-4 6 0"/></g>'
+		+ '<path d="M29 33h22c0 7-5 11-11 11s-11-4-11-11z" fill="#3b3024"/><path d="M34 40c3-2 9-2 12 0-2 2.5-10 2.5-12 0z" fill="' + EMBER + '"/>'
+		+ '<g fill="' + INK + '" opacity=".75"><path d="M12 14l2 3 3 2-3 2-2 3-2-3-3-2 3-2zM66 40l1.5 2.5 2.5 1.5-2.5 1.5-1.5 2.5-1.5-2.5-2.5-1.5 2.5-1.5z"/></g>'],
+	summit: ["#4a5f7a", '<circle cx="18" cy="16" r="6" fill="' + GOLD + '"/><path d="M4 52l22-24 10 10 12-20 28 34z" fill="' + INK + '" opacity=".45"/>'
+		+ '<path d="M18 52l26-36 22 36z" fill="' + INK + '"/><path d="M44 16l-6 8 3-1 3 3 3-3 3 1z" fill="#4a5f7a" opacity=".35"/>'
+		+ '<path d="M44 16V5" stroke="#3b3024" stroke-width="1.6"/><path d="M44 5l9 3-9 3z" fill="' + EMBER + '"/>'],
+	bolt: ["#3c3f6e", '<path d="M22 30a8 8 0 0 1 2-15.6A12 12 0 0 1 46 11a9 9 0 0 1 14 7 7 7 0 0 1-2 12z" fill="' + INK + '"/>'
+		+ '<path d="M42 30l-10 13h8l-5 13 15-18h-8l5-8z" fill="' + GOLD + '"/>'
+		+ '<g stroke="' + GOLD + '" stroke-width="1.6" stroke-linecap="round" opacity=".7"><path d="M24 40l-4 4M58 38l4 3"/></g>']
 };
+// A laurel wreath for nonfiction Classics: two arcs of leaves.
+ART.laurel = ["#6b5a2e", (function () {
+	var out = "";
+	for (var i = 0; i < 6; i++) {
+		var deg = 112 + i * 24, r = deg * Math.PI / 180, dx = Math.cos(r) * 18, y = (30 + Math.sin(r) * 18).toFixed(1);
+		[[40 + dx, deg + 25], [40 - dx, 180 - deg - 25]].forEach(function (l) {
+			var x = l[0].toFixed(1);
+			out += '<ellipse cx="' + x + '" cy="' + y + '" rx="2.4" ry="5.4" fill="' + (i % 2 ? GOLD : INK) + '" transform="rotate(' + l[1] + " " + x + " " + y + ')"/>';
+		});
+	}
+	return out + '<path d="M33 51l7-4 7 4" fill="none" stroke="' + EMBER + '" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>'
+		+ '<path d="M40 22l2.4 5 5.4.6-4 3.7 1.1 5.3-4.9-2.7-4.9 2.7 1.1-5.3-4-3.7 5.4-.6z" fill="' + INK + '"/>';
+})()];
 var FICTION = [
 	["Classics", /\bclassic/, "classics"],
 	["Westerns", /\bwestern/, "westerns"],
 	["Mysteries", /\bmyster|\bdetective/, "mysteries"],
 	["Fantasy", /fantasy/, "fantasy"],
-	["Science Fiction", /science fiction|\bsci ?-?fi\b|^sf$/, "scifi"]
+	["Science Fiction", /science fiction|\bsci ?-?fi\b|^sf$/, "scifi"],
+	["Horror", /horror/, "horror"],
+	["Young Adult", /young adult|\bya\b|\bteen/, "ya"],
+	["Kid Lit", /children|\bkids?\b/, "kids"]
 ];
-// Which drawing a nonfiction tag gets; anything else is an open book.
+// Which drawing a nonfiction tag gets. No two cards share one: a tag whose
+// drawing is taken, or that matches none, gets the next spare.
 var FACT_ART = [[/histor|\bwar\b/, "history"], [/biograph|memoir|\blives\b/, "people"], [/philosoph/, "philosophy"],
-	[/religio|theolog|bible|spiritual/, "religion"], [/scien|physics|biolog|chemis|astronom|math|nature/, "science"], [/poe/, "poetry"]];
+	[/religio|theolog|bible|spiritual/, "religion"], [/scien|physics|biolog|chemis|astronom|math|nature/, "science"], [/poe/, "poetry"],
+	[/classic/, "laurel"], [/creativ|drawing|\bart\b|design/, "palette"], [/humou?r|comedy/, "smile"],
+	[/personal|self|develop|productiv|success/, "summit"], [/myth|folklore|legend/, "bolt"]];
+var SPARE_ART = ["book", "summit", "palette", "bolt", "laurel", "smile", "science", "history", "people", "philosophy", "religion", "poetry"];
 var NONFIC = /^non-?fiction$/;
 var pick = null, anyRecs = false;
 function svgArt(key) {
@@ -3351,7 +3396,7 @@ function genreButton(g) {
 	return btn;
 }
 function renderRecs() {
-	var fic = [], non = [], counts = {};
+	var fic = [], non = [], counts = {}, used = {};
 	FICTION.forEach(function (f) {
 		var test = function (b) { return b.tags.some(function (t) { return f[1].test(fold(t)); }); };
 		var n = books.filter(test).length;
@@ -3364,9 +3409,14 @@ function renderRecs() {
 		if (!b.tags.some(function (t) { return NONFIC.test(fold(t)); })) return;
 		b.tags.forEach(function (t) { if (!NONFIC.test(fold(t)) && everywhere[t] < books.length) counts[t] = (counts[t] || 0) + 1; });
 	});
-	Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a] || fold(a).localeCompare(fold(b)); }).forEach(function (t) {
-		var art = "book";
-		FACT_ART.some(function (r) { if (r[0].test(fold(t))) { art = r[1]; return true; } return false; });
+	var tags = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a] || fold(a).localeCompare(fold(b)); }), arts = {};
+	// Tags with their own drawing first, so a spare never takes one of those.
+	tags.forEach(function (t) {
+		FACT_ART.some(function (r) { if (r[0].test(fold(t)) && !used[r[1]]) { arts[t] = r[1]; used[r[1]] = 1; return true; } return false; });
+	});
+	tags.forEach(function (t) {
+		var art = arts[t];
+		if (!art) { art = SPARE_ART.filter(function (k) { return !used[k]; })[0] || "book"; used[art] = 1; }
 		non.push({ id: "n:" + t, label: t, art: art, n: counts[t], test: function (b) {
 			return b.tags.indexOf(t) >= 0 && b.tags.some(function (x) { return NONFIC.test(fold(x)); });
 		} });
