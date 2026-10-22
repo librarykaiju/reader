@@ -3955,36 +3955,33 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.sub { margin: -8px 0 14px; font-size: 14px; }
 	.intro { margin: 0 0 20px; font: 400 17px/1.55 var(--display); }
 	.intro p { margin: 0 0 10px; }
-	/* The landing page: noir. Near-black, light through venetian blinds,
-	   white type, one red accent. */
-	body.landing { background: #0a0a0b; color: #ece8e1; min-height: 100vh; }
-	body.landing::before { content: ""; position: fixed; inset: 0; pointer-events: none;
-		background: repeating-linear-gradient(162deg, rgba(255,255,255,.075) 0 22px, rgba(255,255,255,0) 22px 52px);
-		-webkit-mask-image: radial-gradient(ellipse 75% 55% at 78% 8%, #000 0%, rgba(0,0,0,.35) 45%, transparent 75%);
-		mask-image: radial-gradient(ellipse 75% 55% at 78% 8%, #000 0%, rgba(0,0,0,.35) 45%, transparent 75%); }
-	body.landing::after { content: ""; position: fixed; inset: 0; pointer-events: none; background: radial-gradient(ellipse at 50% 50%, transparent 40%, rgba(0,0,0,.7) 100%); }
-	body.landing main { position: relative; z-index: 1; min-height: 100vh; display: flex; flex-direction: column; justify-content: center; }
-	.noir { max-width: 520px; width: 100%; margin: 32px auto; }
-	.noir h1 { font: 600 54px/.98 var(--display); letter-spacing: -.03em; color: #f4f1ea; margin: 0; }
-	.noir h1 small { display: block; font-size: 20px; font-weight: 400; letter-spacing: .02em; color: #8f8a82; margin-bottom: 6px; }
-	.noir h1 em { font-style: italic; font-weight: 400; }
-	.noir .rule { width: 56px; height: 2px; background: #c8322c; margin: 26px 0 22px; }
-	.noir p { margin: 0 0 18px; font: 300 19px/1.6 var(--display); color: #bdb7ae; }
-	.stamp { appearance: none; display: inline-flex; align-items: center; justify-content: space-between; gap: 18px; width: 100%; margin-top: 10px; padding: 16px 18px;
-		border: 1px solid rgba(255,255,255,.85); border-radius: 0; background: transparent; color: #f4f1ea; cursor: pointer;
-		font: 600 13px/1.2 var(--sans); letter-spacing: .22em; text-transform: uppercase; transition: background .2s, color .2s; }
-	.stamp::after { content: "\2192"; font-size: 18px; letter-spacing: 0; }
-	.stamp:hover, .stamp:focus-visible { background: #f4f1ea; color: #0a0a0b; outline: none; }
-	.stamp:disabled { opacity: .5; }
-	.noir label { display: block; font: 600 11px/1.3 var(--sans); letter-spacing: .22em; text-transform: uppercase; color: #8f8a82; margin: 22px 0 6px; }
-	.noir label .muted { color: #5f5b55; letter-spacing: .1em; }
-	.noir .hint { margin-top: 6px; font: 400 13px/1.4 var(--sans); color: #5f5b55; }
-	.noir input[type=text], .noir input[type=email], .noir textarea { width: 100%; border: 0; border-bottom: 1px solid rgba(255,255,255,.28); background: transparent; color: #f4f1ea; padding: 8px 0;
-		font: 300 21px/1.4 var(--display); border-radius: 0; }
-	.noir textarea { resize: vertical; min-height: 60px; }
-	.noir input:focus, .noir textarea:focus { outline: none; border-bottom-color: #c8322c; }
-	.noir .msg { font: 400 15px/1.5 var(--sans); color: #bdb7ae; border-left: 2px solid #c8322c; padding-left: 12px; }
-	.noir .msg.bad { color: #ef7a72; }
+	/* The landing page: the library's sepia, all type. Brown text, red
+	   buttons, and printer's flourishes above and below the title. */
+	body.landing main { min-height: 100vh; display: flex; flex-direction: column; justify-content: center; }
+	.sepia { max-width: 520px; width: 100%; margin: 32px auto; text-align: center; color: var(--fg); }
+	.sepia .orn { display: flex; align-items: center; gap: 14px; color: #8b2e1f; font: 400 22px/1 var(--display); }
+	.sepia .orn::before, .sepia .orn::after { content: ""; flex: 1; height: 0; border-top: 1px solid #b89a72; border-bottom: 1px solid #b89a72; padding-top: 2px; }
+	.sepia h1 { margin: 18px 0 16px; font: 600 48px/1 var(--display); letter-spacing: -.02em; color: #4a3220; }
+	.sepia h1 small { display: block; font: italic 400 22px/1 var(--display); letter-spacing: 0; color: var(--muted); margin-bottom: 8px; }
+	.sepia h1 em { font-style: italic; font-weight: 500; }
+	.sepia .orn + p { margin-top: 22px; }
+	.sepia p { margin: 0 0 18px; font: 400 19px/1.6 var(--display); color: #4a3220; }
+	.stamp { appearance: none; display: block; width: 100%; margin-top: 8px; padding: 15px 18px; cursor: pointer;
+		border: 0; border-radius: 10px; background: #8b2e1f; color: #fbf3e2; box-shadow: 0 2px 0 #5e1d12;
+		font: 600 17px/1.2 var(--display); letter-spacing: .02em; transition: background .15s, transform .1s, box-shadow .1s; }
+	.stamp:hover, .stamp:focus-visible { background: #a1381f; outline: none; }
+	.stamp:active { transform: translateY(2px); box-shadow: 0 0 0 #5e1d12; }
+	.stamp:disabled { opacity: .55; }
+	.sepia form { text-align: left; }
+	.sepia label { display: block; font: 600 13px/1.3 var(--sans); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 18px 0 4px; }
+	.sepia label .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
+	.sepia .hint { margin-top: 5px; font: italic 400 14px/1.4 var(--display); color: var(--muted); }
+	.sepia input[type=text], .sepia input[type=email], .sepia textarea { width: 100%; border: 1px solid var(--line); background: var(--card); color: var(--fg); padding: 10px 12px;
+		font: 400 18px/1.4 var(--display); border-radius: 10px; }
+	.sepia textarea { resize: vertical; min-height: 70px; }
+	.sepia input:focus, .sepia textarea:focus { outline: none; border-color: #8b2e1f; }
+	.sepia .msg { font: 400 17px/1.5 var(--display); color: #4a3220; }
+	.sepia .msg.bad { color: #8b2e1f; }
 	.check { margin: 16px 0 4px; min-height: 0; }
 	.check:empty { margin: 0; }
 	.hp { position: absolute !important; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
@@ -4064,9 +4061,10 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 </head>
 <body>
 <main>
-	<section id="landing" class="noir" hidden>
-		<h1><small>The</small><em>Back Alley</em> Library</h1>
-		<div class="rule"></div>
+	<section id="landing" class="sepia" hidden>
+		<div class="orn" aria-hidden="true">&#10086;</div>
+		<h1><small>Welcome to</small>The <em>Back Alley</em> Library</h1>
+		<div class="orn" aria-hidden="true">&#10087;</div>
 		<p>The Back Alley Library is a secret between family and friends. Inside you will find my entire collection of books, comics, and audiobooks. Click the button below to request your library card.</p>
 		<p id="lMsg" class="msg" hidden></p>
 		<button id="lAsk" class="stamp" type="button">Request your library card</button>
@@ -4856,7 +4854,6 @@ $("howLink").addEventListener("click", function (e) { e.preventDefault(); welcom
 function landing(msg) {
 	say("");
 	document.body.classList.add("landing");
-	document.querySelector("meta[name=theme-color]").content = "#0a0a0b";
 	$("landing").hidden = false;
 	var asked = read("cardRequested");
 	if (asked && !msg) msg = "Your request is in. You'll get your own link once it's approved.";
@@ -4872,7 +4869,7 @@ function startCheck() {
 	checkId = "loading";
 	window.onTurnstileLoad = function () {
 		checkId = window.turnstile.render("#lCheck", {
-			sitekey: SITE_KEY, theme: "dark", action: "library-card",
+			sitekey: SITE_KEY, theme: "light", action: "library-card",
 			callback: function (t) { checkToken = t; },
 			"expired-callback": function () { checkToken = ""; },
 			"error-callback": function () { checkToken = ""; }
