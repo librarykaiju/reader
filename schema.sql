@@ -207,3 +207,12 @@ CREATE TABLE IF NOT EXISTS downloads (
 );
 
 CREATE INDEX IF NOT EXISTS downloads_by_person ON downloads (person_id, at DESC);
+
+-- How much of a PDF each family member has been sent by its preview, which
+-- stops at 40% of the file (migration 0015).
+CREATE TABLE IF NOT EXISTS previews (
+	person_id INTEGER NOT NULL REFERENCES people (id) ON DELETE CASCADE,
+	book_id INTEGER NOT NULL REFERENCES books (id) ON DELETE CASCADE,
+	bytes INTEGER NOT NULL,
+	PRIMARY KEY (person_id, book_id)
+);
