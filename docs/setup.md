@@ -180,6 +180,8 @@ npx wrangler d1 execute reader --remote --file migrations/0010_family.sql
 npx wrangler d1 execute reader --remote --file migrations/0011_library_card_requests.sql
 npx wrangler d1 execute reader --remote --file migrations/0012_request_limit.sql
 npx wrangler d1 execute reader --remote --file migrations/0013_request_email.sql
+npx wrangler d1 execute reader --remote --file migrations/0014_book_records.sql
+npx wrangler d1 execute reader --remote --file migrations/0015_previews.sql
 npx wrangler deploy
 ```
 
@@ -285,6 +287,7 @@ A migration that already ran stops with an error such as "duplicate column name"
 - The first time someone opens their link they get a welcome page: the plain address to keep and how to save it on their device (Home Screen or bookmark), then **Go to the library**. It's there again from **How to save this page** at the bottom. Set your name for it with `OWNER_NAME` in `wrangler.toml`.
 - Their page is always in the Sepia colors: covers (a series is one cover that opens to its volumes), search by title, author or series, and filters for format (EPUB, PDF, Comics, Text) and tag. Tapping a book downloads it, saved as `Title - Author.epub`. Nothing else is open to them: no feeds, places, highlights, Edit details, uploads or deletes. Put the tag **Hide from family** on any book to keep it out of their view.
 - Each person can download 10 different books in any 24 hours (taking the same book again doesn't count twice). Their page shows how many they have left, and a tap past the limit says to come back tomorrow. The number is `DOWNLOADS_PER_DAY` in `src/index.js`; you have no limit.
+- **Preview** on a book's Record opens a sample to read on the page, without downloading it and without counting toward the 10 (needs migration 0015): about the first 30 pages of an EPUB or text file (whole chapters while they fit), the first 30 pages of a PDF, or the first 6 pages of a comic, and never more than a third of a short book. Only the sample is sent. A PDF can't be cut up by the Worker, so its preview is held to 40% of the file per person, however often they open it. Hidden books have no preview.
 - On the Family screen, **N downloads ›** under a person lists what they downloaded and when.
 - **New link** makes a fresh link and signs them out everywhere (a lost phone, a forwarded link). **Remove** cuts them off at once. Links are shown only when made, since only a scrambled copy is stored; if one gets lost, make a new one.
 

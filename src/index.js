@@ -109,6 +109,12 @@
 //   GET    /api/family/books/:id/cover   as /api/books/:id/cover
 //   GET    /api/family/books/:id/file    the file as a download named "Title - Author.ext" (logged for a family member,
 //                                        who gets 10 different books in any 24 hours; a page saying so after that)
+//   GET    /api/family/books/:id/preview  -> a sample to read before downloading (not counted as a download; see
+//                                  "Previews"): {"type": "epub"|"txt", "blocks", "more"}, {"type": "cbz", "pages", "of"}
+//                                  or {"type": "pdf", "size", "pages"}
+//   GET    /api/family/books/:id/preview/page/:n  a comic's page n (from 0), only the preview's pages
+//   GET    /api/family/books/:id/preview/part?at=&len=  len bytes of a PDF from byte at, for pdf.js (a family
+//                                  member gets at most 40% of a PDF's bytes this way)
 //
 // Email (Cloudflare Email Routing -> "Send to a Worker" -> this Worker):
 //   each message sent to the routed address (news@brandonj.ink, say) becomes
@@ -2406,7 +2412,7 @@ async function addGenreTags(env, book, opts) {
 
 async function deleteBook(env, id) {
 	const book = await getBook(env, id);
-	await env.BOOKS.delete([book.r2_key, coverKey(id)]);
+	await env.BOOKS.delete([book.r2_key, coverKey(id), previewKey(id)]);
 	await env.DB.prepare("DELETE FROM books WHERE id = ?").bind(id).run();
 	return json({ ok: true });
 }
@@ -2760,6 +2766,12 @@ async function familyApi(request, env, url, who) {
 	}
 	const file = p.match(/^\/api\/family\/books\/(\d+)\/file$/);
 	if (file) return familyDownload(env, toId(file[1]), who.person);
+	const preview = p.match(/^\/api\/family\/books\/(\d+)\/preview$/);
+	if (preview) return familyPreview(env, toId(preview[1]));
+	const page = p.match(/^\/api\/family\/books\/(\d+)\/preview\/page\/(\d+)$/);
+	if (page) return previewComicPage(env, toId(page[1]), Number(page[2]));
+	const part = p.match(/^\/api\/family\/books\/(\d+)\/preview\/part$/);
+	if (part) return previewPart(env, toId(part[1]), url, who.person);
 	return null;
 }
 
@@ -2838,6 +2850,471 @@ async function familyDownload(env, id, person) {
 	});
 }
 
+// Previews: a sample of a book read in the page, before deciding to
+// download it. The Worker sends only the sample, never the whole file, and
+// a preview isn't a download, so it doesn't count toward the 10 a day.
+//   EPUB and .txt: the text from the start, as paragraphs, up to about 30
+//     pages (whole chapters while they fit), and never more than a third
+//     of the book. The page lays it out; none of the book's own markup,
+//     styles or images reach it.
+//   Comics: the first 6 pages, or a quarter of a short one, one image each.
+//   PDF: pdf.js draws the first 30 pages (a third of a short one) from the
+//     pieces of the file it asks for. A PDF can't be cut up here, so what
+//     keeps it a sample is that each person gets at most 40% of a PDF's
+//     bytes through previews, ever (the previews table, migration 0015).
+const PREVIEW_PAGES = 30;
+// The same pinned pdf.js the app's page uses (PDFJS and PDFJS_DATA there).
+const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/";
+const PDFJS_DATA_URL = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/";
+const PREVIEW_COMIC_PAGES = 6;
+const PREVIEW_PDF_SHARE = 0.4;
+const PREVIEW_PDF_CHUNK = 16384;
+const PREVIEW_SPINE_MAX = 60;
+
+function previewWords(totalWords) {
+	return Math.max(WORDS_PER_PAGE, Math.min(PREVIEW_PAGES * WORDS_PER_PAGE, Math.round(totalWords / 3)));
+}
+function previewComicCount(total) {
+	return Math.max(1, Math.min(PREVIEW_COMIC_PAGES, Math.ceil(total / 4)));
+}
+function wordCount(s) {
+	const m = s.match(/\S+/g);
+	return m ? m.length : 0;
+}
+
+async function familyPreview(env, id) {
+	const book = await familyBook(env, id);
+	const type = bookType(book);
+	if (type === "epub") return json({ type, ...(await epubPreview(env, book)) });
+	if (type === "txt") return json({ type, ...(await txtPreview(env, book)) });
+	if (type === "cbz") {
+		const total = (await comicImages(env, book)).length;
+		if (!total) throw new HttpError(422, "This comic has no pages to show");
+		return json({ type, pages: previewComicCount(total), of: total });
+	}
+	const cut = await pdfPreviewUpdate(env, book);
+	return json({ type, size: book.size + cut.tail.length, pages: cut.pages || PREVIEW_PAGES, of: cut.of || null });
+}
+
+// A chapter's XHTML -> [{k: "p" | "h" | "q", r: [[text, ""|"i"|"b"|"ib"], ...]}]:
+// headings, paragraphs and quotations with their italics and bold, and
+// nothing else (no attributes, links, images or styles).
+const PREVIEW_BLOCK = /^(p|div|h[1-6]|li|blockquote|section|article|aside|header|footer|figure|figcaption|dt|dd|tr|pre|hr|table|ul|ol|dl|nav|body)$/;
+function htmlBlocks(html) {
+	const body = (/<body\b[^>]*>([\s\S]*)<\/body>/i.exec(html) || [null, html])[1]
+		.replace(/<!--[\s\S]*?-->/g, "")
+		.replace(/<(script|style|svg|math|head|title|noscript)\b[\s\S]*?<\/\1\s*>/gi, "");
+	const blocks = [];
+	let cur = { k: "p", r: [] }, em = 0, strong = 0, quote = 0, heading = 0;
+	const flush = () => {
+		const r = cur.r;
+		if (r.length) {
+			r[0][0] = r[0][0].replace(/^\s+/, "");
+			r[r.length - 1][0] = r[r.length - 1][0].replace(/\s+$/, "");
+			const text = r.map((x) => x[0]).join("");
+			if (text.trim()) blocks.push({ k: cur.k, r: r.filter((x) => x[0]) });
+		}
+		cur = { k: heading ? "h" : quote ? "q" : "p", r: [] };
+	};
+	const add = (text) => {
+		const style = (em > 0 ? "i" : "") + (strong > 0 ? "b" : "");
+		const last = cur.r[cur.r.length - 1];
+		if (last && last[1] === style) last[0] += text;
+		else cur.r.push([text, style]);
+	};
+	for (const m of body.matchAll(/<(\/?)([a-zA-Z][\w:-]*)[^>]*>|([^<]+)/g)) {
+		if (m[3] !== undefined) {
+			const text = htmlEntities(m[3]).replace(/\s+/g, " ");
+			if (text) add(text);
+			continue;
+		}
+		const close = m[1] === "/", tag = m[2].toLowerCase().replace(/^\w+:/, "");
+		if (tag === "br") { add("\n"); continue; }
+		if (tag === "i" || tag === "em" || tag === "cite") { em += close ? -1 : 1; continue; }
+		if (tag === "b" || tag === "strong") { strong += close ? -1 : 1; continue; }
+		if (!PREVIEW_BLOCK.test(tag) && !/^h[1-6]$/.test(tag)) continue;
+		if (/^h[1-6]$/.test(tag)) heading = Math.max(0, heading + (close ? -1 : 1));
+		if (tag === "blockquote") quote = Math.max(0, quote + (close ? -1 : 1));
+		flush();
+	}
+	flush();
+	return blocks;
+}
+// Blocks up to a number of words, the last one cut at a sentence when it runs over.
+function takeWords(blocks, budget, out) {
+	for (const b of blocks) {
+		const n = wordCount(b.r.map((x) => x[0]).join(""));
+		if (out.words + n <= budget) { out.blocks.push(b); out.words += n; continue; }
+		const room = budget - out.words, r = [];
+		let used = 0;
+		for (const [text, style] of b.r) {
+			const parts = text.split(/(\s+)/);
+			let kept = "";
+			for (const part of parts) {
+				if (/\S/.test(part) && used >= room) break;
+				if (/\S/.test(part)) used++;
+				kept += part;
+			}
+			if (kept) r.push([kept, style]);
+			if (used >= room) break;
+		}
+		if (r.length && room > 20) {
+			// Back to the end of the last whole sentence, if the cut piece has one.
+			const last = r[r.length - 1], m = /^([\s\S]*[.!?…]["'”’)]*)\s/.exec(last[0] + " ");
+			last[0] = m ? m[1] : last[0].replace(/\s+$/, "") + "…";
+			out.blocks.push({ k: b.k, r });
+		}
+		out.more = true;
+		return false;
+	}
+	return true;
+}
+
+async function epubPreview(env, book) {
+	const zip = await r2Zip(env, book.r2_key, book.size);
+	if (!zip) throw new HttpError(422, "This EPUB can't be read");
+	const { opf, dir } = await epubPackage(env, zip);
+	const byName = (n) => zip.files.find((f) => f.name === n) || zip.files.find((f) => f.name.toLowerCase() === n.toLowerCase());
+	const hrefs = {};
+	for (const m of opf.matchAll(/<(?:\w+:)?item\b[^>]*>/gi)) {
+		const id = xmlAttr(m[0], "id"), href = xmlAttr(m[0], "href");
+		if (id && href) hrefs[id] = href;
+	}
+	const spine = [...opf.matchAll(/<(?:\w+:)?itemref\b[^>]*>/gi)]
+		.filter((m) => xmlAttr(m[0], "linear") !== "no")
+		.map((m) => hrefs[xmlAttr(m[0], "idref")]).filter(Boolean)
+		.map((href) => byName(resolveZipPath(dir, href))).filter(Boolean);
+	// The same estimate the Record's page count uses: about a third of the XHTML is text.
+	const totalWords = Math.round(spine.reduce((n, f) => n + f.usize, 0) * 0.35 / 6);
+	const out = { blocks: [], words: 0, more: false };
+	const budget = previewWords(totalWords);
+	for (const [i, f] of spine.slice(0, PREVIEW_SPINE_MAX).entries()) {
+		const data = await r2ZipRead(env, zip, f);
+		if (!data) continue;
+		const blocks = htmlBlocks(new TextDecoder().decode(data));
+		if (!blocks.length) continue;
+		// A new chapter starts on its own.
+		if (out.blocks.length) out.blocks.push({ k: "hr", r: [] });
+		if (!takeWords(blocks, budget, out)) break;
+		if (out.words >= budget) { out.more = i < spine.length - 1; break; }
+	}
+	if (spine.length > PREVIEW_SPINE_MAX && !out.more) out.more = true;
+	if (!out.blocks.length) throw new HttpError(422, "This EPUB has no text to show");
+	return { blocks: out.blocks, more: out.more };
+}
+
+async function txtPreview(env, book) {
+	const size = book.size || 0;
+	const len = Math.min(size, Math.max(4096, Math.ceil(size / 3)), 80 * 1024);
+	const raw = len ? await r2Bytes(env, book.r2_key, 0, len) : new Uint8Array(0);
+	if (!raw) throw new HttpError(404, "The file is missing from storage");
+	let text = new TextDecoder().decode(raw).replace(/^﻿/, "").replace(/�+$/, "").replace(/\r\n?/g, "\n");
+	// A YAML header (title, author...) isn't part of the book.
+	text = text.replace(/^---\n[\s\S]*?\n---\n/, "");
+	const blocks = text.split(/\n\s*\n/).map((p) => p.replace(/\s*\n\s*/g, " ").replace(/[ \t]+/g, " ").trim()).filter(Boolean)
+		.map((p) => ({ k: "p", r: [[p, ""]] }));
+	const out = { blocks: [], words: 0, more: len < size };
+	takeWords(blocks, previewWords(Math.round(size / 6)), out);
+	// The last paragraph read may have been cut off by the end of the piece read.
+	if (len < size && out.blocks.length > 1 && !out.more) out.blocks.pop();
+	return { blocks: out.blocks, more: out.more || len < size };
+}
+
+// A PDF's preview, cut to its first pages without rewriting the file: an
+// update appended to it (as an editor saving changes would) that gives the
+// page list only the preview's pages. pdf.js then reads only what those
+// pages need; without it, opening a PDF can read most of the file just to
+// walk the page list. The update is worked out the first time and kept in
+// R2 (previews/<book id>, tagged with the file it's for); an empty one
+// means the PDF couldn't be read this way, and its preview gets the whole
+// page list, still held to the 40%.
+function previewKey(id) { return `previews/${id}`; }
+function previewPdfCount(total) {
+	return Math.max(1, Math.min(PREVIEW_PAGES, Math.ceil(total / 3)));
+}
+async function pdfPreviewUpdate(env, book) {
+	const stored = await env.BOOKS.get(previewKey(book.id));
+	if (stored && stored.customMetadata?.src === book.r2_key) {
+		return { tail: new Uint8Array(await stored.arrayBuffer()), pages: Number(stored.customMetadata.pages) || 0, of: Number(stored.customMetadata.of) || 0 };
+	}
+	if (stored) await stored.arrayBuffer().catch(() => {});
+	let out = { tail: new Uint8Array(0), pages: 0, of: 0 };
+	try {
+		out = (await pdfCutPages(env, book)) || out;
+	} catch (err) {
+		console.warn("preview", book.id, err);
+	}
+	await env.BOOKS.put(previewKey(book.id), out.tail, { customMetadata: { src: book.r2_key, pages: String(out.pages), of: String(out.of) } });
+	return out;
+}
+
+// Reading a file in R2 in 64 KB pieces, each fetched once.
+function r2Pieces(env, key, size) {
+	const pieces = new Map(), PIECE = 65536;
+	const piece = (n) => {
+		if (!pieces.has(n)) pieces.set(n, r2Bytes(env, key, n * PIECE, Math.min(PIECE, size - n * PIECE)));
+		return pieces.get(n);
+	};
+	return {
+		size,
+		async read(at, len) {
+			len = Math.min(len, size - at);
+			if (at < 0 || len <= 0) return new Uint8Array(0);
+			const out = new Uint8Array(len);
+			for (let n = Math.floor(at / PIECE); n * PIECE < at + len; n++) {
+				const p = await piece(n);
+				if (!p) throw new Error("The file is missing from storage");
+				const from = Math.max(at, n * PIECE), to = Math.min(at + len, n * PIECE + p.length);
+				out.set(p.subarray(from - n * PIECE, to - n * PIECE), from - at);
+			}
+			return out;
+		},
+	};
+}
+const latin1 = (b) => new TextDecoder("latin1").decode(b);
+async function inflate(b) {
+	return new Uint8Array(await new Response(new Blob([b]).stream().pipeThrough(new DecompressionStream("deflate"))).arrayBuffer());
+}
+// PNG predictors (an xref stream's /DecodeParms /Predictor 10-15), one byte per sample.
+function unpredict(data, columns) {
+	const out = new Uint8Array(Math.floor(data.length / (columns + 1)) * columns);
+	for (let row = 0, at = 0; at + columns < data.length && row * columns < out.length; row++, at += columns + 1) {
+		const f = data[at], o = row * columns;
+		for (let i = 0; i < columns; i++) {
+			const x = data[at + 1 + i], a = i ? out[o + i - 1] : 0, b = row ? out[o - columns + i] : 0, c = row && i ? out[o - columns + i - 1] : 0;
+			let v = x;
+			if (f === 1) v = x + a;
+			else if (f === 2) v = x + b;
+			else if (f === 3) v = x + ((a + b) >> 1);
+			else if (f === 4) { const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c); v = x + (pa <= pb && pa <= pc ? a : pb <= pc ? b : c); }
+			out[o + i] = v & 255;
+		}
+	}
+	return out;
+}
+const pdfInt = (dict, name) => { const m = new RegExp(`/${name}\\s+(\\d+)(?!\\s+\\d+\\s+R)`).exec(dict); return m ? Number(m[1]) : null; };
+const pdfRef = (dict, name) => { const m = new RegExp(`/${name}\\s+(\\d+)\\s+(\\d+)\\s+R`).exec(dict); return m ? { num: Number(m[1]), gen: Number(m[2]) } : null; };
+const pdfRefs = (text) => [...text.matchAll(/(\d+)\s+(\d+)\s+R/g)].map((m) => ({ num: Number(m[1]), gen: Number(m[2]) }));
+const pdfArray = (dict, name) => { const m = new RegExp(`/${name}\\s*\\[([^\\]]*)\\]`).exec(dict); return m ? m[1] : null; };
+
+// The xref sections, newest first: {entries: Map(num -> {at} | {stm, idx}), trailer}.
+async function pdfXrefs(r) {
+	const tail = latin1(await r.read(Math.max(0, r.size - 2048), 2048));
+	const sx = [...tail.matchAll(/startxref\s+(\d+)/g)].pop();
+	if (!sx) throw new Error("no startxref");
+	const sections = [], seen = new Set();
+	sections.start = Number(sx[1]);
+	for (let at = Number(sx[1]); at !== null && !seen.has(at) && sections.length < 50; ) {
+		seen.add(at);
+		const s = await pdfXrefAt(r, at);
+		sections.push(s);
+		const stm = pdfInt(s.trailer, "XRefStm");
+		if (stm !== null && !seen.has(stm)) { seen.add(stm); sections.push(await pdfXrefAt(r, stm)); }
+		at = pdfInt(s.trailer, "Prev");
+	}
+	return sections;
+}
+async function pdfXrefAt(r, at) {
+	const head = latin1(await r.read(at, 64));
+	const entries = new Map();
+	if (/^\s*xref/.test(head)) {
+		let text = "";
+		for (let len = 65536; ; len *= 4) {
+			text = latin1(await r.read(at, len));
+			const t = text.indexOf("trailer");
+			if ((t >= 0 && text.indexOf("startxref", t) >= 0) || len >= 16 * 1024 * 1024 || at + len >= r.size) break;
+		}
+		const t = text.indexOf("trailer");
+		if (t < 0) throw new Error("no trailer");
+		const lines = text.slice(text.indexOf("xref") + 4, t);
+		const re = /(\d+)\s+(\d+)\s*[\r\n]+|(\d{10})\s+(\d{5})\s+([nf])/g;
+		let num = 0;
+		for (const m of lines.matchAll(re)) {
+			if (m[1] !== undefined) { num = Number(m[1]); continue; }
+			if (m[5] === "n" && !entries.has(num)) entries.set(num, { at: Number(m[3]) });
+			num++;
+		}
+		const tr = text.slice(t + 7);
+		return { entries, trailer: tr.slice(0, tr.indexOf("startxref") >= 0 ? tr.indexOf("startxref") : 4096) };
+	}
+	// An xref stream: "n g obj << /Type /XRef /W [...] ... >> stream ...".
+	const obj = await pdfRawObject(r, at, null);
+	const dict = obj.dict, w = (pdfArray(dict, "W") || "").trim().split(/\s+/).map(Number);
+	if (w.length !== 3 || w.some((x) => !Number.isInteger(x))) throw new Error("bad /W");
+	let data = obj.stream;
+	if (/\/FlateDecode/.test(dict)) data = await inflate(data);
+	const pred = pdfInt(dict, "Predictor") || 1, row = w[0] + w[1] + w[2];
+	if (pred >= 10) data = unpredict(data, pdfInt(dict, "Columns") || row);
+	const index = (pdfArray(dict, "Index") || `0 ${pdfInt(dict, "Size")}`).trim().split(/\s+/).map(Number);
+	const field = (o, n) => { let v = 0; for (let i = 0; i < n; i++) v = v * 256 + data[o + i]; return v; };
+	let o = 0;
+	for (let k = 0; k + 1 < index.length; k += 2) {
+		for (let num = index[k], end = index[k] + index[k + 1]; num < end && o + row <= data.length; num++, o += row) {
+			const type = w[0] ? field(o, w[0]) : 1, a = field(o + w[0], w[1]), b = field(o + w[0] + w[1], w[2]);
+			if (entries.has(num)) continue;
+			if (type === 1) entries.set(num, { at: a });
+			else if (type === 2) entries.set(num, { stm: a, idx: b });
+		}
+	}
+	return { entries, trailer: dict };
+}
+// The object at a byte offset: its dict (or whole body) as text, and its stream's bytes if any.
+async function pdfRawObject(r, at, xrefs) {
+	let text = "", bytes = null;
+	for (let len = 8192; ; len *= 4) {
+		bytes = await r.read(at, len);
+		text = latin1(bytes);
+		if (/endobj|stream\r?\n/.test(text) || len >= 4 * 1024 * 1024 || at + len >= r.size) break;
+	}
+	const start = text.search(/\d+\s+\d+\s+obj/);
+	if (start < 0) throw new Error("no object at " + at);
+	const s = text.search(/\bstream\r?\n/), e = text.indexOf("endobj");
+	if (s < 0 || (e >= 0 && e < s)) return { dict: text.slice(start, e < 0 ? undefined : e), stream: null };
+	const dict = text.slice(start, s), from = at + s + (text[s + 6] === "\r" ? 8 : 7);
+	let len = pdfInt(dict, "Length");
+	const lref = len === null && pdfRef(dict, "Length");
+	if (lref && xrefs) len = Number((/\d+\s+\d+\s+obj\s*(\d+)/.exec(await pdfObject(r, xrefs, lref.num)) || [])[1]);
+	if (!Number.isInteger(len)) {
+		// No usable /Length: up to "endstream".
+		const rest = latin1(await r.read(from, 16 * 1024 * 1024));
+		len = rest.indexOf("endstream");
+		if (len < 0) throw new Error("no endstream");
+	}
+	return { dict, stream: await r.read(from, len) };
+}
+// Object num's text ("n g obj << ... >>"), from the file or from an object stream.
+async function pdfObject(r, xrefs, num, cache = new Map()) {
+	let e = null;
+	for (const s of xrefs) if ((e = s.entries.get(num))) break;
+	if (!e) throw new Error("no object " + num);
+	if (e.at !== undefined) return (await pdfRawObject(r, e.at, xrefs)).dict;
+	let stm = cache.get(e.stm);
+	if (!stm) {
+		let at = null;
+		for (const s of xrefs) { const x = s.entries.get(e.stm); if (x) { at = x.at; break; } }
+		if (at === null || at === undefined) throw new Error("no object stream " + e.stm);
+		const o = await pdfRawObject(r, at, xrefs);
+		const data = /\/FlateDecode/.test(o.dict) ? await inflate(o.stream) : o.stream;
+		stm = { text: latin1(data), first: pdfInt(o.dict, "First") || 0 };
+		stm.offsets = stm.text.slice(0, stm.first).trim().split(/\s+/).map(Number);
+		cache.set(e.stm, stm);
+	}
+	for (let i = 0; i + 1 < stm.offsets.length; i += 2) {
+		if (stm.offsets[i] !== num) continue;
+		const from = stm.first + stm.offsets[i + 1], next = stm.offsets[i + 3];
+		return `${num} 0 obj ` + stm.text.slice(from, next !== undefined ? stm.first + next : undefined);
+	}
+	throw new Error("object " + num + " isn't in its object stream");
+}
+
+// -> {tail: the update's bytes, pages: the preview's pages, of: the PDF's}.
+async function pdfCutPages(env, book) {
+	const r = r2Pieces(env, book.r2_key, book.size);
+	const xrefs = await pdfXrefs(r), trailer = xrefs[0].trailer, cache = new Map();
+	if (/\/Encrypt\s*<</.test(trailer)) return null;
+	const root = pdfRef(trailer, "Root");
+	if (!root) return null;
+	const pagesRef = pdfRef(await pdfObject(r, xrefs, root.num, cache), "Pages");
+	if (!pagesRef) return null;
+	const top = await pdfObject(r, xrefs, pagesRef.num, cache), total = pdfInt(top, "Count");
+	if (!total) return null;
+	const want = previewPdfCount(total);
+	if (want >= total) return { tail: new Uint8Array(0), pages: total, of: total };
+	// The first pages in order: a node's kids, the leaves kept, the nodes opened.
+	const kidsOf = async (dict) => {
+		const arr = pdfArray(dict, "Kids");
+		if (arr !== null) return pdfRefs(arr);
+		const ref = pdfRef(dict, "Kids");
+		return ref ? pdfRefs(await pdfObject(r, xrefs, ref.num, cache)) : [];
+	};
+	const leaves = [], seen = new Set([pagesRef.num]);
+	let reads = 0;
+	const walk = async (dict) => {
+		for (const kid of await kidsOf(dict)) {
+			if (leaves.length >= want) return;
+			if (seen.has(kid.num) || ++reads > 2000) continue;
+			seen.add(kid.num);
+			const d = await pdfObject(r, xrefs, kid.num, cache);
+			if (/\/Kids\b/.test(d)) await walk(d);
+			else leaves.push(kid);
+		}
+	};
+	await walk(top);
+	if (!leaves.length) return null;
+	let size = Math.max(pdfInt(trailer, "Size") || 0, pagesRef.num + 1);
+	for (const s of xrefs) for (const n of s.entries.keys()) if (n >= size) size = n + 1;
+	const objAt = book.size + 1;
+	const obj = `\n${pagesRef.num} ${pagesRef.gen} obj\n<< /Type /Pages /Kids [${leaves.map((k) => `${k.num} ${k.gen} R`).join(" ")}] /Count ${leaves.length} >>\nendobj\n`;
+	const xrefAt = book.size + obj.length;
+	const keep = ["Info", "Encrypt"].map((k) => { const ref = pdfRef(trailer, k); return ref ? ` /${k} ${ref.num} ${ref.gen} R` : ""; }).join("");
+	const id = (/\/ID\s*\[[^\]]*\]/.exec(trailer) || [""])[0];
+	const tail = obj + `xref\n${pagesRef.num} 1\n${String(objAt).padStart(10, "0")} ${String(pagesRef.gen).padStart(5, "0")} n\r\n`
+		+ `trailer\n<< /Size ${size} /Root ${root.num} ${root.gen} R${keep}${id ? " " + id : ""} /Prev ${xrefs.start} >>\nstartxref\n${xrefAt}\n%%EOF\n`;
+	return { tail: new TextEncoder().encode(tail), pages: leaves.length, of: total };
+}
+
+// A comic's page images in reading order (as the reader sorts them).
+async function comicImages(env, book) {
+	const zip = await r2Zip(env, book.r2_key, book.size);
+	if (!zip) return [];
+	const pages = zip.files.filter((f) => COVER_IMAGE.test(f.name) && !/(^|\/)(__MACOSX\/|\.)/.test(f.name));
+	pages.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+	pages.zip = zip;
+	return pages;
+}
+async function previewComicPage(env, id, n) {
+	const book = await familyBook(env, id);
+	if (bookType(book) !== "cbz") throw new HttpError(404, "Not a comic");
+	const pages = await comicImages(env, book);
+	if (!Number.isInteger(n) || n < 0 || n >= previewComicCount(pages.length)) throw new HttpError(404, "That page isn't in the preview");
+	const img = await r2ZipRead(env, pages.zip, pages[n]);
+	const kind = img && imageType(img);
+	if (!kind) throw new HttpError(422, "That page can't be shown");
+	const res = coverResponse(img, kind);
+	res.headers.set("Cache-Control", "private, max-age=86400");
+	return res;
+}
+
+// A piece of a PDF for pdf.js, counted against the person's 40% of it. The
+// pieces can be kept by the browser for a day, so opening the preview again
+// doesn't count them twice. The owner has no limit.
+async function previewPart(env, id, url, person) {
+	const book = await familyBook(env, id);
+	if (bookType(book) !== "pdf") throw new HttpError(404, "Not a PDF");
+	const at = Number(url.searchParams.get("at")), want = Number(url.searchParams.get("len"));
+	// The file as pdf.js sees it: the book's, then the update cutting it to the preview's pages.
+	const tail = Number.isInteger(at) && at + want > book.size ? (await pdfPreviewUpdate(env, book)).tail : new Uint8Array(0);
+	const total = book.size + tail.length;
+	if (!Number.isInteger(at) || !Number.isInteger(want) || at < 0 || want < 1 || want > 4 * 1024 * 1024 || at >= total) {
+		throw new HttpError(400, "at and len must be whole numbers inside the file, len up to 4 MB");
+	}
+	const len = Math.min(want, total - at);
+	if (person) {
+		// At least a few pieces, so a very small PDF can still show its first page.
+		const allowed = Math.max(Math.floor(book.size * PREVIEW_PDF_SHARE), 4 * PREVIEW_PDF_CHUNK);
+		const row = len > allowed ? null : await env.DB.prepare(
+			`INSERT INTO previews (person_id, book_id, bytes) VALUES (?1, ?2, ?3)
+			ON CONFLICT (person_id, book_id) DO UPDATE SET bytes = bytes + ?3 WHERE bytes + ?3 <= ?4 RETURNING bytes`,
+		).bind(person.id, id, len, allowed).first();
+		if (!row) throw new HttpError(429, "That's as much of this book as a preview shows");
+	}
+	let body;
+	if (at + len <= book.size) {
+		const obj = await env.BOOKS.get(book.r2_key, { range: { offset: at, length: len } });
+		if (!obj) throw new HttpError(404, "The file is missing from storage");
+		body = obj.body;
+	} else {
+		const head = at < book.size ? await r2Bytes(env, book.r2_key, at, book.size - at) : new Uint8Array(0);
+		if (!head) throw new HttpError(404, "The file is missing from storage");
+		body = new Uint8Array(len);
+		body.set(head);
+		body.set(tail.subarray(Math.max(0, at - book.size), at + len - book.size), head.length);
+	}
+	return new Response(body, {
+		headers: { "Content-Type": "application/octet-stream", "Cache-Control": "private, max-age=86400", "X-Content-Type-Options": "nosniff" },
+	});
+}
+
 // Book records: what the family library's Record page shows about a book
 // before it's downloaded. The jacket copy (blurb) and page count come from
 // the file first (an EPUB's dc:description, a comic's ComicInfo.xml Summary
@@ -2882,6 +3359,12 @@ const WORDS_PER_PAGE = 275;
 const HTML_ENTITIES = { nbsp: " ", ldquo: "\u201c", rdquo: "\u201d", lsquo: "\u2018", rsquo: "\u2019", mdash: "\u2014", ndash: "\u2013",
 	hellip: "\u2026", eacute: "\u00e9", egrave: "\u00e8", aacute: "\u00e1", iacute: "\u00ed", oacute: "\u00f3", uacute: "\u00fa",
 	ouml: "\u00f6", uuml: "\u00fc", auml: "\u00e4", ccedil: "\u00e7", ntilde: "\u00f1", copy: "\u00a9", reg: "\u00ae", trade: "\u2122", laquo: "\u00ab", raquo: "\u00bb" };
+function htmlEntities(t) {
+	return decodeXml(t)
+		.replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+		.replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
+		.replace(/&([a-z]+);/gi, (m, n) => HTML_ENTITIES[n] ?? m);
+}
 // HTML or plain description text -> paragraphs separated by blank lines,
 // without Open Library's trailing "----------" link lists and [n] links.
 function blurbText(s) {
@@ -2889,10 +3372,7 @@ function blurbText(s) {
 		.replace(/<\s*br\s*\/?>/gi, "\n")
 		.replace(/<\/\s*(p|div|li|h\d)\s*>/gi, "\n\n")
 		.replace(/<[^>]+>/g, "");
-	t = decodeXml(t)
-		.replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
-		.replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
-		.replace(/&([a-z]+);/gi, (m, n) => HTML_ENTITIES[n] ?? m);
+	t = htmlEntities(t);
 	t = t.split(/\n\s*-{4,}\s*\n|\n\s*\[1\]:/)[0]
 		.replace(/\(\[source\]\[\d+\]\)/gi, "")
 		.replace(/\[([^\]]+)\]\[\d+\]/g, "$1")
@@ -3325,25 +3805,30 @@ function page() {
 // reaches family. It signs in from the invite link, then shows the books as
 // covers (A-Z, a series in volume order) in the Sepia theme, with search and
 // a format filter. Tapping a book opens its Record (#book=<id>): the jacket
-// copy, page count and appeal terms, and the download button.
+// copy, page count and appeal terms, the download button, and Preview
+// (#preview=<id>), a sample of the book to read on the page.
 function familyPage(env) {
 	const nonce = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))));
 	// Turnstile (the library card form's check) runs from Cloudflare's own address, in a frame.
 	const ts = turnstileOn(env) ? " https://challenges.cloudflare.com" : "";
 	const csp = [
 		"default-src 'none'",
-		`script-src 'nonce-${nonce}'${ts}`,
+		// A PDF's preview loads pdf.js from cdnjs (as the app does), its CMaps and fonts from jsDelivr.
+		`script-src 'nonce-${nonce}' 'wasm-unsafe-eval' https://cdnjs.cloudflare.com${ts}`,
 		`style-src 'nonce-${nonce}'`,
-		"img-src 'self' data:",
-		"font-src 'self'",
-		"connect-src 'self'",
+		"img-src 'self' data: blob:",
+		"font-src 'self' data:",
+		"connect-src 'self' https://cdn.jsdelivr.net",
+		"worker-src blob: https://cdnjs.cloudflare.com",
 		`frame-src${ts || " 'none'"}`,
 		"base-uri 'none'",
 		"form-action 'none'",
 		"frame-ancestors 'none'",
 	].join("; ");
 	const siteKey = turnstileOn(env) ? env.TURNSTILE_SITE_KEY.replace(/[^\w-]/g, "") : "";
-	return new Response(FAMILY_PAGE.replaceAll("__NONCE__", nonce).replaceAll("__ICON__", ICON_URI).replaceAll("__TURNSTILE__", siteKey), {
+	const html = FAMILY_PAGE.replaceAll("__NONCE__", nonce).replaceAll("__ICON__", ICON_URI).replaceAll("__TURNSTILE__", siteKey)
+		.replaceAll("__PDFJS__", PDFJS_URL).replaceAll("__PDFJS_DATA__", PDFJS_DATA_URL).replaceAll("__PREVIEW_PAGES__", String(PREVIEW_PAGES));
+	return new Response(html, {
 		headers: {
 			"Content-Type": "text/html; charset=utf-8",
 			"Content-Security-Policy": csp,
@@ -3500,11 +3985,46 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.appeal dt { font: 600 16px/1.3 var(--display); padding-top: 4px; }
 	.appeal dd { margin: 0; display: flex; flex-wrap: wrap; gap: 6px; }
 	.term { border: 1px solid var(--line); background: var(--bg); border-radius: 999px; padding: 3px 12px; font-size: 14px; line-height: 1.5; }
+	.rbtns { display: flex; flex-wrap: wrap; gap: 10px; max-width: 520px; }
+	.rbtns .rdl { flex: 1 1 200px; }
+	.rpv { display: flex; align-items: center; justify-content: center; flex: 0 1 150px; min-height: 48px; margin-top: 0; border: 1px solid var(--accent); border-radius: 10px;
+		color: var(--accent); font-weight: 600; font-size: 17px; text-decoration: none; background: transparent; }
+	.rpv:hover, .rpv:focus-visible { background: var(--card); }
+	/* A preview: the sample, laid out like a page of a book. */
+	.preview { max-width: 720px; margin: 0 auto; }
+	.pveye { margin-top: 14px; }
+	.preview h1 { font-size: 30px; margin: 0 0 4px; overflow-wrap: anywhere; }
+	.preview h1:focus { outline: none; }
+	.pvby { font: italic 400 18px/1.35 var(--display); margin: 0 0 6px; }
+	.pvnote { font-size: 14px; margin: 0 0 22px; }
+	.pvtext { font: 400 19px/1.65 var(--display); background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 34px clamp(18px, 6vw, 56px) 30px;
+		box-shadow: 0 1px 3px rgba(0,0,0,.06); overflow-wrap: break-word; }
+	.pvtext p { margin: 0; text-indent: 1.4em; white-space: pre-line; }
+	.pvtext h2 + p, .pvtext hr + p, .pvtext p:first-child, .pvtext blockquote + p { text-indent: 0; }
+	.pvtext h2 { font: 600 23px/1.3 var(--display); text-align: center; margin: 10px 0 18px; }
+	.pvtext h2 + h2 { margin-top: -10px; font-size: 18px; font-weight: 400; font-style: italic; }
+	.pvtext blockquote { margin: 12px 1.4em; font-size: 17px; white-space: pre-line; }
+	.pvtext hr { border: 0; margin: 34px 0; text-align: center; height: 1em; }
+	.pvtext hr::before { content: "\2042"; color: var(--muted); font-size: 18px; }
+	.pvpages { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+	.pvpages img, .pvpages .pvpdf { display: block; width: 100%; max-width: 720px; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.22); border-radius: 2px; }
+	.pvpages img { height: auto; min-height: 200px; max-width: 600px; }
+	.pvpdf { position: relative; }
+	.pvpdf canvas { display: block; width: 100%; height: 100%; }
+	.pvpdf .pn { position: absolute; right: 8px; bottom: 6px; font-size: 12px; color: #999; }
+	.pvend { text-align: center; border-top: 1px solid var(--line); margin-top: 30px; padding-top: 22px; }
+	.pvend p { margin: 0 0 6px; font: 400 18px/1.5 var(--display); }
+	.pvend .rbtns { margin: 6px auto 0; justify-content: center; }
+	.pvend .rdl { margin-top: 0; }
+	.pvend .rleft { font: 14px/1.45 var(--sans); margin: 0 0 10px; }
 	@media (max-width: 600px) {
 		.rtop { grid-template-columns: 1fr; gap: 18px; }
 		.rcover { width: 56%; max-width: 230px; justify-self: center; }
 		.record h1 { font-size: 29px; }
 		.rdl { max-width: none; }
+		.rbtns { max-width: none; }
+		.rpv { flex-basis: 100%; }
+		.pvtext { font-size: 18px; }
 		.appeal { grid-template-columns: 1fr; gap: 4px; }
 		.appeal dd { margin-bottom: 10px; }
 		.appeal dd:last-child { margin-bottom: 0; }
@@ -3581,7 +4101,10 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 					<p id="rBy" class="rby"></p>
 					<p id="rSeries" class="rseries"></p>
 					<dl id="rFacts" class="facts"></dl>
-					<a id="rDl" class="go rdl" href="#"></a>
+					<div class="rbtns">
+						<a id="rDl" class="go rdl" href="#"></a>
+						<a id="rPv" class="rpv" href="#">Preview</a>
+					</div>
 					<p id="rLeft" class="rleft muted"></p>
 				</div>
 			</div>
@@ -3595,6 +4118,19 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 				<dl id="rAppeal" class="appeal"></dl>
 				<p id="rAppealNote" class="note" hidden></p>
 			</section>
+		</article>
+		<article id="preview" class="preview" hidden>
+			<a id="pvBack" class="up" href="/library">‹ Back</a>
+			<p class="eyebrow pveye">Preview</p>
+			<h1 id="pvTitle" tabindex="-1"></h1>
+			<p id="pvBy" class="pvby"></p>
+			<p id="pvNote" class="pvnote muted"></p>
+			<div id="pvBody"></div>
+			<div id="pvEnd" class="pvend" hidden>
+				<p id="pvEndText"></p>
+				<p id="pvLeft" class="rleft muted"></p>
+				<div class="rbtns"><a id="pvDl" class="go rdl" href="#"></a></div>
+			</div>
 		</article>
 		<footer><a id="howLink" href="#">How to save this page</a></footer>
 	</div>
@@ -3611,7 +4147,9 @@ var books = [], format = "", query = "", tag = "", me = {};
 function openSeries() { var m = /^#series=(.+)$/.exec(location.hash); return m ? decodeURIComponent(m[1]) : null; }
 // A book's Record: #book=<id>.
 function openBook() { var m = /^#book=(\d+)$/.exec(location.hash); return m ? Number(m[1]) : null; }
-var listScroll = 0, viaList = false, onRecord = false, records = {}, common = {};
+// Its preview: #preview=<id>.
+function openPreview() { var m = /^#preview=(\d+)$/.exec(location.hash); return m ? Number(m[1]) : null; }
+var listScroll = 0, viaList = false, viaRecord = false, onRecord = false, onPreview = false, records = {}, common = {};
 function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 function read(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
 
@@ -3860,11 +4398,16 @@ function renderTags() {
 }
 function render() {
 	var id = openBook(), rb = id && books.filter(function (b) { return b.id === id; })[0];
-	$("browse").hidden = !!rb;
+	var pid = openPreview(), pb = pid && books.filter(function (b) { return b.id === pid; })[0];
+	$("browse").hidden = !!(rb || pb);
 	$("record").hidden = !rb;
-	$("intro").hidden = !!rb;
+	$("preview").hidden = !pb;
+	$("intro").hidden = !!(rb || pb);
 	onRecord = !!rb;
+	onPreview = !!pb;
+	if (!pb) closePreview();
 	if (rb) { $("head").hidden = $("sub").hidden = true; showRecord(rb); return; }
+	if (pb) { $("head").hidden = $("sub").hidden = true; showPreview(pb); return; }
 	document.title = "The Back Alley Library";
 	$("head").hidden = false;
 	var series = openSeries(), words = fold(query).split(/\s+/).filter(Boolean);
@@ -3937,10 +4480,11 @@ function showRecord(b) {
 		sr.append(link);
 	}
 	recordFacts(b, records[b.id]);
-	var dl = $("rDl");
-	dl.href = "/api/family/books/" + b.id + "/file";
-	dl.onclick = function (e) { downloading(e, b); setTimeout(function () { recordLeft(b); }, 0); };
-	recordLeft(b);
+	downloadButton($("rDl"), $("rLeft"), b);
+	var pv = $("rPv");
+	pv.href = "#preview=" + b.id;
+	pv.setAttribute("aria-label", "Preview " + b.title);
+	pv.onclick = function () { viaRecord = true; };
 	if (records[b.id]) return recordDetails(b, records[b.id]);
 	$("rBlurbSec").hidden = false;
 	$("rBlurb").innerHTML = '<p class="muted">Looking this book up…</p>';
@@ -3962,8 +4506,13 @@ function recordFacts(b, rec) {
 	if (rec && rec.pages) add("Length", (rec.from.pages === "estimate" ? "About " : "") + rec.pages.toLocaleString() + (rec.pages === 1 ? " page" : " pages"));
 	add("Shelved", b.tags.filter(function (t) { return !common[t]; }).join(", "));
 }
-function recordLeft(b) {
-	var dl = $("rDl"), left = $("rLeft"), took = me.today && me.today.indexOf(b.id) >= 0, out = me.left != null && me.left <= 0 && !took;
+function downloadButton(dl, left, b) {
+	dl.href = "/api/family/books/" + b.id + "/file";
+	dl.onclick = function (e) { downloading(e, b); setTimeout(function () { recordLeft(dl, left, b); }, 0); };
+	recordLeft(dl, left, b);
+}
+function recordLeft(dl, left, b) {
+	var took = me.today && me.today.indexOf(b.id) >= 0, out = me.left != null && me.left <= 0 && !took;
 	dl.textContent = out ? "That's today's " + 10 + " books" : "Download " + KIND[b.type];
 	dl.classList.toggle("off", out);
 	dl.setAttribute("aria-label", out ? "No downloads left today" : "Download " + b.title + ", " + KIND[b.type] + ", " + bytes(b.size));
@@ -4000,6 +4549,182 @@ function recordDetails(b, rec) {
 		box.innerHTML = '<p class="muted">Nothing more on this one yet.</p>';
 	}
 }
+// A preview: a sample of the book on the page. The Worker sends only the
+// sample (see "Previews" there): EPUB and text as paragraphs laid out here,
+// a comic's first pages as images, and a PDF's first pages drawn by pdf.js
+// from the pieces of the file it asks for. It isn't a download, so it
+// doesn't count toward the 10 a day.
+var PDFJS = "__PDFJS__", PDFJS_DATA = "__PDFJS_DATA__", PREVIEW_PAGES = __PREVIEW_PAGES__;
+var pv = null, pdfjsLoading = null;
+function closePreview() {
+	if (!pv) return;
+	pv.alive = false;
+	pv.cleanup.forEach(function (f) { try { f(); } catch (e) {} });
+	$("pvBody").textContent = "";
+	pv = null;
+}
+function showPreview(b) {
+	document.title = "Preview: " + b.title + " · The Back Alley Library";
+	$("pvBack").href = "#book=" + b.id;
+	$("pvBack").textContent = "‹ Back to the record";
+	$("pvTitle").textContent = b.title;
+	$("pvBy").textContent = b.author ? "by " + b.author : "";
+	$("pvBy").hidden = !b.author;
+	if (pv && pv.id === b.id) return;
+	closePreview();
+	var sess = pv = { id: b.id, alive: true, cleanup: [] };
+	$("pvNote").textContent = "Loading the preview…";
+	$("pvEnd").hidden = true;
+	$("pvBody").textContent = "";
+	fetch("/api/family/books/" + b.id + "/preview").then(function (res) {
+		return res.json().catch(function () { return {}; }).then(function (d) {
+			if (!res.ok) throw new Error(d.error || "Couldn't load the preview.");
+			return d;
+		});
+	}).then(function (d) {
+		if (!sess.alive) return;
+		if (d.type === "pdf") return previewPdf(sess, b, d);
+		if (d.type === "cbz") return previewComic(sess, b, d);
+		previewText(sess, b, d);
+	}).catch(function (e) {
+		if (!sess.alive) return;
+		$("pvNote").textContent = (e && e.message) || "Couldn't load the preview.";
+		previewEnd(b, "");
+	});
+}
+function previewEnd(b, text) {
+	$("pvEndText").textContent = text;
+	$("pvEndText").hidden = !text;
+	downloadButton($("pvDl"), $("pvLeft"), b);
+	$("pvEnd").hidden = false;
+}
+function pagesWord(n) { return n === 1 ? "1 page" : n + " pages"; }
+function previewText(sess, b, d) {
+	var box = h("div", "pvtext");
+	(d.blocks || []).forEach(function (bl) {
+		if (bl.k === "hr") { box.append(h("hr")); return; }
+		var el = h(bl.k === "h" ? "h2" : bl.k === "q" ? "blockquote" : "p");
+		bl.r.forEach(function (run) {
+			var text = run[0], style = run[1] || "";
+			if (!style) { el.append(text); return; }
+			var outer = h(style.indexOf("i") >= 0 ? "em" : "strong"), inner = outer;
+			if (style === "ib") { inner = h("strong"); outer.append(inner); }
+			inner.textContent = text;
+			el.append(outer);
+		});
+		box.append(el);
+	});
+	$("pvBody").append(box);
+	$("pvNote").textContent = d.more ? "The opening of the book, up to about " + PREVIEW_PAGES + " pages. Reading it doesn't count as a download." : "The whole of it fits in the preview. Reading it doesn't count as a download.";
+	previewEnd(b, d.more ? "That's the end of the preview." : "That's the end.");
+}
+function previewComic(sess, b, d) {
+	var box = h("div", "pvpages");
+	for (var i = 0; i < d.pages; i++) {
+		var img = h("img");
+		img.alt = "Page " + (i + 1);
+		img.loading = i < 2 ? "eager" : "lazy";
+		img.decoding = "async";
+		img.src = "/api/family/books/" + b.id + "/preview/page/" + i;
+		box.append(img);
+	}
+	$("pvBody").append(box);
+	$("pvNote").textContent = "The first " + pagesWord(d.pages) + " of " + d.of + ". Reading them doesn't count as a download.";
+	previewEnd(b, "That's the end of the preview.");
+}
+function loadPdfJs() {
+	if (!pdfjsLoading) {
+		pdfjsLoading = import(PDFJS + "pdf.min.mjs").then(function (lib) {
+			lib.GlobalWorkerOptions.workerSrc = PDFJS + "pdf.worker.min.mjs";
+			return lib;
+		}).catch(function (e) {
+			pdfjsLoading = null;
+			throw new Error("Couldn't load the PDF viewer (" + e.message + ").");
+		});
+	}
+	return pdfjsLoading;
+}
+// pdf.js asks for pieces as it needs them (16 KB of a smaller PDF, so
+// little is read past the pages shown; 64 KB of a big one); the Worker
+// counts them against this person's share of the file and says no past it.
+async function previewPdf(sess, b, d) {
+	var size = d.size, CHUNK = size < 8 * 1048576 ? 16384 : 65536, failed = null;
+	var part = async function (at, len) {
+		var res = await fetch("/api/family/books/" + b.id + "/preview/part?at=" + at + "&len=" + len);
+		if (!res.ok) {
+			var e = new Error((await res.json().catch(function () { return {}; })).error || "HTTP " + res.status);
+			e.status = res.status;
+			throw e;
+		}
+		return new Uint8Array(await res.arrayBuffer());
+	};
+	var stop = function (e) {
+		if (failed || !sess.alive) return;
+		failed = e;
+		$("pvNote").textContent = e.status === 429 ? "That's as much of this PDF as a preview can show." : "Couldn't load the rest of the preview.";
+		previewEnd(b, e.status === 429 ? "That's the end of the preview." : "");
+	};
+	var lib = await loadPdfJs(), head = await part(0, Math.min(CHUNK, size)).catch(function (e) { stop(e); return null; });
+	if (!sess.alive || !head) return;
+	var range = new lib.PDFDataRangeTransport(size, head);
+	range.requestDataRange = function (begin, end) {
+		// In pieces of up to 1 MB, each a whole number of chunks.
+		for (var at = begin; at < end; at += 1048576) (function (at, len) {
+			part(at, len).then(function (data) { if (sess.alive) range.onDataRange(at, data); }, stop);
+		})(at, Math.min(1048576, end - at));
+	};
+	var task = lib.getDocument({
+		range: range, length: size, rangeChunkSize: CHUNK, disableAutoFetch: true, disableStream: true,
+		isEvalSupported: false, useWorkerFetch: false,
+		cMapUrl: PDFJS_DATA + "cmaps/", cMapPacked: true, standardFontDataUrl: PDFJS_DATA + "standard_fonts/"
+	});
+	sess.cleanup.push(function () { task.destroy(); });
+	var doc = await task.promise;
+	if (!sess.alive) return;
+	// The Worker has usually cut the PDF to the preview's pages already (d.of is then the whole count).
+	var of = d.of || doc.numPages, n = d.of ? Math.min(d.pages, doc.numPages) : Math.max(1, Math.min(PREVIEW_PAGES, doc.numPages, Math.ceil(doc.numPages / 3)));
+	var first = (await doc.getPage(1)).getViewport({ scale: 1 });
+	if (!sess.alive) return;
+	var box = h("div", "pvpages"), pages = [];
+	for (var i = 1; i <= n; i++) {
+		var div = h("div", "pvpdf");
+		div.dataset.n = i;
+		div.style.aspectRatio = first.width + " / " + first.height;
+		div.append(h("span", "pn", String(i)));
+		pages.push(div);
+		box.append(div);
+	}
+	$("pvBody").append(box);
+	$("pvNote").textContent = "The first " + pagesWord(n) + " of " + of + ". Reading them doesn't count as a download.";
+	previewEnd(b, "That's the end of the preview.");
+	var io = new IntersectionObserver(function (entries) {
+		entries.forEach(function (e) { if (e.isIntersecting && !failed) drawPdfPage(sess, doc, e.target); });
+	}, { rootMargin: "100% 0px" });
+	pages.forEach(function (p) { io.observe(p); });
+	sess.cleanup.push(function () {
+		io.disconnect();
+		pages.forEach(function (p) { var c = p.querySelector("canvas"); if (c) c.width = c.height = 0; });
+	});
+}
+async function drawPdfPage(sess, doc, div) {
+	if (div.done) return;
+	div.done = true;
+	try {
+		var page = await doc.getPage(Number(div.dataset.n));
+		var vp1 = page.getViewport({ scale: 1 }), dpr = Math.min(window.devicePixelRatio || 1, 2);
+		div.style.aspectRatio = vp1.width + " / " + vp1.height;
+		var scale = Math.min((div.clientWidth * dpr) / vp1.width, Math.sqrt(16e6 / (vp1.width * vp1.height)));
+		var vp = page.getViewport({ scale: scale }), canvas = document.createElement("canvas");
+		canvas.width = Math.floor(vp.width);
+		canvas.height = Math.floor(vp.height);
+		await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+		if (!sess.alive) { canvas.width = canvas.height = 0; return; }
+		div.prepend(canvas);
+		page.cleanup();
+	} catch (e) {
+		div.done = false;
+	}
+}
 async function load() {
 	var invite = /[#&]invite=([\w-]+)/.exec(location.hash), used = invite ? await signIn(invite[1]) : "";
 	var res = await fetch("/api/family/me");
@@ -4031,12 +4756,20 @@ $("rBack").addEventListener("click", function (e) {
 	e.preventDefault();
 	history.back();
 });
+// Back from a preview opened from its Record goes back to the Record.
+$("pvBack").addEventListener("click", function (e) {
+	if (!viaRecord) return;
+	e.preventDefault();
+	history.back();
+});
 window.addEventListener("hashchange", function () {
-	var back = onRecord && !openBook();
+	var back = onRecord && !openBook() && !openPreview();
 	if (back) viaList = false;
+	if (onPreview && !openPreview()) viaRecord = false;
 	render();
 	window.scrollTo(0, back ? listScroll : 0);
 	if (onRecord) $("rTitle").focus({ preventScroll: true });
+	if (onPreview) $("pvTitle").focus({ preventScroll: true });
 });
 
 // The first time on a device: how to keep the page. The invite link works
