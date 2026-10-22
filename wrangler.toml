@@ -40,6 +40,8 @@ binding = "AI"
 #                    device and sends it as a Bearer token
 #   ANTHROPIC_API_KEY -- optional; "Compare coverage" uses Claude instead,
 #                        but only when there's no AI binding (docs/setup.md, Part 7)
+#                        It also picks the family library's appeal terms
+#                        (Workers AI does when it isn't set).
 #
 # Dev only (put it in .dev.vars, never in production):
 #   ALLOW_PRIVATE_FETCH = "1"  -- lets /api/fetch reach localhost/private IPs
