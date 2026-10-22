@@ -107,8 +107,8 @@ CREATE TABLE IF NOT EXISTS books (
 	appeal TEXT,
 	record_from TEXT,
 	record_at INTEGER,
-	-- Catalog details as JSON (migration 0015): year, publisher, language,
-	-- classification, isbn. Also fed to the site's book logs (GET /api/catalog).
+	-- Catalog details as JSON (migration 0016): year, publisher, language,
+	-- classification, isbn, subjects. Also fed to the site's book logs (GET /api/catalog).
 	catalog TEXT
 );
 
