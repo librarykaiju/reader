@@ -4201,7 +4201,14 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.appeal { display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: 12px 16px; margin: 0; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
 	.appeal dt { font: 600 16px/1.3 var(--display); padding-top: 4px; }
 	.appeal dd { margin: 0; display: flex; flex-wrap: wrap; gap: 6px; }
-	.term { border: 1px solid var(--line); background: var(--bg); border-radius: 999px; padding: 3px 12px; font-size: 14px; line-height: 1.5; }
+	.term { border: 1px solid var(--t-line, var(--line)); background: var(--t-bg, var(--bg)); color: var(--t-fg, inherit); border-radius: 999px; padding: 3px 12px; font-size: 14px; line-height: 1.5; }
+	/* Each appeal factor has its own color: its label and its terms. */
+	.appeal .f-pacing { --t-fg: #8a3a12; --t-bg: #f6dcc8; --t-line: #e8b896; }
+	.appeal .f-tone { --t-fg: #6b2f5b; --t-bg: #efd9e6; --t-line: #d9b3cb; }
+	.appeal .f-style { --t-fg: #1f5d5a; --t-bg: #d6ebe6; --t-line: #a9d1c9; }
+	.appeal .f-characters { --t-fg: #4f5b16; --t-bg: #e3e8c6; --t-line: #c3cd92; }
+	.appeal .f-story { --t-fg: #2f4a7a; --t-bg: #dbe3f1; --t-line: #b3c3e0; }
+	.appeal dt[class^="f-"] { color: var(--t-fg); }
 	.rbtns { display: flex; flex-wrap: wrap; gap: 10px; max-width: 520px; }
 	.rbtns .rdl { flex: 1 1 200px; }
 	.rpv { display: flex; align-items: center; justify-content: center; flex: 0 1 150px; min-height: 48px; margin-top: 0; border: 1px solid var(--accent); border-radius: 10px;
@@ -4778,9 +4785,9 @@ function recordDetails(b, rec) {
 	APPEAL.forEach(function (f) {
 		var terms = rec.appeal && rec.appeal[f[0]];
 		if (!terms || !terms.length) return;
-		var dd = h("dd");
+		var dd = h("dd", "f-" + f[0]);
 		terms.forEach(function (t) { dd.append(h("span", "term", t)); });
-		dl.append(h("dt", null, f[1]), dd);
+		dl.append(h("dt", "f-" + f[0], f[1]), dd);
 		any = true;
 	});
 	$("rAppealSec").hidden = !any;
