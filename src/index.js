@@ -3102,8 +3102,7 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	body.landing::after { content: ""; position: fixed; inset: 0; pointer-events: none; background: radial-gradient(ellipse at 50% 50%, transparent 40%, rgba(0,0,0,.7) 100%); }
 	body.landing main { position: relative; z-index: 1; min-height: 100vh; display: flex; flex-direction: column; justify-content: center; }
 	.noir { max-width: 520px; width: 100%; margin: 32px auto; }
-	.noir .kicker { font: 600 11px/1 var(--sans); letter-spacing: .32em; text-transform: uppercase; color: #c8322c; }
-	.noir h1 { font: 600 54px/.98 var(--display); letter-spacing: -.03em; color: #f4f1ea; margin: 18px 0 0; }
+	.noir h1 { font: 600 54px/.98 var(--display); letter-spacing: -.03em; color: #f4f1ea; margin: 0; }
 	.noir h1 small { display: block; font-size: 20px; font-weight: 400; letter-spacing: .02em; color: #8f8a82; margin-bottom: 6px; }
 	.noir h1 em { font-style: italic; font-weight: 400; }
 	.noir .rule { width: 56px; height: 2px; background: #c8322c; margin: 26px 0 22px; }
@@ -3119,7 +3118,6 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.noir input[type=text], .noir textarea { width: 100%; border: 0; border-bottom: 1px solid rgba(255,255,255,.28); background: transparent; color: #f4f1ea; padding: 8px 0;
 		font: 300 21px/1.4 var(--display); border-radius: 0; }
 	.noir textarea { resize: vertical; min-height: 60px; }
-	.noir textarea::placeholder { color: #5f5b55; }
 	.noir input:focus, .noir textarea:focus { outline: none; border-bottom-color: #c8322c; }
 	.noir .msg { font: 400 15px/1.5 var(--sans); color: #bdb7ae; border-left: 2px solid #c8322c; padding-left: 12px; }
 	.noir .msg.bad { color: #ef7a72; }
@@ -3132,7 +3130,6 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 <body>
 <main>
 	<section id="landing" class="noir" hidden>
-		<div class="kicker">Members only</div>
 		<h1><small>The</small><em>Back Alley</em> Library</h1>
 		<div class="rule"></div>
 		<p>The Back Alley Library is a secret between family and friends. Inside you will find my entire collection of books, comics, and audiobooks. Click the button below to request your library card.</p>
@@ -3142,7 +3139,7 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 			<label for="lName">Your name</label>
 			<input id="lName" type="text" maxlength="60" autocomplete="name" autocapitalize="words" required>
 			<label for="lNote">How do I know you? <span class="muted">(optional)</span></label>
-			<textarea id="lNote" maxlength="300" placeholder="Cousin Jo, from book club…"></textarea>
+			<textarea id="lNote" maxlength="300"></textarea>
 			<div class="hp" aria-hidden="true"><label for="lSite">Website</label><input id="lSite" type="text" tabindex="-1" autocomplete="off"></div>
 			<div id="lCheck" class="check"></div>
 			<button id="lSend" class="stamp" type="submit">Send my request</button>
