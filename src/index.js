@@ -4027,6 +4027,7 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.preview h1:focus { outline: none; }
 	.pvby { font: italic 400 18px/1.35 var(--display); margin: 0 0 6px; }
 	.pvnote { font-size: 14px; margin: 0 0 22px; }
+	.pvnote:empty { margin-bottom: 18px; }
 	.pvtext { font: 400 19px/1.65 var(--display); background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 34px clamp(18px, 6vw, 56px) 30px;
 		box-shadow: 0 1px 3px rgba(0,0,0,.06); overflow-wrap: break-word; }
 	.pvtext p { margin: 0; text-indent: 1.4em; white-space: pre-line; }
@@ -4645,7 +4646,6 @@ function previewEnd(b, text) {
 	downloadButton($("pvDl"), $("pvLeft"), b);
 	$("pvEnd").hidden = false;
 }
-function pagesWord(n) { return n === 1 ? "1 page" : n + " pages"; }
 function previewText(sess, b, d) {
 	var box = h("div", "pvtext");
 	(d.blocks || []).forEach(function (bl) {
@@ -4662,7 +4662,7 @@ function previewText(sess, b, d) {
 		box.append(el);
 	});
 	$("pvBody").append(box);
-	$("pvNote").textContent = d.more ? "The opening of the book, up to about " + PREVIEW_PAGES + " pages. Reading it doesn't count as a download." : "The whole of it fits in the preview. Reading it doesn't count as a download.";
+	$("pvNote").textContent = "";
 	previewEnd(b, d.more ? "That's the end of the preview." : "That's the end.");
 }
 function previewComic(sess, b, d) {
@@ -4676,7 +4676,7 @@ function previewComic(sess, b, d) {
 		box.append(img);
 	}
 	$("pvBody").append(box);
-	$("pvNote").textContent = "The first " + pagesWord(d.pages) + " of " + d.of + ". Reading them doesn't count as a download.";
+	$("pvNote").textContent = "";
 	previewEnd(b, "That's the end of the preview.");
 }
 function loadPdfJs() {
@@ -4729,7 +4729,7 @@ async function previewPdf(sess, b, d) {
 	var doc = await task.promise;
 	if (!sess.alive) return;
 	// The Worker has usually cut the PDF to the preview's pages already (d.of is then the whole count).
-	var of = d.of || doc.numPages, n = d.of ? Math.min(d.pages, doc.numPages) : Math.max(1, Math.min(PREVIEW_PAGES, doc.numPages, Math.ceil(doc.numPages / 3)));
+	var n = d.of ? Math.min(d.pages, doc.numPages) : Math.max(1, Math.min(PREVIEW_PAGES, doc.numPages, Math.ceil(doc.numPages / 3)));
 	var first = (await doc.getPage(1)).getViewport({ scale: 1 });
 	if (!sess.alive) return;
 	var box = h("div", "pvpages"), pages = [];
@@ -4742,7 +4742,7 @@ async function previewPdf(sess, b, d) {
 		box.append(div);
 	}
 	$("pvBody").append(box);
-	$("pvNote").textContent = "The first " + pagesWord(n) + " of " + of + ". Reading them doesn't count as a download.";
+	$("pvNote").textContent = "";
 	previewEnd(b, "That's the end of the preview.");
 	var io = new IntersectionObserver(function (entries) {
 		entries.forEach(function (e) { if (e.isIntersecting && !failed) drawPdfPage(sess, doc, e.target); });
