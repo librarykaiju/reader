@@ -3059,6 +3059,21 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.formats button { appearance: none; border: 1px solid var(--line); background: var(--card); border-radius: 999px; padding: 5px 12px; min-height: 34px; font-size: 14px; cursor: pointer; }
 	.formats button[aria-pressed=true] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
 	.count { font-size: 14px; margin: 8px 0 0; }
+	/* Genre picks under the search: little drawn cards, Fiction then Nonfiction. */
+	.recs h2 { font: 600 12px/1.2 var(--sans); letter-spacing: .16em; text-transform: uppercase; color: var(--muted); margin: 16px 0 8px; }
+	.genres { display: flex; align-items: flex-start; gap: 10px; overflow-x: auto; margin: 0 -16px; padding: 6px 16px; scroll-padding-inline: 16px; scroll-snap-type: x proximity; scrollbar-width: none; }
+	.genres::-webkit-scrollbar { display: none; }
+	.genre { appearance: none; flex: 0 0 112px; border: 0; background: none; padding: 0; text-align: left; cursor: pointer; scroll-snap-align: start; }
+	.genre .art { display: block; position: relative; aspect-ratio: 4 / 3; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,.22); }
+	.genre .art::after { content: ""; position: absolute; inset: 5px; border: 1px solid rgba(255,255,255,.3); border-radius: 4px; }
+	.genre svg { display: block; width: 100%; height: 100%; transition: transform .25s; }
+	.genre:hover svg, .genre:focus-visible svg { transform: scale(1.06); }
+	.genre .gl { display: block; font: 600 15px/1.2 var(--display); margin-top: 6px; }
+	.genre .gn { display: block; font-size: 12px; color: var(--muted); }
+	.genre[aria-pressed=true] .art { box-shadow: 0 0 0 3px var(--bg), 0 0 0 5px var(--accent); }
+	.genre[aria-pressed=true] .gl { color: var(--accent); }
+	.genre:focus-visible { outline: none; }
+	.genre:focus-visible .art { box-shadow: 0 0 0 3px var(--bg), 0 0 0 5px var(--muted); }
 	.covers { list-style: none; margin: 14px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 22px 14px; }
 	.covers a { display: flex; flex-direction: column; gap: 3px; color: inherit; text-decoration: none; min-width: 0; }
 	.cover { position: relative; aspect-ratio: 2 / 3; border-radius: 5px; overflow: hidden; background: var(--sel); box-shadow: 0 1px 4px rgba(0,0,0,.22); margin-bottom: 5px; }
@@ -3162,6 +3177,12 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 		<div id="tools">
 			<label class="vh" for="q">Search</label>
 			<input id="q" type="search" placeholder="Search title, author, series" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="search">
+			<div id="recs" class="recs" hidden>
+				<h2 id="hFic">Fiction</h2>
+				<div id="fiction" class="genres" role="group" aria-labelledby="hFic"></div>
+				<h2 id="hNon">Nonfiction</h2>
+				<div id="nonfiction" class="genres" role="group" aria-labelledby="hNon"></div>
+			</div>
 			<div class="filters">
 				<div id="formats" class="formats" role="group" aria-label="Format"></div>
 				<label class="vh" for="tag">Tag</label>
@@ -3258,6 +3279,108 @@ function seriesCard(name, vols) {
 	li.append(a);
 	return li;
 }
+// Genre picks. Each fiction pick covers the tag names that mean it (Mystery
+// or Mysteries, Urban Fantasy counts as Fantasy). Nonfiction picks are the
+// other tags that turn up on books also tagged Nonfiction: History,
+// Biography & Memoir and so on. Only picks with books show.
+var INK = "#fbf7ee", GOLD = "#f2c66d", EMBER = "#ef9a52";
+var ART = {
+	classics: ["#6b2f45", '<path d="M18 23 40 11l22 12z" fill="' + INK + '"/><rect x="17" y="24" width="46" height="3" fill="' + INK + '"/>'
+		+ '<g fill="' + INK + '" opacity=".9"><rect x="21" y="29" width="5" height="15"/><rect x="30" y="29" width="5" height="15"/><rect x="45" y="29" width="5" height="15"/><rect x="54" y="29" width="5" height="15"/></g>'
+		+ '<rect x="15" y="45" width="50" height="3" fill="' + INK + '"/><rect x="12" y="49" width="56" height="3" fill="' + INK + '" opacity=".7"/><circle cx="40" cy="19" r="2.2" fill="' + GOLD + '"/>'],
+	westerns: ["#8a6a1f", '<circle cx="58" cy="17" r="8" fill="' + GOLD + '"/><path d="M0 45h9l4-11h17l4 11h46v15H0z" fill="#000" opacity=".22"/>'
+		+ '<g fill="none" stroke="' + INK + '" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M44 52V23"/><path d="M44 39h-7v-8"/><path d="M44 34h7v-7"/></g>'
+		+ '<path d="M0 52h80" stroke="' + INK + '" stroke-width="1.5" opacity=".6"/>'],
+	mysteries: ["#2f4f6f", '<g fill="' + INK + '" opacity=".55"><ellipse cx="11" cy="51" rx="2.4" ry="3.8" transform="rotate(-25 11 51)"/><ellipse cx="17" cy="45" rx="2.4" ry="3.8" transform="rotate(-25 17 45)"/><ellipse cx="18" cy="55" rx="2.4" ry="3.8" transform="rotate(-25 18 55)"/></g>'
+		+ '<circle cx="36" cy="25" r="12" fill="' + INK + '" fill-opacity=".14" stroke="' + INK + '" stroke-width="4"/><path d="M45 34l11 11" stroke="' + INK + '" stroke-width="6" stroke-linecap="round"/>'
+		+ '<path d="M32 22a4 4 0 1 1 5 4c-1 .5-1 1.5-1 3" fill="none" stroke="' + GOLD + '" stroke-width="2.4" stroke-linecap="round"/><circle cx="36" cy="33" r="1.5" fill="' + GOLD + '"/>'],
+	fantasy: ["#5b3f6e", '<circle cx="62" cy="14" r="6" fill="' + GOLD + '"/><circle cx="65" cy="12" r="5.2" fill="#5b3f6e"/><g fill="' + INK + '" opacity=".7"><circle cx="14" cy="12" r="1"/><circle cx="24" cy="7" r="1.2"/><circle cx="52" cy="24" r=".9"/></g>'
+		+ '<g fill="' + INK + '"><rect x="21" y="31" width="9" height="21"/><path d="M20 31l5.5-10 5.5 10z"/><rect x="50" y="31" width="9" height="21"/><path d="M49 31l5.5-10 5.5 10z"/>'
+		+ '<path d="M30 36h3v-3h3v3h3v-3h2v3h3v-3h3v3h3v16H30z"/><rect x="36" y="21" width="8" height="13"/><path d="M35 21l5-11 5 11z"/></g>'
+		+ '<path d="M40 10V4l6 2-6 2" fill="' + EMBER + '" stroke="' + EMBER + '" stroke-width="1"/><path d="M37 52v-6a3 3 0 0 1 6 0v6z" fill="#5b3f6e"/>'],
+	scifi: ["#1f5e5e", '<g fill="' + INK + '" opacity=".7"><circle cx="10" cy="10" r="1"/><circle cx="20" cy="52" r="1"/><circle cx="70" cy="46" r="1.2"/><circle cx="46" cy="8" r=".9"/></g>'
+		+ '<circle cx="59" cy="20" r="8" fill="' + GOLD + '"/><ellipse cx="59" cy="20" rx="14" ry="4" fill="none" stroke="' + INK + '" stroke-width="1.8" transform="rotate(-18 59 20)"/>'
+		+ '<g transform="translate(30 34) rotate(40)"><path d="M-3 11 0 21l3-10z" fill="' + EMBER + '"/><path d="M0-17c7 6 7 20 4 28h-8c-3-8-3-22 4-28z" fill="' + INK + '"/>'
+		+ '<circle cy="-4" r="2.6" fill="#1f5e5e"/><path d="M-4 3l-6 9 6-1zM4 3l6 9-6-1z" fill="' + INK + '"/></g>'],
+	history: ["#7b4a1c", '<path d="M29 10h22M29 50h22" stroke="' + INK + '" stroke-width="3.5" stroke-linecap="round"/>'
+		+ '<path d="M32 12c0 11 7 13 7 18s-7 7-7 18h16c0-11-7-13-7-18s7-7 7-18z" fill="' + INK + '" fill-opacity=".12" stroke="' + INK + '" stroke-width="2.4"/>'
+		+ '<path d="M35 20h10c-1 3-4 5-5 6-1-1-4-3-5-6zM34 47c1-6 5-8 6-9 1 1 5 3 6 9z" fill="' + GOLD + '"/>'],
+	people: ["#4a4f63", '<rect x="25" y="9" width="30" height="40" rx="3" fill="none" stroke="' + GOLD + '" stroke-width="3"/>'
+		+ '<circle cx="40" cy="24" r="6.5" fill="' + INK + '"/><path d="M29 46c1-8 6-12 11-12s10 4 11 12z" fill="' + INK + '"/>'],
+	philosophy: ["#35524a", '<ellipse cx="40" cy="36" rx="14" ry="16" fill="' + INK + '" fill-opacity=".9"/><path d="M27 24l3-9 6 6M53 24l-3-9-6 6" fill="' + INK + '"/>'
+		+ '<g fill="#35524a"><circle cx="34" cy="30" r="5"/><circle cx="46" cy="30" r="5"/></g><g fill="' + GOLD + '"><circle cx="34" cy="30" r="2.2"/><circle cx="46" cy="30" r="2.2"/><path d="M38 36h4l-2 4z"/></g>'
+		+ '<path d="M18 53h44" stroke="' + INK + '" stroke-width="3" stroke-linecap="round"/>'],
+	religion: ["#6b2f45", '<circle cx="40" cy="20" r="13" fill="' + GOLD + '" opacity=".22"/><path d="M40 9c4 5 5 9 0 14-5-5-4-9 0-14z" fill="' + EMBER + '"/>'
+		+ '<path d="M40 14c2 3 2 5 0 7-2-2-2-4 0-7z" fill="' + GOLD + '"/><rect x="34" y="25" width="12" height="25" rx="1.5" fill="' + INK + '"/><path d="M26 51h28" stroke="' + INK + '" stroke-width="3" stroke-linecap="round"/>'],
+	science: ["#3d5a3a", '<g fill="none" stroke="' + INK + '" stroke-width="2.2"><ellipse cx="40" cy="30" rx="20" ry="7"/><ellipse cx="40" cy="30" rx="20" ry="7" transform="rotate(60 40 30)"/><ellipse cx="40" cy="30" rx="20" ry="7" transform="rotate(-60 40 30)"/></g>'
+		+ '<circle cx="40" cy="30" r="4" fill="' + GOLD + '"/>'],
+	poetry: ["#5b3f6e", '<path d="M54 8C40 12 30 26 27 44l3 1c4-14 13-26 24-37z" fill="' + INK + '"/><path d="M27 44l-3 8" stroke="' + INK + '" stroke-width="2" stroke-linecap="round"/>'
+		+ '<path d="M34 52c6-4 12 3 20-2" fill="none" stroke="' + GOLD + '" stroke-width="2" stroke-linecap="round"/>'],
+	book: ["#2f4f6f", '<path d="M40 18c-6-5-15-6-22-4v32c7-2 16-1 22 4 6-5 15-6 22-4V14c-7-2-16-1-22 4z" fill="' + INK + '"/>'
+		+ '<path d="M40 18v32" stroke="#2f4f6f" stroke-width="1.5"/><g stroke="#2f4f6f" stroke-width="1" opacity=".5"><path d="M23 22c4-1 9 0 13 2M23 28c4-1 9 0 13 2M44 24c4-2 9-3 13-2M44 30c4-2 9-3 13-2"/></g>'
+		+ '<path d="M53 12v12l3-2 3 2V12" fill="' + EMBER + '"/>']
+};
+var FICTION = [
+	["Classics", /\bclassic/, "classics"],
+	["Westerns", /\bwestern/, "westerns"],
+	["Mysteries", /\bmyster|\bdetective/, "mysteries"],
+	["Fantasy", /fantasy/, "fantasy"],
+	["Science Fiction", /science fiction|\bsci ?-?fi\b|^sf$/, "scifi"]
+];
+// Which drawing a nonfiction tag gets; anything else is an open book.
+var FACT_ART = [[/histor|\bwar\b/, "history"], [/biograph|memoir|\blives\b/, "people"], [/philosoph/, "philosophy"],
+	[/religio|theolog|bible|spiritual/, "religion"], [/scien|physics|biolog|chemis|astronom|math|nature/, "science"], [/poe/, "poetry"]];
+var NONFIC = /^non-?fiction$/;
+var pick = null, anyRecs = false;
+function svgArt(key) {
+	var a = ART[key] || ART.book;
+	return '<svg viewBox="0 0 80 60" aria-hidden="true" focusable="false"><rect width="80" height="60" fill="' + a[0] + '"/>' + a[1] + "</svg>";
+}
+function genreButton(g) {
+	var btn = h("button", "genre"), art = h("span", "art");
+	btn.type = "button";
+	btn.setAttribute("aria-pressed", String(!!pick && pick.id === g.id));
+	art.innerHTML = svgArt(g.art);
+	btn.append(art, h("span", "gl", g.label), h("span", "gn", g.n + (g.n === 1 ? " book" : " books")));
+	btn.addEventListener("click", function () {
+		pick = pick && pick.id === g.id ? null : g;
+		if (pick) { tag = ""; $("tag").value = ""; }
+		renderRecs();
+		render();
+	});
+	return btn;
+}
+function renderRecs() {
+	var fic = [], non = [], counts = {};
+	FICTION.forEach(function (f) {
+		var test = function (b) { return b.tags.some(function (t) { return f[1].test(fold(t)); }); };
+		var n = books.filter(test).length;
+		if (n) fic.push({ id: "f:" + f[0], label: f[0], art: f[2], test: test, n: n });
+	});
+	// A tag every book has (like "Books") isn't a collection.
+	var everywhere = {};
+	books.forEach(function (b) { b.tags.forEach(function (t) { everywhere[t] = (everywhere[t] || 0) + 1; }); });
+	books.forEach(function (b) {
+		if (!b.tags.some(function (t) { return NONFIC.test(fold(t)); })) return;
+		b.tags.forEach(function (t) { if (!NONFIC.test(fold(t)) && everywhere[t] < books.length) counts[t] = (counts[t] || 0) + 1; });
+	});
+	Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a] || fold(a).localeCompare(fold(b)); }).forEach(function (t) {
+		var art = "book";
+		FACT_ART.some(function (r) { if (r[0].test(fold(t))) { art = r[1]; return true; } return false; });
+		non.push({ id: "n:" + t, label: t, art: art, n: counts[t], test: function (b) {
+			return b.tags.indexOf(t) >= 0 && b.tags.some(function (x) { return NONFIC.test(fold(x)); });
+		} });
+	});
+	// A pick whose books have all gone lets go.
+	if (pick && !fic.concat(non).some(function (g) { return g.id === pick.id; })) pick = null;
+	[["fiction", "hFic", fic], ["nonfiction", "hNon", non]].forEach(function (row) {
+		var box = $(row[0]);
+		box.textContent = "";
+		row[2].forEach(function (g) { box.append(genreButton(g)); });
+		box.hidden = $(row[1]).hidden = !row[2].length;
+	});
+	anyRecs = fic.length + non.length > 0;
+}
 function renderTags() {
 	var sel = $("tag"), names = {};
 	books.forEach(function (b) { b.tags.forEach(function (t) { names[t] = 1; }); });
@@ -3276,12 +3399,14 @@ function render() {
 		if (series != null && b.series !== series) return false;
 		if (format && b.type !== format) return false;
 		if (tag && b.tags.indexOf(tag) < 0) return false;
+		if (pick && !pick.test(b)) return false;
 		var text = fold([b.title, b.author, b.series].join(" "));
 		return words.every(function (w) { return text.indexOf(w) >= 0; });
 	});
 	var ul = $("books");
 	ul.textContent = "";
 	$("up").hidden = series == null;
+	$("recs").hidden = series != null || !anyRecs;
 	if ($("welcome").hidden) $("head").textContent = series != null ? series : "The Back Alley Library";
 	$("sub").hidden = series != null || !me.name || !$("welcome").hidden;
 	// Browsing (no search, not inside a series): a series is one cover that opens to its volumes.
@@ -3318,11 +3443,12 @@ async function load() {
 	if (!books.length) $("tools").hidden = true;
 	renderFormats();
 	renderTags();
+	renderRecs();
 	render();
 	if (!books.length) $("none").textContent = "No books here yet.";
 }
 $("q").addEventListener("input", function () { query = this.value; render(); });
-$("tag").addEventListener("change", function () { tag = this.value; render(); });
+$("tag").addEventListener("change", function () { tag = this.value; if (tag && pick) { pick = null; renderRecs(); } render(); });
 window.addEventListener("hashchange", function () { render(); window.scrollTo(0, 0); });
 
 // The first time on a device: how to keep the page. The invite link works
