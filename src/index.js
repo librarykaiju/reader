@@ -3326,11 +3326,12 @@ var ART = {
 	ya: ["#7a3b2e", '<path d="M10 46c10 2 16-6 26-4" fill="none" stroke="' + INK + '" stroke-width="1.8" stroke-dasharray="3 3" stroke-linecap="round" opacity=".7"/>'
 		+ '<path d="M30 36L66 14 50 46 43 38z" fill="' + INK + '"/><path d="M43 38l23-24-19 28z" fill="#000" opacity=".18"/><path d="M43 38v8l4-4" fill="' + INK + '"/>'
 		+ '<circle cx="18" cy="16" r="5" fill="' + GOLD + '"/>'],
-	kids: ["#3b6d8f", '<g font-family="ui-rounded, system-ui, sans-serif" font-weight="800" font-size="13" text-anchor="middle" fill="#3b3024">'
-		+ '<rect x="16" y="34" width="18" height="18" rx="2" fill="' + GOLD + '"/><text x="25" y="48">A</text>'
-		+ '<rect x="36" y="34" width="18" height="18" rx="2" fill="' + EMBER + '"/><text x="45" y="48">B</text>'
-		+ '<rect x="26" y="15" width="18" height="18" rx="2" fill="' + INK + '" transform="rotate(-8 35 24)"/><text x="35" y="29" transform="rotate(-8 35 24)">C</text></g>'
-		+ '<path d="M58 22l1.5 3.5 3.5 1.5-3.5 1.5L58 32l-1.5-3.5L53 27l3.5-1.5z" fill="' + GOLD + '"/>'],
+	kids: ["#34466a", '<rect y="34" width="80" height="12" fill="' + EMBER + '" opacity=".35"/><path d="M0 48q20-6 40-2t40-1v15H0z" fill="#22301f"/><g fill="' + INK + '" opacity=".7"><circle cx="12" cy="10" r="1"/><circle cx="26" cy="6" r=".9"/><circle cx="70" cy="30" r=".9"/></g>'
+		+ '<circle cx="64" cy="12" r="5" fill="' + GOLD + '"/><circle cx="66.5" cy="10.5" r="4.4" fill="#34466a"/>'
+		+ '<path d="M36 60V40c0-3-4-6-8-7M40 60V40c0-3 5-5 9-6" fill="none" stroke="#2b2218" stroke-width="5" stroke-linecap="round"/>'
+		+ '<g fill="#2f5a3e"><circle cx="24" cy="30" r="11"/><circle cx="54" cy="29" r="11"/><circle cx="39" cy="22" r="13"/></g>'
+		+ '<path d="M28 31h24v12H28z" fill="#b9814f"/><path d="M25 32l15-10 15 10z" fill="#7a3b2e"/><rect x="35" y="34" width="7" height="6" rx="1" fill="' + GOLD + '"/>'
+		+ '<path d="M24 43h32" stroke="#2b2218" stroke-width="2"/><g stroke="' + INK + '" stroke-width="1.4" opacity=".85"><path d="M50 43v17M55 43v17M50 48h5M50 53h5M50 58h5"/></g>'],
 	palette: ["#8a4b5e", '<path d="M40 12c-15 0-26 9-26 19 0 9 8 15 16 13 4-1 4-6 8-6 3 0 3 4 7 4 9 0 17-5 17-13 0-10-10-17-22-17z" fill="' + INK + '"/>'
 		+ '<circle cx="31" cy="37" r="3.6" fill="#8a4b5e"/><circle cx="27" cy="26" r="3.4" fill="#c8322c"/><circle cx="36" cy="19" r="3.4" fill="' + GOLD + '"/>'
 		+ '<circle cx="47" cy="20" r="3.4" fill="#5f9e8f"/><circle cx="54" cy="29" r="3.4" fill="#3b6d8f"/>'
@@ -3366,7 +3367,7 @@ var FICTION = [
 	["Science Fiction", /science fiction|\bsci ?-?fi\b|^sf$/, "scifi"],
 	["Horror", /horror/, "horror"],
 	["Young Adult", /young adult|\bya\b|\bteen/, "ya"],
-	["Kid Lit", /children|\bkids?\b/, "kids"]
+	["Middle Grade", /middle grade|children|\bkids?\b/, "kids"]
 ];
 // Which drawing a nonfiction tag gets. No two cards share one: a tag whose
 // drawing is taken, or that matches none, gets the next spare.
