@@ -3438,7 +3438,7 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	summary { cursor: pointer; color: var(--accent); }
 	.go { appearance: none; width: 100%; border: 0; border-radius: 10px; background: var(--accent); color: var(--on-accent); font-weight: 600; font-size: 17px; min-height: 48px; margin-top: 10px; cursor: pointer; }
 	.sub { margin: -8px 0 14px; font-size: 14px; }
-	.intro { max-width: 640px; margin: 0 0 20px; font: 400 17px/1.55 var(--display); }
+	.intro { margin: 0 0 20px; font: 400 17px/1.55 var(--display); }
 	.intro p { margin: 0 0 10px; }
 	/* The landing page: noir. Near-black, light through venetian blinds,
 	   white type, one red accent. */
