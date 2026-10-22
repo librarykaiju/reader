@@ -2855,8 +2855,9 @@ async function familyDownload(env, id, person) {
 // has nothing on gets no terms rather than guessed ones.
 //
 // A record is filled the first time anyone opens it and kept (record_at);
-// one that got no appeal terms is tried again after a week. Anything typed
-// in Edit details is marked "edited" and never replaced.
+// one that got no appeal terms is tried again after a day, or at once by
+// Look up records, and record_from.appeal_error says why it got none.
+// Anything typed in Edit details is marked "edited" and never replaced.
 
 const APPEAL = {
 	pacing: ["Fast-paced", "Steady", "Leisurely", "Slow-building", "Unhurried", "Episodic"],
@@ -2874,7 +2875,7 @@ const APPEAL = {
 const RECORD_CLAUDE_MODEL = "claude-opus-5-5";
 const RECORD_AI_MODEL = COVERAGE_AI_MODEL;
 const BLURB_MAX = 4000;
-const RECORD_RETRY_MS = 7 * 24 * 60 * 60 * 1000;
+const RECORD_RETRY_MS = 24 * 60 * 60 * 1000;
 // Words to a printed page, for an estimate (the reader's CHARS_PER_PAGE is this at 6 characters a word).
 const WORDS_PER_PAGE = 275;
 
@@ -2983,6 +2984,16 @@ const APPEAL_SCHEMA = {
 	},
 };
 
+const APPEAL_AI_SCHEMA = {
+	type: "object",
+	required: APPEAL_SCHEMA.required,
+	properties: {
+		known: { type: "boolean" },
+		...Object.fromEntries(Object.keys(APPEAL).map((k) => [k, { type: "array", items: { type: "string" } }])),
+		blurb: { type: "string" },
+	},
+};
+
 function appealPrompt(book, blurb, tags) {
 	const lines = [
 		`Title: ${book.title}`,
@@ -3023,12 +3034,20 @@ async function appealTerms(env, book, blurb, tags) {
 		answer = JSON.parse((data.content || []).filter((b) => b.type === "text").map((b) => b.text).join(""));
 		model = RECORD_CLAUDE_MODEL;
 	} else {
+		// Workers AI's JSON mode gives up ("JSON Mode couldn't be met") on a
+		// schema this size with enums, so its schema has plain strings, the
+		// allowed terms go in the prompt, and cleanAppeal keeps only those.
+		const lists = Object.entries(APPEAL).map(([k, terms]) => `${k}: ${terms.join(", ")}`).join("\n");
 		const out = await env.AI.run(RECORD_AI_MODEL, {
-			messages: [{ role: "system", content: APPEAL_SYSTEM }, { role: "user", content: appealPrompt(book, blurb, tags) }],
-			response_format: { type: "json_schema", json_schema: APPEAL_SCHEMA },
+			messages: [
+				{ role: "system", content: `${APPEAL_SYSTEM}\n\nAllowed terms, by factor:\n${lists}` },
+				{ role: "user", content: appealPrompt(book, blurb, tags) },
+			],
+			response_format: { type: "json_schema", json_schema: APPEAL_AI_SCHEMA },
 			max_tokens: 800,
 		});
-		answer = typeof out?.response === "string" ? JSON.parse(out.response) : out?.response;
+		const raw = out?.response;
+		answer = typeof raw === "string" ? JSON.parse((/\{[\s\S]*\}/.exec(raw) || [raw])[0]) : raw;
 		model = RECORD_AI_MODEL.replace(/^@cf\/[^/]+\//, "");
 	}
 	if (!answer || typeof answer !== "object") throw new Error("No answer");
@@ -3039,10 +3058,12 @@ async function appealTerms(env, book, blurb, tags) {
 // allowed ones (a model's), else anything (typed in Edit details). null when empty.
 function cleanAppeal(a, strict) {
 	if (!a || typeof a !== "object") return null;
-	const out = {};
+	const out = {}, key = (t) => String(t).toLowerCase().replace(/[^a-z]+/g, "");
 	for (const [k, terms] of Object.entries(APPEAL)) {
 		const got = Array.isArray(a[k]) ? a[k] : [];
-		const list = [...new Set(got.map((t) => str(t, 40)).filter((t) => t && (!strict || terms.includes(t))))].slice(0, strict ? 3 : 6);
+		// A model's "fast paced" is the list's "Fast-paced".
+		const named = strict ? got.map((t) => terms.find((x) => key(x) === key(t))) : got.map((t) => str(t, 40));
+		const list = [...new Set(named.filter(Boolean))].slice(0, strict ? 3 : 6);
 		if (list.length) out[k] = list;
 	}
 	return Object.keys(out).length ? out : null;
@@ -3054,10 +3075,11 @@ function recordJSON(book) {
 	try { from = JSON.parse(book.record_from || "{}") || {}; } catch {}
 	return { blurb: book.blurb || null, pages: book.pages || null, appeal, from, filled: !!book.record_at };
 }
-function recordDue(book) {
+// soon: the owner's Look up records, which tries a record without appeal terms again at once.
+function recordDue(book, soon) {
 	if (!book.record_at) return true;
 	const r = recordJSON(book);
-	return !r.appeal && r.from.appeal !== "edited" && Date.now() - book.record_at > RECORD_RETRY_MS;
+	return !r.appeal && r.from.appeal !== "edited" && (soon || Date.now() - book.record_at > RECORD_RETRY_MS);
 }
 
 // Fills in what's missing (all of it with refresh, except anything edited)
@@ -3082,8 +3104,16 @@ async function fillRecord(env, book, refresh) {
 	if (!keep("appeal")) {
 		const { results } = await env.DB.prepare("SELECT t.name FROM book_tag_links l JOIN book_tags t ON t.id = l.tag_id WHERE l.book_id = ?").bind(book.id).all();
 		const tags = results.map((r) => r.name).filter((t) => t.toLowerCase() !== HIDE_TAG.toLowerCase() && t.toLowerCase() !== "books");
-		const got = await within(() => appealTerms(env, book, blurb, tags).catch((err) => { console.warn("appeal", book.id, err); return null; }), null, 40000);
+		// Why there are no terms, kept for Edit details: no model set up, the model's error, or it didn't know the book.
+		let why = "";
+		const got = await within(() => appealTerms(env, book, blurb, tags).catch((err) => {
+			console.warn("appeal", book.id, err);
+			why = String(err?.message || err).slice(0, 200);
+			return null;
+		}), null, 40000);
+		delete from.appeal_error;
 		if (got?.appeal) { appeal = got.appeal; from.appeal = got.model; }
+		else from.appeal_error = why || (got ? `${got.model} didn't know this book` : env.ANTHROPIC_API_KEY || env.AI ? "the model took too long" : "no AI binding or ANTHROPIC_API_KEY");
 		if (got?.blurb && !blurb) { blurb = got.blurb; from.blurb = "ai"; from.blurb_model = got.model; }
 	}
 	const row = await env.DB.prepare("UPDATE books SET blurb = ?, pages = ?, appeal = ?, record_from = ?, record_at = ? WHERE id = ? RETURNING blurb, pages, appeal, record_from, record_at")
@@ -3101,7 +3131,7 @@ async function familyRecord(env, id) {
 async function ownerRecord(env, id, url) {
 	const book = await getBook(env, id);
 	const refresh = url.searchParams.has("refresh");
-	const record = refresh || (url.searchParams.has("fill") && recordDue(book)) ? await fillRecord(env, book, refresh) : recordJSON(book);
+	const record = refresh || (url.searchParams.has("fill") && recordDue(book, true)) ? await fillRecord(env, book, refresh) : recordJSON(book);
 	return json({ id, record });
 }
 
@@ -8636,7 +8666,8 @@ function fillDetailsRecord(rec) {
 	$("dRecStatus").textContent = !rec ? "" : !rec.filled ? "Not looked up yet." : [
 		from.blurb && from.blurb !== "edited" && "copy from " + ({ file: "the file", openlibrary: "Open Library", google: "Google Books", ai: "AI" }[from.blurb] || from.blurb),
 		from.pages === "estimate" && "pages estimated",
-		from.appeal && from.appeal !== "edited" && "terms by " + from.appeal
+		from.appeal && from.appeal !== "edited" && "terms by " + from.appeal,
+		from.appeal_error && "no appeal factors: " + from.appeal_error
 	].filter(Boolean).join(", ");
 }
 // how: "" (as saved), "fill" (look up if never done) or "refresh" (again, keeping edits).
@@ -8984,20 +9015,21 @@ async function recordSelected() {
 	var books = selectedBooks(), btn = $("libSelRecord");
 	if (!books.length) return;
 	btn.disabled = true;
-	var done = 0, terms = 0, failed = [];
+	var done = 0, terms = 0, why = "", failed = [];
 	for (var i = 0; i < books.length; i++) {
 		$("libSelN").textContent = "Looking up " + (i + 1) + " of " + books.length + "…";
 		try {
 			var d = await apiJSON("/api/books/" + books[i].id + "/record?fill=1");
 			done++;
 			if (d.record.appeal) terms++;
+			else why = why || d.record.from.appeal_error || "";
 		} catch (e) {
 			if (e.message === UNAUTH) return;
 			failed.push(books[i].title);
 		}
 	}
 	renderBooks();
-	var msg = done ? "Records ready for " + done + (done === 1 ? " book" : " books") + (terms < done ? " (" + (done - terms) + " without appeal terms)." : ".") : "";
+	var msg = done ? "Records ready for " + done + (done === 1 ? " book" : " books") + (terms < done ? " (" + (done - terms) + " without appeal factors" + (why ? ", e.g. " + why : "") + ")." : ".") : "";
 	if (failed.length) fail(new Error((msg ? msg + " " : "") + "Couldn't look up " + failed.join(", ") + "."));
 	else toast(msg);
 }
