@@ -87,7 +87,7 @@
 //   PATCH  /api/highlights/:id     {note?, start_pos?, end_pos?} (note null or "" = no note)
 //   DELETE /api/highlights/:id
 //   GET    /api/people             -> {"people": [...each with signed_in, invite_expires_at, last_seen_at, downloads,
-//                                  requested_at and request_note (a library card request not yet answered)]}
+//                                  requested_at, request_note and request_email (a library card request not yet answered)]}
 //   POST   /api/people             {name} -> {"person", "code"}: a new family member and their invite code
 //   POST   /api/people/:id/link    -> {"person", "code"}: a fresh invite code; signs out their devices
 //                                  (on a request: approves it)
@@ -2806,6 +2806,8 @@ async function requestCard(request, env) {
 	if (str(data.website, 200)) return json({ ok: true });
 	const name = str(data.name, 60);
 	if (!name) throw new HttpError(400, "Please give your name");
+	const email = str(data.email, 254);
+	if (email && !/^[^\s@<>,;"]+@[^\s@<>,;"]+\.[^\s@<>,;"]+$/.test(email)) throw new HttpError(400, "That email doesn't look right. Please check it, or leave it empty.");
 	const ip = request.headers.get("CF-Connecting-IP") || "";
 	if (turnstileOn(env) && !(await turnstileOk(env, str(data.check, 4096), ip))) {
 		throw new HttpError(403, "The check didn't go through. Please try it again.");
@@ -2815,13 +2817,13 @@ async function requestCard(request, env) {
 	if (recent >= REQUESTS_PER_IP_PER_DAY) throw new HttpError(429, "You've already sent a few requests today. Please wait for an answer.");
 	const waiting = await env.DB.prepare("SELECT COUNT(*) AS n FROM people WHERE requested_at IS NOT NULL").first("n");
 	if (waiting >= REQUESTS_WAITING_MAX) throw new HttpError(429, "Too many requests are waiting right now. Please try again later.");
-	await env.DB.prepare("INSERT INTO people (name, created_at, requested_at, request_note, request_ip) VALUES (?, ?, ?, ?, ?)")
-		.bind(name, now, now, str(data.note, 300), ipHash).run();
+	await env.DB.prepare("INSERT INTO people (name, created_at, requested_at, request_note, request_ip, request_email) VALUES (?, ?, ?, ?, ?, ?)")
+		.bind(name, now, now, str(data.note, 300), ipHash, email).run();
 	return json({ ok: true }, 201);
 }
 
 // The owner's side: the Family screen.
-const PERSON_COLUMNS = `id, name, created_at, last_seen_at, invite_expires_at, requested_at, request_note, token_hash IS NOT NULL AS signed_in,
+const PERSON_COLUMNS = `id, name, created_at, last_seen_at, invite_expires_at, requested_at, request_note, request_email, token_hash IS NOT NULL AS signed_in,
 	(SELECT COUNT(*) FROM downloads d WHERE d.person_id = people.id) AS downloads`;
 
 async function listPeople(env) {
@@ -3130,7 +3132,8 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.stamp:disabled { opacity: .5; }
 	.noir label { display: block; font: 600 11px/1.3 var(--sans); letter-spacing: .22em; text-transform: uppercase; color: #8f8a82; margin: 22px 0 6px; }
 	.noir label .muted { color: #5f5b55; letter-spacing: .1em; }
-	.noir input[type=text], .noir textarea { width: 100%; border: 0; border-bottom: 1px solid rgba(255,255,255,.28); background: transparent; color: #f4f1ea; padding: 8px 0;
+	.noir .hint { margin-top: 6px; font: 400 13px/1.4 var(--sans); color: #5f5b55; }
+	.noir input[type=text], .noir input[type=email], .noir textarea { width: 100%; border: 0; border-bottom: 1px solid rgba(255,255,255,.28); background: transparent; color: #f4f1ea; padding: 8px 0;
 		font: 300 21px/1.4 var(--display); border-radius: 0; }
 	.noir textarea { resize: vertical; min-height: 60px; }
 	.noir input:focus, .noir textarea:focus { outline: none; border-bottom-color: #c8322c; }
@@ -3153,6 +3156,9 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 		<form id="lForm" hidden>
 			<label for="lName">Your name</label>
 			<input id="lName" type="text" maxlength="60" autocomplete="name" autocapitalize="words" required>
+			<label for="lEmail">Your email <span class="muted">(optional)</span></label>
+			<input id="lEmail" type="email" maxlength="254" autocomplete="email" autocapitalize="off" spellcheck="false">
+			<div class="hint">I'll send your library card here.</div>
 			<label for="lNote">How do I know you? <span class="muted">(optional)</span></label>
 			<textarea id="lNote" maxlength="300"></textarea>
 			<div class="hp" aria-hidden="true"><label for="lSite">Website</label><input id="lSite" type="text" tabindex="-1" autocomplete="off"></div>
@@ -3587,7 +3593,7 @@ $("lForm").addEventListener("submit", async function (e) {
 	$("lSend").disabled = true;
 	try {
 		var res = await fetch("/api/family/request", { method: "POST", headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ name: name, note: $("lNote").value.trim(), website: $("lSite").value, check: checkToken }) });
+			body: JSON.stringify({ name: name, email: $("lEmail").value.trim(), note: $("lNote").value.trim(), website: $("lSite").value, check: checkToken }) });
 		var d = await res.json().catch(function () { return {}; });
 		if (!res.ok) {
 			// A token works once; a fresh one for the next try.
@@ -6221,10 +6227,16 @@ setInterval(function () { if (document.visibilityState === "visible") checkReque
 function requestRow(p) {
 	var li = h("li", "req"), who = h("div", "who"), acts = h("div", "acts");
 	who.append(h("b", null, p.name), h("span", null, "Asked for a library card " + ago(p.requested_at)));
+	if (p.request_email) who.append(h("div", "muted", p.request_email));
 	if (p.request_note) who.append(h("q", null, p.request_note));
 	acts.append(
 		button("Approve", "btn small primary", function () {
-			apiJSON("/api/people/" + p.id + "/link", { method: "POST" }).then(function (d) { showInvite(d.person, d.code); window.scrollTo(0, 0); return loadPeople(); }).catch(fail);
+			apiJSON("/api/people/" + p.id + "/link", { method: "POST" }).then(function (d) {
+				showInvite(d.person, d.code, p.request_email);
+				if (p.request_email) location.href = inviteMail(p.name, p.request_email, inviteLink(d.code));
+				window.scrollTo(0, 0);
+				return loadPeople();
+			}).catch(fail);
 		}),
 		button("Decline", "btn small danger", function () {
 			if (!confirm("Decline " + p.name + "'s request?")) return;
@@ -6258,7 +6270,7 @@ function renderPeople(people) {
 		acts.append(
 			button("New link", "btn small", function () {
 				if (p.signed_in && !confirm("Make a new link for " + p.name + "? Their old link and every device they're signed in on stop working.")) return;
-				apiJSON("/api/people/" + p.id + "/link", { method: "POST" }).then(function (d) { showInvite(d.person, d.code); return loadPeople(); }).catch(fail);
+				apiJSON("/api/people/" + p.id + "/link", { method: "POST" }).then(function (d) { showInvite(d.person, d.code, p.request_email); return loadPeople(); }).catch(fail);
 			}),
 			button("Remove", "btn small danger", function () {
 				if (!confirm("Remove " + p.name + "? They're signed out at once, and their download history goes too.")) return;
@@ -6273,8 +6285,18 @@ function renderPeople(people) {
 	show($("famEmpty"), !people.length);
 }
 // The link is shown once: only its hash is kept, so "New link" is the way to get another.
-function showInvite(person, code) {
-	var box = $("famLink"), link = location.origin + "/library#invite=" + code;
+function inviteLink(code) { return location.origin + "/library#invite=" + code; }
+// A ready-to-send email in the owner's own mail app; nothing goes through the Worker.
+function inviteMail(name, email, link) {
+	var first = name.split(/\s+/)[0];
+	var body = "Hi " + first + ",\n\n" +
+		"Your library card came through. Here's your way into The Back Alley Library:\n\n" + link + "\n\n" +
+		"It's yours alone: it works once, on the device you open it on, and runs out in 7 days. Open it on the phone or tablet you'll read on, then save the page so you can find your way back.\n\n" +
+		"See you in the stacks.";
+	return "mailto:" + email.replace(/[?&#%]/g, encodeURIComponent) + "?subject=" + encodeURIComponent("Your library card for The Back Alley Library") + "&body=" + encodeURIComponent(body);
+}
+function showInvite(person, code, email) {
+	var box = $("famLink"), link = inviteLink(code);
 	box.textContent = "";
 	box.dataset.person = person.id;
 	var input = h("input");
@@ -6287,6 +6309,7 @@ function showInvite(person, code) {
 	row.append(button("Copy", "btn small", function () {
 		navigator.clipboard.writeText(link).then(function () { toast("Link copied."); }, function () { input.select(); });
 	}));
+	if (email) row.append(button("Email", "btn small", function () { location.href = inviteMail(person.name, email, link); }));
 	if (navigator.share) row.append(button("Share", "btn small", function () {
 		navigator.share({ title: "Reader library", text: "Here's your link to my library. It works once, on the device you open it on.", url: link }).catch(function () {});
 	}));
