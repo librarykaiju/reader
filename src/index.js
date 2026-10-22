@@ -3683,6 +3683,23 @@ function renderFormats() {
 		box.append(btn);
 	});
 }
+// A series is one series however its name was typed, as in the app's
+// Library: names that fold the same group together. Every volume shows the
+// spelling with the most capitals (a name typed lazily loses them; one in all
+// capitals counts least), and on a tie the one most volumes use.
+function sameSeries(list) {
+	var names = {};
+	list.forEach(function (b) {
+		if (!b.series) return;
+		var k = fold(b.series), n = names[k] = names[k] || {};
+		n[b.series] = (n[b.series] || 0) + 1;
+	});
+	var caps = function (s) { return s === s.toUpperCase() ? -1 : s.replace(/[^A-Z]/g, "").length; };
+	Object.keys(names).forEach(function (k) {
+		names[k] = Object.keys(names[k]).sort(function (a, b) { return caps(b) - caps(a) || names[k][b] - names[k][a]; })[0];
+	});
+	list.forEach(function (b) { if (b.series) b.series = names[fold(b.series)]; });
+}
 function seriesCard(name, vols) {
 	var li = h("li", "series"), a = h("a"), first = card(vols[0]).querySelector(".cover");
 	a.href = "#series=" + encodeURIComponent(name);
@@ -3869,7 +3886,7 @@ function render() {
 	$("head").hidden = false;
 	var series = openSeries(), words = fold(query).split(/\s+/).filter(Boolean);
 	var shown = books.filter(function (b) {
-		if (series != null && b.series !== series) return false;
+		if (series != null && fold(b.series) !== fold(series)) return false;
 		if (format && b.type !== format) return false;
 		if (tag && b.tags.indexOf(tag) < 0) return false;
 		if (pick && !pick.test(b)) return false;
@@ -3880,7 +3897,7 @@ function render() {
 	ul.textContent = "";
 	$("up").hidden = series == null;
 	$("recs").hidden = series != null || !anyRecs;
-	if ($("welcome").hidden) $("head").textContent = series != null ? series : "The Back Alley Library";
+	if ($("welcome").hidden) $("head").textContent = series != null ? (shown[0] ? shown[0].series : series) : "The Back Alley Library";
 	$("sub").hidden = series != null || !me.name || !$("welcome").hidden;
 	// Browsing (no search, not inside a series): a series is one cover that opens to its volumes.
 	var group = series == null && !words.length, seen = {};
@@ -4014,6 +4031,7 @@ async function load() {
 	books = (data.books || []).slice().sort(function (a, b) {
 		return fold(a.series || a.title).localeCompare(fold(b.series || b.title)) || (parseFloat(a.volume) || 0) - (parseFloat(b.volume) || 0) || fold(a.title).localeCompare(fold(b.title));
 	});
+	sameSeries(books);
 	say("");
 	if ($("welcome").hidden) $("lib").hidden = false;
 	if (!books.length) $("tools").hidden = true;
