@@ -4342,7 +4342,6 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 			<section id="rAppealSec" class="rsec" hidden>
 				<h2>Appeal factors</h2>
 				<dl id="rAppeal" class="appeal"></dl>
-				<p id="rAppealNote" class="note" hidden></p>
 			</section>
 		</article>
 		<article id="preview" class="preview" hidden>
@@ -4791,9 +4790,6 @@ function recordDetails(b, rec) {
 		any = true;
 	});
 	$("rAppealSec").hidden = !any;
-	var an = $("rAppealNote"), by = rec.from.appeal;
-	an.textContent = by === "edited" ? "" : "Picked by " + who(by) + " from what it knows of the book, the way a librarian sums one up.";
-	an.hidden = !any || by === "edited";
 	if (!rec.blurb && !any) {
 		$("rBlurbSec").hidden = false;
 		box.innerHTML = '<p class="muted">Nothing more on this one yet.</p>';
