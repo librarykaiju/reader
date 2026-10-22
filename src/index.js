@@ -4433,6 +4433,8 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.rdl { display: flex; align-items: center; justify-content: center; gap: 8px; max-width: 340px; text-decoration: none; margin-top: 0; }
 	.rdl.off { background: var(--line); color: var(--muted); }
 	.rleft { font-size: 14px; margin: 8px 0 0; }
+	/* The audiobook's buttons, under the ebook's when the library has both. */
+	.raudio { margin-top: 16px; }
 	.rsec { border-top: 1px solid var(--line); margin-top: 30px; padding-top: 18px; }
 	.rsec h2 { font: 600 12px/1.2 var(--sans); letter-spacing: .16em; text-transform: uppercase; color: var(--muted); margin: 0 0 12px; }
 	.blurb p { font: 400 18px/1.6 var(--display); margin: 0 0 14px; max-width: 62ch; }
@@ -4585,6 +4587,13 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 						<a id="rPv" class="rpv" href="#">Preview</a>
 					</div>
 					<p id="rLeft" class="rleft muted"></p>
+					<div id="rAudio" class="raudio" hidden>
+						<div class="rbtns">
+							<a id="rAdl" class="go rdl" href="#"></a>
+							<a id="rListen" class="rpv" href="#">Listen</a>
+						</div>
+						<p id="rALeft" class="rleft muted"></p>
+					</div>
 				</div>
 			</div>
 			<section id="rBlurbSec" class="rsec">
@@ -4671,6 +4680,8 @@ function drawnCover(b) {
 function fillCover(cov, b) {
 	cov.textContent = "";
 	cov.append(drawnCover(b));
+	// An ebook with no cover of its own borrows its audiobook's (which is square, so it's second choice).
+	if (b.audio && b.audio.cover !== "none" && (b.cover === "none" || (b.cover == null && b.type !== "epub" && b.type !== "cbz"))) b = b.audio;
 	if (b.cover === "yes" || (b.cover !== "none" && (b.type === "epub" || b.type === "cbz" || b.type === "audiobook"))) {
 		var img = h("img");
 		img.alt = "";
@@ -4687,18 +4698,57 @@ function card(b) {
 	var li = h("li"), a = h("a"), cov = fillCover(h("div", "cover"), b);
 	a.href = "#book=" + b.id;
 	a.addEventListener("click", function () { listScroll = window.scrollY; viaList = true; });
-	a.setAttribute("aria-label", b.title + (b.author ? " by " + b.author : "") + ", " + KIND[b.type]);
+	a.setAttribute("aria-label", b.title + (b.author ? " by " + b.author : "") + ", " + KIND[b.type] + (b.audio ? " and audiobook" : ""));
 	var by = [b.author, b.series ? b.series + (b.volume ? " " + b.volume : "") : null].filter(Boolean).join(" · ");
 	a.append(cov, h("span", "ct", b.title));
 	if (by) a.append(h("span", "ca", by));
-	a.append(h("span", "dl", KIND[b.type] + " · " + (b.type === "audiobook" ? hours(b.duration) : bytes(b.size))));
+	a.append(h("span", "dl", KIND[b.type] + " · " + (b.type === "audiobook" ? hours(b.duration) : b.audio ? "Audiobook" : bytes(b.size))));
 	li.append(a);
 	return li;
 }
 
+// A book the library has as an ebook and an audiobook is one Record with
+// both: the audiobook joins the ebook with the same title (before any
+// subtitle) and an author sharing a word, as b.audio (and it gets .parent).
+// An audiobook with no ebook stays a book of its own.
+function titleKey(b) { return fold(b.title).split(/[:(\[]/)[0].replace(/[^a-z0-9]+/g, " ").trim(); }
+function authorWords(b) { return fold(b.author).replace(/[^a-z]+/g, " ").trim().split(" ").filter(function (w) { return w.length > 1; }); }
+function pairAudio(list) {
+	var ebooks = {};
+	list.forEach(function (b) {
+		var k = titleKey(b);
+		if (b.type !== "audiobook" && k) (ebooks[k] = ebooks[k] || []).push(b);
+	});
+	return list.filter(function (b) {
+		if (b.type !== "audiobook") return true;
+		var words = authorWords(b), e = (ebooks[titleKey(b)] || []).filter(function (x) {
+			var theirs = authorWords(x);
+			return !x.audio && (!words.length && !theirs.length || words.some(function (w) { return theirs.indexOf(w) >= 0; }));
+		})[0];
+		if (!e) return true;
+		e.audio = b;
+		b.parent = e;
+		// Audiobookshelf's title, author and series are shown for both.
+		e.fileTitle = e.title;
+		e.title = b.title;
+		if (b.author) e.author = b.author;
+		if (b.series) { e.series = b.series; e.volume = b.volume; }
+		return false;
+	});
+}
+function findBook(id) {
+	for (var i = 0; i < books.length; i++) {
+		if (books[i].id === id) return books[i];
+		if (books[i].audio && books[i].audio.id === id) return books[i].audio;
+	}
+	return null;
+}
 function renderFormats() {
 	var box = $("formats"), have = {};
-	books.forEach(function (b) { have[b.type] = (have[b.type] || 0) + 1; });
+	books.forEach(function (b) {
+		have[b.type] = (have[b.type] || 0) + 1;
+		if (b.audio) have.audiobook = (have.audiobook || 0) + 1;
+	});
 	var kinds = Object.keys(FORMATS).filter(function (k) { return have[k]; });
 	box.textContent = "";
 	box.hidden = kinds.length < 2;
@@ -4903,8 +4953,9 @@ function renderTags() {
 	sel.hidden = !list.length;
 }
 function render() {
-	var id = openBook(), rb = id && books.filter(function (b) { return b.id === id; })[0];
-	var pid = openPreview(), pb = pid && books.filter(function (b) { return b.id === pid; })[0];
+	// An audiobook paired with its ebook opens the ebook's Record, and plays on its own.
+	var id = openBook(), rb = id && findBook(id), pid = openPreview(), pb = pid && findBook(pid);
+	if (rb && rb.parent) rb = rb.parent;
 	$("browse").hidden = !!(rb || pb);
 	$("record").hidden = !rb;
 	$("preview").hidden = !pb;
@@ -4919,10 +4970,10 @@ function render() {
 	var series = openSeries(), words = fold(query).split(/\s+/).filter(Boolean);
 	var shown = books.filter(function (b) {
 		if (series != null && fold(b.series) !== fold(series)) return false;
-		if (format && b.type !== format) return false;
+		if (format && b.type !== format && !(format === "audiobook" && b.audio)) return false;
 		if (tag && b.tags.indexOf(tag) < 0) return false;
 		if (pick && !pick.test(b)) return false;
-		var text = fold([b.title, b.author, b.series].join(" "));
+		var text = fold([b.title, b.author, b.series, b.fileTitle].join(" "));
 		return words.every(function (w) { return text.indexOf(w) >= 0; });
 	});
 	var ul = $("books");
@@ -5000,25 +5051,55 @@ function showRecord(b) {
 	pv.textContent = listen ? "Listen" : "Preview";
 	pv.setAttribute("aria-label", (listen ? "Listen to " : "Preview ") + b.title);
 	pv.onclick = function () { viaRecord = true; };
+	$("rAudio").hidden = !b.audio;
+	if (b.audio) {
+		downloadButton($("rAdl"), $("rALeft"), b.audio);
+		$("rListen").href = "#preview=" + b.audio.id;
+		$("rListen").setAttribute("aria-label", "Listen to " + b.title);
+		$("rListen").onclick = function () { viaRecord = true; };
+	}
 	if (records[b.id]) return recordDetails(b, records[b.id]);
 	$("rBlurbSec").hidden = false;
 	$("rBlurb").innerHTML = '<p class="muted">Looking this book up…</p>';
 	$("rBlurbNote").hidden = $("rAppealSec").hidden = true;
-	fetch("/api/family/books/" + b.id).then(function (res) {
-		if (!res.ok) throw new Error();
-		return res.json();
-	}).then(function (d) {
-		records[b.id] = d.record;
-		if (openBook() === b.id) { recordFacts(b, d.record); recordDetails(b, d.record); }
+	var get = function (id) {
+		return fetch("/api/family/books/" + id).then(function (res) {
+			if (!res.ok) throw new Error();
+			return res.json();
+		}).then(function (d) { return d.record; });
+	};
+	Promise.all([get(b.id), b.audio ? get(b.audio.id).catch(function () { return null; }) : null]).then(function (r) {
+		var rec = records[b.id] = withAudio(r[0], r[1]);
+		if (openBook() === b.id) { recordFacts(b, rec); recordDetails(b, rec); }
 	}).catch(function () {
 		if (openBook() === b.id) $("rBlurb").innerHTML = '<p class="muted">Couldn\'t look this book up just now.</p>';
 	});
+}
+// A book with an audiobook too: Audiobookshelf's details (usually
+// Audible's, once matched there) come first for what the two share. Its
+// description wins over any but one edited by hand. Publisher, year and
+// ISBN describe an edition, and the audiobook's are the recording's, so
+// the ebook's stay and the audiobook's only fill gaps. Appeal terms the
+// ebook lacks come from the audiobook's record.
+function withAudio(rec, audio) {
+	if (!audio) return rec;
+	var out = Object.assign({}, rec, { from: Object.assign({}, rec.from), catalog: Object.assign({}, rec.catalog) });
+	if (audio.blurb && audio.from.blurb === "file" && rec.from.blurb !== "edited") {
+		out.blurb = audio.blurb;
+		out.from.blurb = "abs";
+	}
+	Object.keys(audio.catalog || {}).forEach(function (k) {
+		if (k !== "isbn" && !out.catalog[k]) out.catalog[k] = audio.catalog[k];
+	});
+	if (!rec.appeal && audio.appeal) out.appeal = audio.appeal;
+	return out;
 }
 function recordFacts(b, rec) {
 	var dl = $("rFacts"), add = function (k, v) { if (v) dl.append(h("dt", null, k), h("dd", null, v)); };
 	dl.textContent = "";
 	add("Format", KIND[b.type] + " · " + bytes(b.size));
 	if (b.type === "audiobook") { add("Length", hours(b.duration)); add("Narrator", b.narrator); }
+	if (b.audio) { add("Audiobook", hours(b.audio.duration) + " · " + bytes(b.audio.size)); add("Narrator", b.audio.narrator); }
 	if (rec && rec.pages) add("Length", (rec.from.pages === "estimate" ? "About " : "") + rec.pages.toLocaleString() + (rec.pages === 1 ? " page" : " pages"));
 	var c = rec && rec.catalog || {};
 	add("Published", c.year);
@@ -5050,7 +5131,7 @@ function recordDetails(b, rec) {
 	var box = $("rBlurb"), note = $("rBlurbNote"), who = function (m) { return /^claude/.test(m || "") ? "Claude" : "an AI model"; };
 	box.textContent = "";
 	(rec.blurb || "").split(/\n\s*\n/).forEach(function (p) { if (p.trim()) box.append(h("p", null, p.trim())); });
-	var said = { openlibrary: "From Open Library.", google: "From Google Books.",
+	var said = { openlibrary: "From Open Library.", google: "From Google Books.", abs: "From the audiobook's details.",
 		ai: "This one had no jacket copy, so " + who(rec.from.blurb_model) + " wrote this summary." }[rec.from.blurb];
 	note.textContent = said || "";
 	note.hidden = !said || !rec.blurb;
@@ -5089,7 +5170,7 @@ function showPreview(b) {
 	var listen = b.type === "audiobook";
 	document.title = (listen ? "Listen: " : "Preview: ") + b.title + " · The Back Alley Library";
 	$("pvEye").textContent = listen ? "Listen" : "Preview";
-	$("pvBack").href = "#book=" + b.id;
+	$("pvBack").href = "#book=" + (b.parent || b).id;
 	$("pvBack").textContent = "‹ Back to the record";
 	$("pvTitle").textContent = b.title;
 	$("pvBy").textContent = b.author ? "by " + b.author : "";
@@ -5370,7 +5451,7 @@ async function load() {
 	$("intro").hidden = false;
 	if (invite || !read("familyWelcomed")) welcome(true);
 	var data = await (await fetch("/api/family/books")).json();
-	books = (data.books || []).slice().sort(function (a, b) {
+	books = pairAudio((data.books || []).slice()).sort(function (a, b) {
 		return fold(a.series || a.title).localeCompare(fold(b.series || b.title)) || (parseFloat(a.volume) || 0) - (parseFloat(b.volume) || 0) || fold(a.title).localeCompare(fold(b.title));
 	});
 	sameSeries(books);
