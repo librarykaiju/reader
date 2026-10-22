@@ -139,7 +139,7 @@ const BOOK_TYPE = "CASE WHEN filename LIKE '%.cbz' THEN 'cbz' WHEN filename LIKE
 function storedType(ext) { return ext === "cbz" || ext === "epub" ? "pdf" : ext; }
 function bookType(book) { const m = /\.(cbz|epub)$/i.exec(book.filename); return m ? m[1].toLowerCase() : book.type; }
 // Every book column but r2_key, which never leaves the Worker.
-const BOOK_COLUMNS = `id, title, filename, ${BOOK_TYPE} AS type, size, position, finished_at, created_at, last_opened_at, author, series, volume, layout`;
+const BOOK_COLUMNS = `id, title, filename, ${BOOK_TYPE} AS type, size, position, finished_at, created_at, last_opened_at, author, series, volume, layout, pages`;
 // An item with a media file is a podcast episode, or a video if the file is
 // video; YouTube, Twitch and Vimeo videos are stored as video/x-youtube etc.
 const VIEWS = {
@@ -2875,7 +2875,7 @@ const RECORD_CLAUDE_MODEL = "claude-opus-5-5";
 const RECORD_AI_MODEL = COVERAGE_AI_MODEL;
 const BLURB_MAX = 4000;
 const RECORD_RETRY_MS = 7 * 24 * 60 * 60 * 1000;
-// Words to a printed page, for an estimate.
+// Words to a printed page, for an estimate (the reader's CHARS_PER_PAGE is this at 6 characters a word).
 const WORDS_PER_PAGE = 275;
 
 // The named entities descriptions use besides XML's own.
@@ -4322,6 +4322,12 @@ const PAGE = String.raw`<!doctype html>
 		font-family: var(--display); font-weight: 600; font-optical-sizing: auto; }
 	.listhead h2, .article .title { letter-spacing: -.01em; }
 	.bar .progress { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+	.bar .progress .pg::before { content: " · "; }
+	/* A phone's bar is short of room: the page goes under the percentage. */
+	@media (max-width: 600px) {
+		.bar .progress { display: flex; flex-direction: column; align-items: flex-end; font-size: 12px; line-height: 1.25; }
+		.bar .progress .pg::before { content: none; }
+	}
 	.tabs { display: flex; gap: 4px; padding: 0 16px 8px; max-width: 1100px; margin: 0 auto; }
 	.tabs a { flex: 1; text-align: center; padding: 7px 0; border-radius: 9px; color: var(--muted); text-decoration: none; font-weight: 600; font-size: 15px; }
 	.tabs a[aria-current=page] { background: var(--sel); color: var(--fg); }
@@ -5063,6 +5069,7 @@ var LIST_VIEWS = { unread: "Unread", saved: "Saved", all: "All" };
 var MEDIA_TABS = { podcasts: "Podcasts", videos: "Videos" };
 var STALE_MS = 5 * 60 * 1000; // auto-refresh skips feeds fetched this recently
 var CHUNK = 50; // paragraphs per block in the .txt reader
+var CHARS_PER_PAGE = 1650; // a printed page, for a .txt or .epub with no page count (the Worker's WORDS_PER_PAGE)
 // A .txt book's YAML header; the Worker reads it (parseFrontMatter).
 var FRONT_MATTER = /^\s*---[ \t]*\r?\n[\s\S]*?\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|$)/;
 var UNAUTH = "Unauthorized";
@@ -9201,7 +9208,7 @@ async function openBook(id) {
 	var sess = session = { id: id, book: book, alive: true, cleanup: [], dirty: false, start: parsePos(book.position) || {} };
 	$("heading").textContent = book.title;
 	document.title = book.title + " — Reader";
-	$("progress").textContent = "";
+	setProgress("");
 	zoomable(book.type === "pdf" || book.type === "cbz");
 	try {
 		if (book.type === "pdf") await openPdf(sess, parsePos(book.position) || {});
@@ -9247,13 +9254,13 @@ function closeBook() {
 }
 // mark: a new bookmark ({} style spot), null to remove it, or left out to
 // keep the one there is.
-function savePosition(sess, pos, label, mark) {
+function savePosition(sess, pos, mark) {
 	var prev = here(sess), far = farOf(prev);
 	if (!far || (pos.f > far.f && pos.f - far.f <= 3 * screenF(sess))) far = spot(pos);
 	if (mark === undefined) mark = prev.mark;
 	sess.pos = Object.assign(pos, { at: Date.now(), far: far }, mark ? { mark: mark } : {});
 	sess.dirty = true;
-	$("progress").textContent = label;
+	setProgress(posLabel(sess, pos));
 	clearTimeout(sess.timer);
 	sess.timer = setTimeout(function () { flushPosition(sess); }, 800);
 	updateMarks(sess);
@@ -9288,7 +9295,22 @@ function screenF(sess) {
 	return window.innerHeight / Math.max(document.documentElement.scrollHeight, window.innerHeight);
 }
 function spotName(s) { return s.page ? "page " + s.page : Math.round(s.f * 100) + "%"; }
-function spotLabel(s) { return s.page ? s.page + " / " + s.pages : Math.round(s.f * 100) + "%"; }
+// The bar's readout: how far through, then the page. A PDF or comic has real
+// pages; a .txt or .epub's page is its share of the Record's page count, or
+// without one of the text's length at CHARS_PER_PAGE, so its count gets a "~".
+function posLabel(sess, s) {
+	var f = s.f || 0, pct = Math.round(f * 100) + "%";
+	if (s.page) return pct + " · p. " + s.page + " of " + s.pages;
+	var n = sess.book.pages || (sess.txt ? Math.max(1, Math.round(sess.txt.total / CHARS_PER_PAGE)) : 0);
+	return n ? pct + " · p. " + clamp(Math.ceil(f * n), 1, n) + " of ~" + n : pct;
+}
+// The percentage and the page in spans of their own, so a phone can stack them.
+function setProgress(label) {
+	var el = $("progress"), at = label.indexOf(" · ");
+	el.textContent = "";
+	if (at < 0) { el.textContent = label; return; }
+	el.append(h("span", "pct", label.slice(0, at)), h("span", "pg", label.slice(at + 3)));
+}
 // The bookmark button's state, and "Back to furthest" while the place is
 // more than a screen and a half behind it.
 function updateMarks(sess) {
@@ -9307,7 +9329,7 @@ function goToSpot(sess, s) {
 	if (!sess || !sess.jump || !s) return;
 	sess.farHidden = false;
 	sess.jump(s);
-	savePosition(sess, spot(s), spotLabel(s));
+	savePosition(sess, spot(s));
 }
 // Bookmark where the reader is; tapped again on the same spot, take it away.
 function toggleMark(sess) {
@@ -9315,11 +9337,11 @@ function toggleMark(sess) {
 	if (sess.track && !sess.restoring) sess.track();
 	var c = here(sess), s = spot(c);
 	if (c.mark && Math.abs(c.mark.f - s.f) < 1e-4 && c.mark.page === s.page) {
-		savePosition(sess, spot(c), $("progress").textContent, null);
+		savePosition(sess, spot(c), null);
 		toast("Bookmark removed.");
 		return;
 	}
-	savePosition(sess, spot(c), $("progress").textContent, s);
+	savePosition(sess, spot(c), s);
 	toast("Bookmarked at " + spotName(s) + ". Go back to it from ⋯.");
 }
 // Reaching the end marks a book finished: the last line of a .txt or .epub, the
@@ -9387,7 +9409,7 @@ async function restartBook() {
 	window.scrollTo(0, 0);
 	setTimeout(function () { sess.restoring = false; }, 300);
 	if (sess.cbz) sess.cbz.go(1, false);
-	$("progress").textContent = sess.pdf ? "1 / " + sess.pdf.n : sess.cbz ? "1 / " + sess.cbz.n : "0%";
+	setProgress(posLabel(sess, sess.pdf ? { page: 1, pages: sess.pdf.n } : sess.cbz ? { page: 1, pages: sess.cbz.n, f: 1 / sess.cbz.n } : {}));
 	try { await resetPosition(sess.book, here(sess).mark || null); } catch (e) { fail(e); }
 	sess.pos = null;
 	sess.start = parsePos(sess.book.position) || {};
@@ -9495,7 +9517,7 @@ function startText(sess, t, pos) {
 	var track = function () {
 		if (sess.restoring || !t.chunks.length) return;
 		var f = txtFraction(t);
-		savePosition(sess, { f: Math.round(f * 1e5) / 1e5 }, Math.round(f * 100) + "%");
+		savePosition(sess, { f: Math.round(f * 1e5) / 1e5 });
 		// An EPUB's notes after its end don't count (endIdx), and nor does a
 		// jump by link, until the reader scrolls on from where it landed.
 		if (t.endIdx != null && paraAt(t, f * t.total) > t.endIdx) return;
@@ -9509,7 +9531,7 @@ function startText(sess, t, pos) {
 	restoreTxt(sess, pos.f || 0);
 	listen(sess, window, "scroll", onScrollFrame(track), { passive: true });
 	listen(sess, window, "resize", onScrollFrame(function () { estimateChunks(t); }));
-	$("progress").textContent = Math.round((pos.f || 0) * 100) + "%";
+	setProgress(posLabel(sess, { f: pos.f }));
 }
 // Placeholder height for blocks that haven't been laid out yet, from the
 // text length and the current font/width, so the scrollbar stays honest.
@@ -10151,8 +10173,7 @@ async function openPdf(sess, pos) {
 	var track = function () {
 		if (sess.restoring) return;
 		var c = pdfCurrent(pdf);
-		savePosition(sess, { page: c.page, pf: Math.round(c.within * 1000) / 1000, pages: pdf.n, f: Math.round((c.page - 1 + c.within) / pdf.n * 1e4) / 1e4 },
-			c.page + " / " + pdf.n);
+		savePosition(sess, { page: c.page, pf: Math.round(c.within * 1000) / 1000, pages: pdf.n, f: Math.round((c.page - 1 + c.within) / pdf.n * 1e4) / 1e4 });
 		if (!sess.quietEnd) checkEnd(sess, pages[pages.length - 1]);
 	};
 	sess.track = track;
@@ -10170,7 +10191,7 @@ async function openPdf(sess, pos) {
 		}, track);
 	};
 	var page = clamp(pos.page || 1, 1, pdf.n);
-	$("progress").textContent = page + " / " + pdf.n;
+	setProgress(posLabel(sess, { page: page, pages: pdf.n, f: pos.f }));
 	setTimeout(function () { if (sess.alive) sendPdfCover(sess); }, 1500);
 	if (page > 1 || pos.pf > 0) sess.jump(pos);
 }
@@ -10543,8 +10564,7 @@ async function openCbzScroll(sess, pos, buf, u8, pages) {
 	var track = function () {
 		if (sess.restoring) return;
 		var c = pdfCurrent(list);
-		savePosition(sess, { page: c.page, pf: Math.round(c.within * 1000) / 1000, pages: n, f: Math.round((c.page - 1 + c.within) / n * 1e4) / 1e4 },
-			c.page + " / " + n);
+		savePosition(sess, { page: c.page, pf: Math.round(c.within * 1000) / 1000, pages: n, f: Math.round((c.page - 1 + c.within) / n * 1e4) / 1e4 });
 		if (!sess.quietEnd) checkEnd(sess, strips[n - 1]);
 	};
 	sess.track = track;
@@ -10558,7 +10578,7 @@ async function openCbzScroll(sess, pos, buf, u8, pages) {
 	};
 	sess.cbz = { n: n, buf: buf, scroll: true, go: function (i) { sess.jump({ page: i }); }, setGuided: function () {} };
 	var page = clamp(pos.page || 1, 1, n);
-	$("progress").textContent = page + " / " + n;
+	setProgress(posLabel(sess, { page: page, pages: n, f: pos.f }));
 	if (page > 1 || pos.pf > 0) sess.jump(pos);
 }
 async function openCbzPages(sess, pos, buf, u8, pages, rtl) {
@@ -10594,6 +10614,7 @@ async function openCbzPages(sess, pos, buf, u8, pages, rtl) {
 		if (!urls[i]) urls[i] = zipEntryBlob(u8, pages[i - 1]).then(function (b) { return URL.createObjectURL(b); });
 		return urls[i];
 	}
+	function comicLabel(i) { return posLabel(sess, { page: i, pages: n, f: i / n }); }
 	// Keeps two pages back and three ahead unpacked; lets the rest go.
 	function keepNear(c) {
 		Object.keys(urls).forEach(function (k) {
@@ -10610,9 +10631,9 @@ async function openCbzPages(sess, pos, buf, u8, pages, rtl) {
 		slider.value = i;
 		prev.disabled = i === 1;
 		next.disabled = i === n;
-		$("progress").textContent = i + " / " + n;
+		setProgress(comicLabel(i));
 		if (byReader) {
-			savePosition(sess, { page: i, pages: n, f: Math.round(i / n * 1e4) / 1e4 }, i + " / " + n);
+			savePosition(sess, { page: i, pages: n, f: Math.round(i / n * 1e4) / 1e4 });
 			if (i === n) reachedEnd(sess);
 		}
 		keepNear(i);
@@ -10662,14 +10683,14 @@ async function openCbzPages(sess, pos, buf, u8, pages, rtl) {
 		img.style.width = nw + "px";
 		img.style.height = nh + "px";
 		img.style.transform = "translate(" + tx + "px," + ty + "px) scale(" + s + ")";
-		$("progress").textContent = cur + " / " + n + (g.panels && !g.whole ? " · " + (g.at + 1) + "/" + g.panels.length : "");
+		setProgress(comicLabel(cur) + (g.panels && !g.whole ? " · panel " + (g.at + 1) + "/" + g.panels.length : ""));
 	}
 	function setGuided(on) {
 		store(GUIDED_KEY, on ? "on" : null);
 		body.classList.toggle("guided", on);
 		g.found = {};
 		g.whole = false;
-		if (on) guide(cur, false); else { g.panels = null; place(); $("progress").textContent = cur + " / " + n; }
+		if (on) guide(cur, false); else { g.panels = null; place(); }
 	}
 	sess.cbz = { n: n, buf: buf, go: go, setGuided: setGuided };
 	sess.jump = function (s) { go(s.page || Math.round(s.f * n) || 1, false); window.scrollTo(0, 0); };
@@ -11223,7 +11244,7 @@ $("bmUnmark").addEventListener("click", function () {
 	openBookMenu(false);
 	if (!sess) return;
 	var c = here(sess);
-	savePosition(sess, spot(c), $("progress").textContent, null);
+	savePosition(sess, spot(c), null);
 	toast("Bookmark removed.");
 });
 $("farGo").addEventListener("click", function () { if (session) goToSpot(session, farOf(here(session))); });
