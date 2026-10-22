@@ -3092,31 +3092,37 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	summary { cursor: pointer; color: var(--accent); }
 	.go { appearance: none; width: 100%; border: 0; border-radius: 10px; background: var(--accent); color: var(--on-accent); font-weight: 600; font-size: 17px; min-height: 48px; margin-top: 10px; cursor: pointer; }
 	.sub { margin: -8px 0 14px; font-size: 14px; }
-	/* The landing page: a library card on a brick wall at dusk. */
-	body.landing { background-color: #3a2a22;
-		background-image: radial-gradient(ellipse at 50% 16%, rgba(255,196,120,.32), rgba(0,0,0,0) 62%), radial-gradient(ellipse at 50% 120%, rgba(0,0,0,.55), rgba(0,0,0,0) 70%),
-			url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='64' height='32'%3E%3Cg stroke='%23000' stroke-opacity='.4' stroke-width='2'%3E%3Cpath d='M0 1H64M0 17H64M1 1V17M33 17V33'/%3E%3C/g%3E%3C/svg%3E");
-		background-attachment: fixed; min-height: 100vh; }
-	body.landing main { min-height: 100vh; display: flex; flex-direction: column; justify-content: center; }
-	.card { position: relative; max-width: 440px; width: 100%; margin: 24px auto; background: #f7efdc; color: var(--fg); border-radius: 6px; padding: 30px 26px 26px;
-		box-shadow: 0 18px 40px rgba(0,0,0,.45), 0 2px 0 rgba(255,255,255,.4) inset; transform: rotate(-1.2deg);
-		background-image: repeating-linear-gradient(transparent 0 31px, rgba(138,75,20,.12) 31px 32px); background-position: 0 128px; }
-	.card::before { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 10px; border-radius: 6px 6px 0 0; background: #8b2e1f; }
-	.card .no { display: flex; justify-content: space-between; font: 600 11px/1 var(--sans); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
-	.card h1 { font-size: 38px; line-height: 1.02; margin: 14px 0 6px; letter-spacing: -.02em; }
-	.card h1 span { display: block; font-size: 15px; font-weight: 400; font-style: italic; letter-spacing: .02em; color: var(--muted); margin-bottom: 4px; }
-	.card .rule { height: 0; border-top: 3px double rgba(59,48,36,.5); margin: 14px 0 16px; }
-	.card p { margin: 0 0 16px; font: 400 18px/1.55 var(--display); }
-	.stamp { appearance: none; display: block; width: 100%; margin-top: 8px; padding: 14px 16px; border: 2px solid #8b2e1f; border-radius: 6px; background: #8b2e1f; color: #fbf2df;
-		font: 700 15px/1.2 var(--sans); letter-spacing: .12em; text-transform: uppercase; cursor: pointer; box-shadow: 0 3px 0 #5e1d13; }
-	.stamp:active { transform: translateY(2px); box-shadow: 0 1px 0 #5e1d13; }
-	.stamp:disabled { opacity: .6; }
-	.card label { display: block; font: 600 13px/1.3 var(--sans); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 12px 0 6px; }
-	.card input[type=text], .card textarea { width: 100%; border: 0; border-bottom: 2px solid rgba(59,48,36,.45); background: transparent; padding: 6px 2px; font: 400 19px/1.4 var(--display); border-radius: 0; }
-	.card textarea { resize: vertical; min-height: 64px; }
-	.card input:focus, .card textarea:focus { outline: none; border-bottom-color: #8b2e1f; }
-	.card .msg { font: 400 15px/1.45 var(--sans); color: var(--muted); }
-	.card .msg.bad { color: #8b2e1f; }
+	/* The landing page: noir. Near-black, light through venetian blinds,
+	   white type, one red accent. */
+	body.landing { background: #0a0a0b; color: #ece8e1; min-height: 100vh; }
+	body.landing::before { content: ""; position: fixed; inset: 0; pointer-events: none;
+		background: repeating-linear-gradient(162deg, rgba(255,255,255,.075) 0 22px, rgba(255,255,255,0) 22px 52px);
+		-webkit-mask-image: radial-gradient(ellipse 75% 55% at 78% 8%, #000 0%, rgba(0,0,0,.35) 45%, transparent 75%);
+		mask-image: radial-gradient(ellipse 75% 55% at 78% 8%, #000 0%, rgba(0,0,0,.35) 45%, transparent 75%); }
+	body.landing::after { content: ""; position: fixed; inset: 0; pointer-events: none; background: radial-gradient(ellipse at 50% 50%, transparent 40%, rgba(0,0,0,.7) 100%); }
+	body.landing main { position: relative; z-index: 1; min-height: 100vh; display: flex; flex-direction: column; justify-content: center; }
+	.noir { max-width: 520px; width: 100%; margin: 32px auto; }
+	.noir .kicker { font: 600 11px/1 var(--sans); letter-spacing: .32em; text-transform: uppercase; color: #c8322c; }
+	.noir h1 { font: 600 54px/.98 var(--display); letter-spacing: -.03em; color: #f4f1ea; margin: 18px 0 0; }
+	.noir h1 small { display: block; font-size: 20px; font-weight: 400; letter-spacing: .02em; color: #8f8a82; margin-bottom: 6px; }
+	.noir h1 em { font-style: italic; font-weight: 400; }
+	.noir .rule { width: 56px; height: 2px; background: #c8322c; margin: 26px 0 22px; }
+	.noir p { margin: 0 0 18px; font: 300 19px/1.6 var(--display); color: #bdb7ae; }
+	.stamp { appearance: none; display: inline-flex; align-items: center; justify-content: space-between; gap: 18px; width: 100%; margin-top: 10px; padding: 16px 18px;
+		border: 1px solid rgba(255,255,255,.85); border-radius: 0; background: transparent; color: #f4f1ea; cursor: pointer;
+		font: 600 13px/1.2 var(--sans); letter-spacing: .22em; text-transform: uppercase; transition: background .2s, color .2s; }
+	.stamp::after { content: "\2192"; font-size: 18px; letter-spacing: 0; }
+	.stamp:hover, .stamp:focus-visible { background: #f4f1ea; color: #0a0a0b; outline: none; }
+	.stamp:disabled { opacity: .5; }
+	.noir label { display: block; font: 600 11px/1.3 var(--sans); letter-spacing: .22em; text-transform: uppercase; color: #8f8a82; margin: 22px 0 6px; }
+	.noir label .muted { color: #5f5b55; letter-spacing: .1em; }
+	.noir input[type=text], .noir textarea { width: 100%; border: 0; border-bottom: 1px solid rgba(255,255,255,.28); background: transparent; color: #f4f1ea; padding: 8px 0;
+		font: 300 21px/1.4 var(--display); border-radius: 0; }
+	.noir textarea { resize: vertical; min-height: 60px; }
+	.noir textarea::placeholder { color: #5f5b55; }
+	.noir input:focus, .noir textarea:focus { outline: none; border-bottom-color: #c8322c; }
+	.noir .msg { font: 400 15px/1.5 var(--sans); color: #bdb7ae; border-left: 2px solid #c8322c; padding-left: 12px; }
+	.noir .msg.bad { color: #ef7a72; }
 	.check { margin: 16px 0 4px; min-height: 0; }
 	.check:empty { margin: 0; }
 	.hp { position: absolute !important; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
@@ -3125,9 +3131,9 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 </head>
 <body>
 <main>
-	<section id="landing" class="card" hidden>
-		<div class="no"><span>Library card</span><span>No. ____</span></div>
-		<h1><span>Welcome to</span>The Back Alley Library</h1>
+	<section id="landing" class="noir" hidden>
+		<div class="kicker">Members only</div>
+		<h1><small>The</small><em>Back Alley</em> Library</h1>
 		<div class="rule"></div>
 		<p>The Back Alley Library is a secret between family and friends. Inside you will find my entire collection of books, comics, and audiobooks. Click the button below to request your library card.</p>
 		<p id="lMsg" class="msg" hidden></p>
@@ -3358,6 +3364,7 @@ $("howLink").addEventListener("click", function (e) { e.preventDefault(); welcom
 function landing(msg) {
 	say("");
 	document.body.classList.add("landing");
+	document.querySelector("meta[name=theme-color]").content = "#0a0a0b";
 	$("landing").hidden = false;
 	var asked = read("cardRequested");
 	if (asked && !msg) msg = "Your request is in. You'll get your own link once it's approved.";
@@ -3373,7 +3380,7 @@ function startCheck() {
 	checkId = "loading";
 	window.onTurnstileLoad = function () {
 		checkId = window.turnstile.render("#lCheck", {
-			sitekey: SITE_KEY, theme: "light", action: "library-card",
+			sitekey: SITE_KEY, theme: "dark", action: "library-card",
 			callback: function (t) { checkToken = t; },
 			"expired-callback": function () { checkToken = ""; },
 			"error-callback": function () { checkToken = ""; }
