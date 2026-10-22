@@ -24,6 +24,11 @@ bucket_name = "reader-books"
 # library"). Leave it out and the page just says "the library".
 [vars]
 OWNER_NAME = "Brandon"
+# Cloudflare Turnstile on the library card request form (docs/setup.md,
+# "Family library"): the widget's site key here, and its secret key with
+#   npx wrangler secret put TURNSTILE_SECRET
+# Leave it out and the form works without the check.
+# TURNSTILE_SITE_KEY = ""
 
 # Workers AI, for "Compare coverage" (docs/setup.md, Part 7). In the
 # dashboard: Settings -> Bindings -> Add binding -> Workers AI, name AI.
