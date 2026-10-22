@@ -3955,36 +3955,52 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.sub { margin: -8px 0 14px; font-size: 14px; }
 	.intro { margin: 0 0 20px; font: 400 17px/1.55 var(--display); }
 	.intro p { margin: 0 0 10px; }
-	/* The landing page: noir. Near-black, light through venetian blinds,
-	   white type, one red accent. */
-	body.landing { background: #0a0a0b; color: #ece8e1; min-height: 100vh; }
-	body.landing::before { content: ""; position: fixed; inset: 0; pointer-events: none;
-		background: repeating-linear-gradient(162deg, rgba(255,255,255,.075) 0 22px, rgba(255,255,255,0) 22px 52px);
-		-webkit-mask-image: radial-gradient(ellipse 75% 55% at 78% 8%, #000 0%, rgba(0,0,0,.35) 45%, transparent 75%);
-		mask-image: radial-gradient(ellipse 75% 55% at 78% 8%, #000 0%, rgba(0,0,0,.35) 45%, transparent 75%); }
-	body.landing::after { content: ""; position: fixed; inset: 0; pointer-events: none; background: radial-gradient(ellipse at 50% 50%, transparent 40%, rgba(0,0,0,.7) 100%); }
-	body.landing main { position: relative; z-index: 1; min-height: 100vh; display: flex; flex-direction: column; justify-content: center; }
-	.noir { max-width: 520px; width: 100%; margin: 32px auto; }
-	.noir h1 { font: 600 54px/.98 var(--display); letter-spacing: -.03em; color: #f4f1ea; margin: 0; }
-	.noir h1 small { display: block; font-size: 20px; font-weight: 400; letter-spacing: .02em; color: #8f8a82; margin-bottom: 6px; }
-	.noir h1 em { font-style: italic; font-weight: 400; }
-	.noir .rule { width: 56px; height: 2px; background: #c8322c; margin: 26px 0 22px; }
-	.noir p { margin: 0 0 18px; font: 300 19px/1.6 var(--display); color: #bdb7ae; }
-	.stamp { appearance: none; display: inline-flex; align-items: center; justify-content: space-between; gap: 18px; width: 100%; margin-top: 10px; padding: 16px 18px;
-		border: 1px solid rgba(255,255,255,.85); border-radius: 0; background: transparent; color: #f4f1ea; cursor: pointer;
-		font: 600 13px/1.2 var(--sans); letter-spacing: .22em; text-transform: uppercase; transition: background .2s, color .2s; }
-	.stamp::after { content: "\2192"; font-size: 18px; letter-spacing: 0; }
-	.stamp:hover, .stamp:focus-visible { background: #f4f1ea; color: #0a0a0b; outline: none; }
-	.stamp:disabled { opacity: .5; }
-	.noir label { display: block; font: 600 11px/1.3 var(--sans); letter-spacing: .22em; text-transform: uppercase; color: #8f8a82; margin: 22px 0 6px; }
-	.noir label .muted { color: #5f5b55; letter-spacing: .1em; }
-	.noir .hint { margin-top: 6px; font: 400 13px/1.4 var(--sans); color: #5f5b55; }
-	.noir input[type=text], .noir input[type=email], .noir textarea { width: 100%; border: 0; border-bottom: 1px solid rgba(255,255,255,.28); background: transparent; color: #f4f1ea; padding: 8px 0;
-		font: 300 21px/1.4 var(--display); border-radius: 0; }
-	.noir textarea { resize: vertical; min-height: 60px; }
-	.noir input:focus, .noir textarea:focus { outline: none; border-bottom-color: #c8322c; }
-	.noir .msg { font: 400 15px/1.5 var(--sans); color: #bdb7ae; border-left: 2px solid #c8322c; padding-left: 12px; }
-	.noir .msg.bad { color: #ef7a72; }
+	/* The landing page: a beat-up pulp paperback in the library's sepia.
+	   The cover is aged paper with a halftone wash, a painted alley scene,
+	   a dog-eared corner, creases across it and a spine bent from reading. */
+	body.landing { min-height: 100vh;
+		background: #d6c29a radial-gradient(ellipse at 50% 30%, #efe3c6 0%, #e4d4b0 60%, #d6c29a 100%) no-repeat; }
+	body.landing main { min-height: 100vh; display: flex; flex-direction: column; justify-content: center; }
+	.pulp { position: relative; max-width: 480px; width: 100%; margin: 24px auto; padding: 22px 22px 26px 30px; color: #3b2a1a;
+		background:
+			linear-gradient(90deg, rgba(60,35,15,.28) 0, rgba(60,35,15,.06) 10px, transparent 14px, rgba(255,250,235,.35) 15px, transparent 17px, transparent 22px, rgba(60,35,15,.1) 23px, transparent 26px),
+			linear-gradient(118deg, transparent 0 46%, rgba(255,250,235,.45) 46.3%, rgba(70,40,15,.16) 46.7%, transparent 47.5%),
+			linear-gradient(64deg, transparent 0 71%, rgba(70,40,15,.14) 71.2%, rgba(255,250,235,.4) 71.6%, transparent 72.4%),
+			linear-gradient(4deg, transparent 0 22%, rgba(255,250,235,.35) 22.15%, rgba(70,40,15,.12) 22.5%, transparent 23%),
+			radial-gradient(circle at 82% 88%, transparent 0 38px, rgba(120,70,25,.13) 39px 42px, transparent 44px),
+			radial-gradient(rgba(110,60,20,.09) 1px, transparent 1.4px) 0 0 / 5px 5px,
+			radial-gradient(ellipse at 50% 45%, #f6ebcf 0%, #ead9b2 70%, #d9c093 100%);
+		box-shadow: inset 0 0 0 1px rgba(80,50,20,.25), inset 0 0 38px rgba(110,65,25,.35), 0 1px 0 #fff8, 6px 10px 24px rgba(60,35,15,.3);
+		clip-path: polygon(0 0, calc(100% - 34px) 0, 100% 34px, 100% 100%, 0 100%);
+		transform: rotate(-.6deg); }
+	/* The dog-eared corner, folded over. */
+	.pulp::before { content: ""; position: absolute; top: 0; right: 0; width: 34px; height: 34px;
+		background: linear-gradient(225deg, transparent 50%, #c9ae7e 50%, #e2cea5 75%, #d3ba8c 100%); box-shadow: -2px 2px 4px rgba(60,35,15,.25); }
+	.pulp .top { display: flex; justify-content: space-between; align-items: center; font: 800 11px/1 var(--sans); letter-spacing: .2em; text-transform: uppercase; color: #8a4b14; }
+	.pulp .price { display: inline-grid; place-items: center; width: 40px; height: 40px; border-radius: 50%; background: #8b2e1f; color: #f6ebcf;
+		font: 800 14px/1 var(--display); letter-spacing: 0; transform: rotate(-10deg); box-shadow: inset 0 0 0 2px #f6ebcf, 0 0 0 1px #8b2e1f; margin-right: 26px; }
+	.pulp h1 { margin: 10px 0 14px; font: 900 64px/.86 var(--display); letter-spacing: -.035em; color: #8b2e1f; text-transform: uppercase;
+		text-shadow: 3px 3px 0 #3b2a1a, 3px 3px 0 #3b2a1a; transform: rotate(-2deg); transform-origin: left; }
+	.pulp h1 small { display: block; font: italic 500 22px/1 var(--display); text-transform: none; letter-spacing: 0; color: #3b2a1a; text-shadow: none; margin-bottom: 4px; }
+	.pulp h1 b { display: block; font-size: 46px; color: #c27a26; }
+	.pulp .art { display: block; width: calc(100% + 52px); margin: 0 -22px 18px -30px; border-top: 3px solid #3b2a1a; border-bottom: 3px solid #3b2a1a; filter: sepia(.35) contrast(1.05); }
+	.pulp p { margin: 0 0 16px; font: 400 18px/1.55 var(--display); color: #3b2a1a; }
+	.stamp { appearance: none; display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; margin-top: 6px; padding: 15px 18px; cursor: pointer;
+		border: 2px solid #3b2a1a; border-radius: 3px; background: #8b2e1f; color: #f6ebcf; box-shadow: 3px 3px 0 #3b2a1a;
+		font: 800 14px/1.2 var(--sans); letter-spacing: .1em; text-transform: uppercase; white-space: nowrap; transition: transform .1s, box-shadow .1s; }
+	.stamp:hover, .stamp:focus-visible { background: #a1381f; outline: none; }
+	.stamp:active { transform: translate(2px, 2px); box-shadow: 1px 1px 0 #3b2a1a; }
+	.stamp:disabled { opacity: .55; }
+	.pulp label { display: block; font: 800 11px/1.3 var(--sans); letter-spacing: .18em; text-transform: uppercase; color: #8a4b14; margin: 18px 0 4px; }
+	.pulp label .muted { color: #9b8566; letter-spacing: .08em; }
+	.pulp .hint { margin-top: 5px; font: italic 400 14px/1.4 var(--display); color: #7b6c58; }
+	.pulp input[type=text], .pulp input[type=email], .pulp textarea { width: 100%; border: 0; border-bottom: 1.5px solid rgba(59,42,26,.45); background: transparent; color: #3b2a1a; padding: 6px 0;
+		font: 400 20px/1.4 var(--display); border-radius: 0; }
+	.pulp textarea { resize: vertical; min-height: 56px; }
+	.pulp input:focus, .pulp textarea:focus { outline: none; border-bottom-color: #8b2e1f; }
+	.pulp .msg { font: 400 16px/1.5 var(--display); color: #3b2a1a; border-left: 3px solid #8b2e1f; padding-left: 12px; }
+	.pulp .msg.bad { color: #8b2e1f; }
+	@media (max-width: 400px) { .pulp h1 { font-size: 54px; } .pulp h1 b { font-size: 40px; } }
 	.check { margin: 16px 0 4px; min-height: 0; }
 	.check:empty { margin: 0; }
 	.hp { position: absolute !important; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
@@ -4063,9 +4079,30 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 </head>
 <body>
 <main>
-	<section id="landing" class="noir" hidden>
-		<h1><small>The</small><em>Back Alley</em> Library</h1>
-		<div class="rule"></div>
+	<section id="landing" class="pulp" hidden>
+		<div class="top"><span>A Back Alley Paperback</span><span class="price">25&cent;</span></div>
+		<h1><small>The</small>Back Alley<b>Library</b></h1>
+		<svg class="art" viewBox="0 0 400 190" role="img" aria-label="A figure in a fedora under a streetlamp in a narrow alley">
+			<defs>
+				<radialGradient id="glow" cx="72%" cy="22%" r="60%"><stop offset="0" stop-color="#f3d58e"/><stop offset=".35" stop-color="#d79a45"/><stop offset="1" stop-color="#6b3415"/></radialGradient>
+				<pattern id="dots" width="4" height="4" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r=".9" fill="#2a1a0e" opacity=".35"/></pattern>
+			</defs>
+			<rect width="400" height="190" fill="url(#glow)"/>
+			<polygon points="0,0 120,40 120,150 0,190" fill="#3b2213"/>
+			<polygon points="400,0 250,45 250,150 400,190" fill="#4a2a16"/>
+			<polygon points="120,40 250,45 250,150 120,150" fill="#a5612b" opacity=".55"/>
+			<g fill="#2a170c" opacity=".55"><rect x="20" y="40" width="22" height="34"/><rect x="60" y="56" width="18" height="30"/><rect x="330" y="40" width="22" height="34"/><rect x="290" y="58" width="18" height="30"/></g>
+			<rect x="140" y="88" width="16" height="22" fill="#f3d58e" opacity=".8"/>
+			<polygon points="0,190 120,150 250,150 400,190" fill="#2e1a0d"/>
+			<g fill="#1d0f07">
+				<rect x="281" y="40" width="4" height="125"/><path d="M270 40 h26 l-5 -10 h-16 z"/>
+				<path d="M187 100 h14 l2 7 h5 l-1 2 h-26 l-1 -2 h5 z"/><circle cx="194" cy="113" r="5.5"/><path d="M191 117 h6 v3 h-6 z"/>
+				<path d="M183 119 h22 l7 44 h-36 z"/><rect x="186" y="160" width="6" height="12"/><rect x="196" y="160" width="6" height="12"/>
+				<path d="M178 172 l-70 18 h70 z" opacity=".6"/>
+			</g>
+			<circle cx="283" cy="38" r="9" fill="#fff3cf" opacity=".9"/>
+			<rect width="400" height="190" fill="url(#dots)"/>
+		</svg>
 		<p>The Back Alley Library is a secret between family and friends. Inside you will find my entire collection of books, comics, and audiobooks. Click the button below to request your library card.</p>
 		<p id="lMsg" class="msg" hidden></p>
 		<button id="lAsk" class="stamp" type="button">Request your library card</button>
@@ -4856,7 +4893,6 @@ $("howLink").addEventListener("click", function (e) { e.preventDefault(); welcom
 function landing(msg) {
 	say("");
 	document.body.classList.add("landing");
-	document.querySelector("meta[name=theme-color]").content = "#0a0a0b";
 	$("landing").hidden = false;
 	var asked = read("cardRequested");
 	if (asked && !msg) msg = "Your request is in. You'll get your own link once it's approved.";
@@ -4872,7 +4908,7 @@ function startCheck() {
 	checkId = "loading";
 	window.onTurnstileLoad = function () {
 		checkId = window.turnstile.render("#lCheck", {
-			sitekey: SITE_KEY, theme: "dark", action: "library-card",
+			sitekey: SITE_KEY, theme: "light", action: "library-card",
 			callback: function (t) { checkToken = t; },
 			"expired-callback": function () { checkToken = ""; },
 			"error-callback": function () { checkToken = ""; }
