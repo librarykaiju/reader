@@ -179,6 +179,7 @@ npx wrangler d1 execute reader --remote --file migrations/0009_comic_layout.sql
 npx wrangler d1 execute reader --remote --file migrations/0010_family.sql
 npx wrangler d1 execute reader --remote --file migrations/0011_library_card_requests.sql
 npx wrangler d1 execute reader --remote --file migrations/0012_request_limit.sql
+npx wrangler d1 execute reader --remote --file migrations/0013_request_email.sql
 npx wrangler deploy
 ```
 
@@ -273,7 +274,7 @@ A migration that already ran stops with an error such as "duplicate column name"
 - The menu next to **Add** puts one tag on a new feed. It starts on the tag you're looking at.
 
 **Family library: The Back Alley Library** (update with migrations 0010 and 0011)
-- It lives at `reader.brandonj.ink/library` (the old `/family` address redirects there, invite links included). Anyone who opens it without a sign-in sees a landing page with **Request your library card**: they give their name and, if they like, how you know them. Requests show at the top of the Family screen, and as a card atop Unread. **Approve** makes their link to send them; **Decline** drops the request.
+- It lives at `reader.brandonj.ink/library` (the old `/family` address redirects there, invite links included). Anyone who opens it without a sign-in sees a landing page with **Request your library card**: they give their name and, if they like, their email and how you know them. Requests show at the top of the Family screen, and as a card atop Unread. **Approve** makes their link to send them; if they gave an email, it also opens a ready-to-send email with the link in your mail app (there's an **Email** button too, if it didn't open). **Decline** drops the request.
 - The request form is guarded: a hidden field that only bots fill in, at most 3 requests a day from one address, and at most 25 waiting at once. For a captcha as well, set up Cloudflare Turnstile (free):
   1. Cloudflare dashboard → **Turnstile** → **Add widget**. Name it "Back Alley Library", add the hostname `reader.brandonj.ink`, mode **Managed** → **Create**.
   2. Copy the **Site key** into `wrangler.toml` under `[vars]` as `TURNSTILE_SITE_KEY = "..."`.

@@ -185,7 +185,9 @@ CREATE TABLE IF NOT EXISTS people (
 	requested_at INTEGER,
 	request_note TEXT,
 	-- Where a request came from, as a salted hash, for 3 a day per address (migration 0012).
-	request_ip TEXT
+	request_ip TEXT,
+	-- The email they gave on the request, if any, for sending their link (migration 0013).
+	request_email TEXT
 );
 
 -- Each download a family member made.
