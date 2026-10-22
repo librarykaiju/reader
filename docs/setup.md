@@ -182,6 +182,7 @@ npx wrangler d1 execute reader --remote --file migrations/0012_request_limit.sql
 npx wrangler d1 execute reader --remote --file migrations/0013_request_email.sql
 npx wrangler d1 execute reader --remote --file migrations/0014_book_records.sql
 npx wrangler d1 execute reader --remote --file migrations/0015_previews.sql
+npx wrangler d1 execute reader --remote --file migrations/0016_book_catalog.sql
 npx wrangler deploy
 ```
 

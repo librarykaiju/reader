@@ -106,7 +106,10 @@ CREATE TABLE IF NOT EXISTS books (
 	pages INTEGER,
 	appeal TEXT,
 	record_from TEXT,
-	record_at INTEGER
+	record_at INTEGER,
+	-- Catalog details as JSON (migration 0016): year, publisher, language,
+	-- classification, isbn, subjects. Also fed to the site's book logs (GET /api/catalog).
+	catalog TEXT
 );
 
 -- Tags for feeds. A feed can carry any number of them, and the page filters

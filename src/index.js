@@ -11,6 +11,8 @@
 //   AI                   Workers AI binding, optional; turns on "Compare coverage" (see Coverage below)
 //   ANTHROPIC_API_KEY    secret, optional; compares with Claude instead, when there's no AI binding; and picks
 //                        the family library's appeal terms (Workers AI does without it; see "Book records")
+//   CATALOG_TOKEN        secret, optional; a read-only token for GET /api/catalog, which the site's build
+//                        uses to fill its book logs' catalog details (any long random string)
 //   OWNER_NAME           optional; your name on the family welcome page ("Welcome to Brandon's library")
 //   TURNSTILE_SITE_KEY   optional; with TURNSTILE_SECRET (a secret), a Cloudflare Turnstile check on the
 //                        library card request form (docs/setup.md, "Family library")
@@ -104,6 +106,9 @@
 //                                  left and today: downloads left in the last 24 hours and the book ids already
 //                                  taken, null for the owner); renews the cookie
 //   GET    /api/family/books       -> {"books": [...each with tags: [names]]}, without any tagged "Hide from family"
+//   GET    /api/catalog           -> {"books": [{id, title, author, series, volume, pages, pages_estimated,
+//                                  year?, publisher?, language?, classification?, isbn?}]}: catalog details for the
+//                                  site's book logs; takes CATALOG_TOKEN (read-only) as well as READER_TOKEN
 //   GET    /api/family/books/:id  -> {"id", "record"}: the book's Record (as /api/books/:id/record), looked up the
 //                                  first time it's opened; 404 for a hidden book
 //   GET    /api/family/books/:id/cover   as /api/books/:id/cover
@@ -188,6 +193,11 @@ export default {
 		try {
 			if (url.pathname === "/api/family/redeem" && request.method === "POST") return await redeemInvite(request, env);
 			if (url.pathname === "/api/family/request" && request.method === "POST") return await requestCard(request, env);
+			// The site's build reads catalog details with its own read-only token.
+			if (url.pathname === "/api/catalog" && request.method === "GET") {
+				if (!(await tokenIs(request, env.CATALOG_TOKEN)) && !(await isOwner(request, env))) return json({ error: "Unauthorized" }, 401);
+				return await catalogFeed(env);
+			}
 			const who = await signedIn(request, env);
 			if (!who) return json({ error: "Unauthorized" }, 401);
 			// The role check: a family sign-in reaches the family routes and nothing else.
@@ -212,8 +222,12 @@ async function signedIn(request, env) {
 	return person ? { person } : null;
 }
 
-async function isOwner(request, env) {
-	if (!env.READER_TOKEN) return false;
+function isOwner(request, env) {
+	return tokenIs(request, env.READER_TOKEN);
+}
+// Whether the request's Bearer token is this secret (false when it isn't set).
+async function tokenIs(request, secret) {
+	if (!secret || !secret.trim()) return false;
 	const header = request.headers.get("Authorization") || "";
 	const given = header.replace(/^Bearer\s+/i, "").trim();
 	if (!given) return false;
@@ -221,7 +235,7 @@ async function isOwner(request, env) {
 	const enc = new TextEncoder();
 	const [a, b] = await Promise.all([
 		crypto.subtle.digest("SHA-256", enc.encode(given)),
-		crypto.subtle.digest("SHA-256", enc.encode(env.READER_TOKEN.trim())),
+		crypto.subtle.digest("SHA-256", enc.encode(secret.trim())),
 	]);
 	return crypto.subtle.timingSafeEqual(a, b);
 }
@@ -2083,8 +2097,8 @@ async function updateBook(request, env, id) {
 	}
 	// The Record page's details as typed in Edit details: marked "edited", so
 	// a lookup never replaces them. Emptied, a lookup may fill it again.
-	if (["blurb", "pages", "appeal"].some((k) => body[k] !== undefined)) {
-		const cur = await env.DB.prepare("SELECT record_from FROM books WHERE id = ?").bind(id).first();
+	if (["blurb", "pages", "appeal", "catalog"].some((k) => body[k] !== undefined)) {
+		const cur = await env.DB.prepare("SELECT record_from, catalog FROM books WHERE id = ?").bind(id).first();
 		if (!cur) throw new HttpError(404, "No such book");
 		let from = {};
 		try { from = JSON.parse(cur.record_from || "{}") || {}; } catch {}
@@ -2092,6 +2106,20 @@ async function updateBook(request, env, id) {
 		if (body.blurb !== undefined) vals.blurb = typeof body.blurb === "string" ? blurbText(body.blurb) : null;
 		if (body.pages !== undefined) vals.pages = body.pages === null || body.pages === "" ? null : clampInt(body.pages, 1, 100000, null);
 		if (body.appeal !== undefined) { const a = cleanAppeal(body.appeal, false); vals.appeal = a && JSON.stringify(a); }
+		// catalog: the fields given replace those; an empty one is cleared (and may be looked up again).
+		if (body.catalog !== undefined) {
+			if (!body.catalog || typeof body.catalog !== "object") throw new HttpError(400, "catalog must be an object");
+			let had = {};
+			try { had = JSON.parse(cur.catalog || "{}") || {}; } catch {}
+			const given = cleanCatalog(body.catalog), cat = { ...from.catalog };
+			for (const k of CATALOG_FIELDS) {
+				if (!(k in body.catalog)) continue;
+				if (given[k]) { had[k] = given[k]; cat[k] = "edited"; } else { delete had[k]; delete cat[k]; }
+			}
+			from.catalog = cat;
+			sets.push("catalog = ?");
+			params.push(Object.keys(had).length ? JSON.stringify(had) : null);
+		}
 		for (const [k, v] of Object.entries(vals)) {
 			sets.push(k + " = ?");
 			params.push(v || null);
@@ -3356,6 +3384,107 @@ const RECORD_RETRY_MS = 24 * 60 * 60 * 1000;
 // Words to a printed page, for an estimate (the reader's CHARS_PER_PAGE is this at 6 characters a word).
 const WORDS_PER_PAGE = 275;
 
+// Catalog details: the same on the family Record and the site's book logs.
+const CATALOG_FIELDS = ["year", "publisher", "language", "classification", "isbn", "subjects"];
+const LANGUAGES = { en: "English", eng: "English", fr: "French", fre: "French", fra: "French", de: "German", ger: "German", deu: "German",
+	es: "Spanish", spa: "Spanish", it: "Italian", ita: "Italian", ja: "Japanese", jpn: "Japanese", la: "Latin", lat: "Latin",
+	ang: "Old English", enm: "Middle English", grc: "Ancient Greek", el: "Greek", gre: "Greek", ru: "Russian", rus: "Russian",
+	pt: "Portuguese", por: "Portuguese", nl: "Dutch", dut: "Dutch", sv: "Swedish", swe: "Swedish", zh: "Chinese", chi: "Chinese", ga: "Irish", gle: "Irish" };
+function isbnOf(s) {
+	const d = String(s || "").replace(/^urn:isbn:|^isbn:?\s*/i, "").replace(/[\s-]/g, "");
+	return /^(97[89]\d{10}|\d{9}[\dXx])$/.test(d) ? d.toUpperCase() : null;
+}
+// Raw values -> the tidy ones kept: a four-digit year, a language name (from
+// a code like "en" or "eng"), digits-only ISBN; unknown fields dropped.
+function cleanCatalog(c) {
+	const out = {};
+	if (!c || typeof c !== "object") return out;
+	const year = /\b(\d{4})\b/.exec(String(c.year ?? ""));
+	if (year && +year[1] > 0 && +year[1] <= new Date().getFullYear() + 1) out.year = year[1];
+	for (const k of ["publisher", "classification"]) { const v = str(c[k] == null ? null : String(c[k]), 120); if (v) out[k] = v; }
+	const lang = str(c.language == null ? null : String(c.language), 40);
+	if (lang) out.language = LANGUAGES[lang.toLowerCase().split(/[-_]/)[0]] || (lang.length > 3 ? lang : null);
+	if (!out.language) delete out.language;
+	const isbn = isbnOf(c.isbn);
+	if (isbn) out.isbn = isbn;
+	// Subject headings: a list, or one string with "; " between them.
+	const subjects = (Array.isArray(c.subjects) ? c.subjects : String(c.subjects ?? "").split(";"))
+		.map((t) => str(String(t ?? ""), 120)).filter(Boolean);
+	if (subjects.length) out.subjects = [...new Set(subjects)].slice(0, 10);
+	return out;
+}
+
+// The Library of Congress catalog (its SRU search, on port 210; no key):
+// {classification, subjects, year, publisher, language} from the MARC record
+// for this ISBN, else for this title and author. Its Dewey number (082), else
+// its LC call number (050), and its LC subject headings (6XX, second
+// indicator 0). null when LC has no record, as for most self-published and
+// ebook-only books.
+const LOC_SRU = "http://lx2.loc.gov:210/lcdb";
+async function locRecord(isbn, title, author) {
+	const search = async (query) => {
+		const res = await fetch(LOC_SRU + "?" + new URLSearchParams({
+			version: "1.1", operation: "searchRetrieve", query, maximumRecords: "5", recordSchema: "marcxml",
+		}), { headers: { "User-Agent": LOOKUP_UA } });
+		if (!res.ok) {
+			await res.body?.cancel();
+			throw new HttpError(502, `lx2.loc.gov answered ${res.status}`);
+		}
+		return marcRecords(await res.text());
+	};
+	const want = looseTitle(title);
+	const surname = looseTitle(String(author || "").split(/,|&| and /)[0]).split(" ").pop();
+	const fits = (m) => {
+		const t = looseTitle(m.title);
+		return !want || t === want || t.startsWith(want + " ") || want.startsWith(t + " ");
+	};
+	const byAuthor = (m) => !surname || looseTitle(m.author).split(" ").includes(surname);
+	let found = isbn ? (await search(`bath.isbn=${isbn}`))[0] : null;
+	if (!found && want) {
+		const q = `dc.title="${want}"` + (surname ? ` and dc.creator="${surname}"` : "");
+		found = (await search(q)).find((m) => fits(m) && byAuthor(m));
+	}
+	return found ? found.catalog : null;
+}
+// MARCXML (an SRU answer) -> [{title, author, catalog}].
+function marcRecords(xml) {
+	return [...xml.matchAll(/<(?:\w+:)?record\b[^>]*>([\s\S]*?)<\/(?:\w+:)?record>/g)]
+		.filter((m) => /<(?:\w+:)?datafield\b/.test(m[1]))
+		.map((m) => marcRecord(m[1]));
+}
+function marcRecord(xml) {
+	const fields = [...xml.matchAll(/<(?:\w+:)?datafield\b([^>]*)>([\s\S]*?)<\/(?:\w+:)?datafield>/g)].map((m) => ({
+		tag: (/\btag="(\d{3})"/.exec(m[1]) || [])[1],
+		ind2: (/\bind2="(.)"/.exec(m[1]) || [])[1],
+		subs: [...m[2].matchAll(/<(?:\w+:)?subfield\b[^>]*\bcode="(.)"[^>]*>([\s\S]*?)<\/(?:\w+:)?subfield>/g)].map((s) => [s[1], xmlText(s[2])]),
+	}));
+	const field = (tag) => fields.find((f) => f.tag === tag);
+	const sub = (f, codes) => (f ? f.subs.filter(([c]) => codes.includes(c)).map(([, v]) => v) : []);
+	// ISBD punctuation ("Dune /", "Chilton Books,", "1965.") goes.
+	const tidy = (v) => String(v || "").replace(/\s*[\/:;,=]\s*$/, "").replace(/(\w{3,})\.$/, "$1").replace(/^\[|\]$/g, "").trim();
+	const control = (/<(?:\w+:)?controlfield\b[^>]*\btag="008"[^>]*>([^<]*)</.exec(xml) || [])[1] || "";
+	const pub = field("264") || field("260");
+	const dewey = sub(field("082"), ["a"])[0];
+	const lcc = sub(field("050"), ["a", "b"]).join(" ");
+	const subjects = fields
+		.filter((f) => ["600", "610", "611", "630", "650", "651"].includes(f.tag) && f.ind2 === "0")
+		.map((f) => {
+			const main = sub(f, ["a", "b", "c", "d", "t"]).map(tidy).join(" ");
+			return [main, ...sub(f, ["v", "x", "y", "z"]).map(tidy)].filter(Boolean).join(" -- ");
+		});
+	return {
+		title: tidy(sub(field("245"), ["a", "b"]).join(" ")),
+		author: tidy(sub(field("100") || field("110"), ["a"])[0]),
+		catalog: cleanCatalog({
+			classification: dewey ? dewey.replace(/\//g, "") : lcc || null,
+			subjects,
+			year: sub(pub, ["c"])[0] || control.slice(7, 11),
+			publisher: tidy(sub(pub, ["b"])[0]),
+			language: control.slice(35, 38).trim(),
+		}),
+	};
+}
+
 // The named entities descriptions use besides XML's own.
 const HTML_ENTITIES = { nbsp: " ", ldquo: "\u201c", rdquo: "\u201d", lsquo: "\u2018", rsquo: "\u2019", mdash: "\u2014", ndash: "\u2013",
 	hellip: "\u2026", eacute: "\u00e9", egrave: "\u00e8", aacute: "\u00e1", iacute: "\u00ed", oacute: "\u00f3", uacute: "\u00fa",
@@ -3385,7 +3514,7 @@ function blurbText(s) {
 
 // What the file says: {blurb, pages, words} (each null when it doesn't say).
 async function fileRecord(env, book) {
-	const type = bookType(book), out = { blurb: null, pages: null, words: null };
+	const type = bookType(book), out = { blurb: null, pages: null, words: null, catalog: {} };
 	if (type === "epub") {
 		const zip = await r2Zip(env, book.r2_key, book.size);
 		if (!zip) return out;
@@ -3394,6 +3523,8 @@ async function fileRecord(env, book) {
 		const desc = /<dc:description\b[^>]*>([\s\S]*?)<\/dc:description>/i.exec(md);
 		// The description is often escaped HTML (&lt;p&gt;), so it's unescaped before the tags go.
 		if (desc) out.blurb = blurbText(decodeXml(desc[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")));
+		const el = (name) => [...md.matchAll(new RegExp(`<dc:${name}\\b[^>]*>([\\s\\S]*?)</dc:${name}>`, "gi"))].map((m) => xmlText(m[1])).filter(Boolean);
+		out.catalog = cleanCatalog({ year: el("date")[0], publisher: el("publisher")[0], language: el("language")[0], isbn: el("identifier").find(isbnOf) });
 		// About 6 characters a word once the markup is gone, which is roughly a third of an XHTML file.
 		const chars = zip.files.filter((f) => /\.x?html?$/i.test(f.name)).reduce((n, f) => n + f.usize, 0);
 		if (chars) out.words = Math.round(chars * 0.35 / 6);
@@ -3402,7 +3533,10 @@ async function fileRecord(env, book) {
 		if (!zip) return out;
 		out.pages = zip.files.filter((f) => COVER_IMAGE.test(f.name) && !/(^|\/)(__MACOSX\/|\.)/.test(f.name)).length || null;
 		const el = await comicInfo(env, book);
-		if (el) out.blurb = blurbText(el("Summary"));
+		if (el) {
+			out.blurb = blurbText(el("Summary"));
+			out.catalog = cleanCatalog({ year: el("Year"), publisher: el("Publisher"), language: el("LanguageISO") });
+		}
 	} else if (type === "pdf") {
 		// Known once it has been opened in the reader.
 		try { out.pages = JSON.parse(book.position || "null")?.pages || null; } catch {}
@@ -3412,25 +3546,39 @@ async function fileRecord(env, book) {
 	return out;
 }
 
-// Open Library, then Google Books: {blurb, pages, from: {blurb, pages}}, each
-// only from a match with the same title and author.
-async function onlineRecord(title, author) {
-	const want = looseTitle(title), out = { blurb: null, pages: null, from: {} };
+// Open Library, then Google Books: {blurb, pages, catalog, from: {blurb,
+// pages, catalog: {field: source}}}, each only from a match with the same
+// title and author. need: the catalog fields still wanted.
+async function onlineRecord(title, author, need = CATALOG_FIELDS) {
+	const want = looseTitle(title), out = { blurb: null, pages: null, catalog: {}, from: { catalog: {} } };
+	const take = (found, source) => {
+		for (const [k, v] of Object.entries(cleanCatalog(found))) {
+			if (need.includes(k) && !out.catalog[k]) { out.catalog[k] = v; out.from.catalog[k] = source; }
+		}
+	};
+	const done = () => out.blurb && out.pages && need.every((k) => out.catalog[k]);
 	if (!want) return out;
 	const surname = looseTitle(String(author || "").split(/,|&| and /)[0]).split(" ").pop();
 	const same = (t) => { const a = looseTitle(t); return a === want || want.startsWith(a + " ") || a.startsWith(want + " "); };
 	const byAuthor = (names) => !surname || (names || []).some((n) => looseTitle(n).split(" ").includes(surname));
 	await within(async () => {
 		const q = [title, author].filter(Boolean).join(" ");
-		const data = await lookupJSON("https://openlibrary.org/search.json?" + new URLSearchParams({ q, fields: "key,title,author_name,number_of_pages_median", limit: "10" }));
+		const data = await lookupJSON("https://openlibrary.org/search.json?" + new URLSearchParams({
+			q, fields: "key,title,author_name,number_of_pages_median,first_publish_year,publisher,language,isbn,ddc,lcc", limit: "10",
+		}));
 		const hit = (data.docs || []).find((d) => same(d.title) && byAuthor(d.author_name) && /^\/works\/OL\d+W$/.test(d.key || ""));
 		if (!hit) return;
 		if (Number.isInteger(hit.number_of_pages_median) && hit.number_of_pages_median > 0) { out.pages = hit.number_of_pages_median; out.from.pages = "openlibrary"; }
+		// The first year it came out; a publisher and ISBN from its editions; Dewey, else Library of Congress.
+		take({
+			year: hit.first_publish_year, publisher: (hit.publisher || [])[0], language: (hit.language || []).includes("eng") ? "eng" : (hit.language || [])[0],
+			isbn: (hit.isbn || []).find((i) => i.length === 13) || (hit.isbn || [])[0], classification: (hit.ddc || [])[0] || (hit.lcc || [])[0],
+		}, "openlibrary");
 		const work = await lookupJSON(`https://openlibrary.org${hit.key}.json`);
 		const desc = blurbText(typeof work.description === "string" ? work.description : work.description?.value);
 		if (desc) { out.blurb = desc; out.from.blurb = "openlibrary"; }
 	}, null, 8000);
-	if (out.blurb && out.pages) return out;
+	if (done()) return out;
 	await within(async () => {
 		const q = [`intitle:${title}`].concat(author ? [`inauthor:${String(author).split(",")[0]}`] : []).join(" ");
 		const data = await lookupJSON("https://www.googleapis.com/books/v1/volumes?" + new URLSearchParams({ q, maxResults: "5", printType: "books" }));
@@ -3439,7 +3587,9 @@ async function onlineRecord(title, author) {
 			if (!same(v.title || "") || !byAuthor(v.authors)) continue;
 			if (!out.blurb && v.description) { out.blurb = blurbText(v.description); if (out.blurb) out.from.blurb = "google"; }
 			if (!out.pages && Number.isInteger(v.pageCount) && v.pageCount > 0) { out.pages = v.pageCount; out.from.pages = "google"; }
-			if (out.blurb && out.pages) break;
+			const ids = Object.fromEntries((v.industryIdentifiers || []).map((i) => [i.type, i.identifier]));
+			take({ year: v.publishedDate, publisher: v.publisher, language: v.language, isbn: ids.ISBN_13 || ids.ISBN_10 }, "google");
+			if (done()) break;
 		}
 	}, null, 8000);
 	return out;
@@ -3553,12 +3703,16 @@ function recordJSON(book) {
 	let appeal = null, from = {};
 	try { appeal = JSON.parse(book.appeal || "null"); } catch {}
 	try { from = JSON.parse(book.record_from || "{}") || {}; } catch {}
-	return { blurb: book.blurb || null, pages: book.pages || null, appeal, from, filled: !!book.record_at };
+	let catalog = {};
+	try { catalog = JSON.parse(book.catalog || "{}") || {}; } catch {}
+	return { blurb: book.blurb || null, pages: book.pages || null, appeal, catalog, from, filled: !!book.record_at };
 }
 // soon: the owner's Look up records, which tries a record without appeal terms again at once.
 function recordDue(book, soon) {
 	if (!book.record_at) return true;
 	const r = recordJSON(book);
+	// Records looked up before catalog details (or the Library of Congress) existed get them once.
+	if (!r.from.catalog || !r.from.loc) return true;
 	return !r.appeal && r.from.appeal !== "edited" && (soon || Date.now() - book.record_at > RECORD_RETRY_MS);
 }
 
@@ -3571,15 +3725,34 @@ async function fillRecord(env, book, refresh) {
 	if (!keep("blurb")) delete from.blurb;
 	if (!keep("pages")) delete from.pages;
 	if (!keep("appeal")) delete from.appeal;
-	let file = { blurb: null, pages: null, words: null };
+	let file = { blurb: null, pages: null, words: null, catalog: {} };
 	try { file = await fileRecord(env, book); } catch (err) { console.warn("record file", book.id, err); }
 	if (!blurb && file.blurb) { blurb = file.blurb; from.blurb = "file"; }
 	if (!pages && file.pages) { pages = file.pages; from.pages = "file"; }
-	if (!blurb || !pages) {
-		const online = await onlineRecord(book.title, book.author || "");
+	// Catalog fields one by one: an edited one stays, a known one stays unless refreshing.
+	const catFrom = { ...(from.catalog || {}) }, catalog = {};
+	for (const k of CATALOG_FIELDS) {
+		if (had.catalog[k] && (catFrom[k] === "edited" || !refresh)) catalog[k] = had.catalog[k];
+		else delete catFrom[k];
+	}
+	for (const [k, v] of Object.entries(file.catalog || {})) if (!catalog[k]) { catalog[k] = v; catFrom[k] = "file"; }
+	const need = CATALOG_FIELDS.filter((k) => !catalog[k]);
+	if (!blurb || !pages || need.length) {
+		const online = await onlineRecord(book.title, book.author || "", need);
 		if (!blurb && online.blurb) { blurb = online.blurb; from.blurb = online.from.blurb; }
 		if (!pages && online.pages) { pages = online.pages; from.pages = online.from.pages; }
+		for (const [k, v] of Object.entries(online.catalog)) { catalog[k] = v; catFrom[k] = online.from.catalog[k]; }
 	}
+	// The Library of Congress's call number and subject headings win over
+	// Open Library's and Google's; its other details only fill gaps. Edits stay.
+	const loc = await within(() => locRecord(catalog.isbn, book.title, book.author || ""), undefined, 8000);
+	// "unreached" (LC down, or too slow) isn't tried again until the next refresh.
+	from.loc = loc === undefined ? "unreached" : loc ? "found" : "none";
+	for (const [k, v] of Object.entries(loc || {})) {
+		if (catFrom[k] === "edited" || catFrom[k] === "file") continue;
+		if (k === "classification" || k === "subjects" || !catalog[k]) { catalog[k] = v; catFrom[k] = "loc"; }
+	}
+	from.catalog = catFrom;
 	if (!pages && file.words > 2000) { pages = Math.max(1, Math.round(file.words / WORDS_PER_PAGE)); from.pages = "estimate"; }
 	if (!keep("appeal")) {
 		const { results } = await env.DB.prepare("SELECT t.name FROM book_tag_links l JOIN book_tags t ON t.id = l.tag_id WHERE l.book_id = ?").bind(book.id).all();
@@ -3596,9 +3769,26 @@ async function fillRecord(env, book, refresh) {
 		else from.appeal_error = why || (got ? `${got.model} didn't know this book` : env.ANTHROPIC_API_KEY || env.AI ? "the model took too long" : "no AI binding or ANTHROPIC_API_KEY");
 		if (got?.blurb && !blurb) { blurb = got.blurb; from.blurb = "ai"; from.blurb_model = got.model; }
 	}
-	const row = await env.DB.prepare("UPDATE books SET blurb = ?, pages = ?, appeal = ?, record_from = ?, record_at = ? WHERE id = ? RETURNING blurb, pages, appeal, record_from, record_at")
-		.bind(blurb, pages, appeal ? JSON.stringify(appeal) : null, JSON.stringify(from), Date.now(), book.id).first();
+	const row = await env.DB.prepare("UPDATE books SET blurb = ?, pages = ?, appeal = ?, catalog = ?, record_from = ?, record_at = ? WHERE id = ? RETURNING blurb, pages, appeal, catalog, record_from, record_at")
+		.bind(blurb, pages, appeal ? JSON.stringify(appeal) : null, Object.keys(catalog).length ? JSON.stringify(catalog) : null, JSON.stringify(from), Date.now(), book.id).first();
 	return recordJSON(row || {});
+}
+
+// GET /api/catalog: every book's catalog details, for the book logs on the
+// site (its build matches them to the notes by title and author). Only
+// catalog facts: no files, tags, reading progress or family details.
+async function catalogFeed(env) {
+	const { results } = await env.DB.prepare(
+		"SELECT id, title, author, series, volume, pages, catalog, record_from FROM books ORDER BY id",
+	).all();
+	const books = results.map((b) => {
+		const r = recordJSON(b);
+		return {
+			id: b.id, title: b.title, author: b.author || null, series: b.series || null, volume: b.volume || null,
+			pages: r.pages, pages_estimated: r.from.pages === "estimate", ...r.catalog,
+		};
+	});
+	return json({ books });
 }
 
 // GET /api/family/books/:id: a book's record, looked up the first time.
@@ -4011,7 +4201,14 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.appeal { display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: 12px 16px; margin: 0; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
 	.appeal dt { font: 600 16px/1.3 var(--display); padding-top: 4px; }
 	.appeal dd { margin: 0; display: flex; flex-wrap: wrap; gap: 6px; }
-	.term { border: 1px solid var(--line); background: var(--bg); border-radius: 999px; padding: 3px 12px; font-size: 14px; line-height: 1.5; }
+	.term { border: 1px solid var(--t-line, var(--line)); background: var(--t-bg, var(--bg)); color: var(--t-fg, inherit); border-radius: 999px; padding: 3px 12px; font-size: 14px; line-height: 1.5; }
+	/* Each appeal factor has its own color: its label and its terms. */
+	.appeal .f-pacing { --t-fg: #8a3a12; --t-bg: #f6dcc8; --t-line: #e8b896; }
+	.appeal .f-tone { --t-fg: #6b2f5b; --t-bg: #efd9e6; --t-line: #d9b3cb; }
+	.appeal .f-style { --t-fg: #1f5d5a; --t-bg: #d6ebe6; --t-line: #a9d1c9; }
+	.appeal .f-characters { --t-fg: #4f5b16; --t-bg: #e3e8c6; --t-line: #c3cd92; }
+	.appeal .f-story { --t-fg: #2f4a7a; --t-bg: #dbe3f1; --t-line: #b3c3e0; }
+	.appeal dt[class^="f-"] { color: var(--t-fg); }
 	.rbtns { display: flex; flex-wrap: wrap; gap: 10px; max-width: 520px; }
 	.rbtns .rdl { flex: 1 1 200px; }
 	.rpv { display: flex; align-items: center; justify-content: center; flex: 0 1 150px; min-height: 48px; margin-top: 0; border: 1px solid var(--accent); border-radius: 10px;
@@ -4550,7 +4747,14 @@ function recordFacts(b, rec) {
 	dl.textContent = "";
 	add("Format", KIND[b.type] + " · " + bytes(b.size));
 	if (rec && rec.pages) add("Length", (rec.from.pages === "estimate" ? "About " : "") + rec.pages.toLocaleString() + (rec.pages === 1 ? " page" : " pages"));
+	var c = rec && rec.catalog || {};
+	add("Published", c.year);
+	add("Publisher", c.publisher);
+	add("Language", c.language);
 	add("Shelved", b.tags.filter(function (t) { return !common[t]; }).join(", "));
+	add("Call number", c.classification);
+	add("Subjects", (c.subjects || []).join("; "));
+	add("ISBN", c.isbn);
 }
 function downloadButton(dl, left, b) {
 	dl.href = "/api/family/books/" + b.id + "/file";
@@ -4581,9 +4785,9 @@ function recordDetails(b, rec) {
 	APPEAL.forEach(function (f) {
 		var terms = rec.appeal && rec.appeal[f[0]];
 		if (!terms || !terms.length) return;
-		var dd = h("dd");
+		var dd = h("dd", "f-" + f[0]);
 		terms.forEach(function (t) { dd.append(h("span", "term", t)); });
-		dl.append(h("dt", null, f[1]), dd);
+		dl.append(h("dt", "f-" + f[0], f[1]), dd);
 		any = true;
 	});
 	$("rAppealSec").hidden = !any;
@@ -5809,6 +6013,8 @@ const PAGE = String.raw`<!doctype html>
 		<div class="drec">
 			<h3>Record <span class="hint">(the family library's page for this book)</span></h3>
 			<label>Jacket copy <textarea id="dBlurb" rows="5" maxlength="4000"></textarea></label>
+			<label>Catalog <span class="hint">(a line each: Published, Publisher, Language, Classification, ISBN)</span>
+				<textarea id="dCatalog" rows="5" placeholder="Published: 1996&#10;Publisher: Bantam"></textarea></label>
 			<label>Appeal terms <span class="hint">(a line each: Pacing, Tone, Writing style, Characters, Storyline)</span>
 				<textarea id="dAppeal" rows="5" placeholder="Pacing: Fast-paced&#10;Tone: Suspenseful, Wry"></textarea></label>
 			<div class="dlook">
@@ -9387,8 +9593,26 @@ function appealParse(text) {
 	});
 	return out;
 }
+var CATALOG_LABELS = { year: "Published", publisher: "Publisher", language: "Language", classification: "Classification", isbn: "ISBN", subjects: "Subjects" };
+function catalogText(c) {
+	return Object.keys(CATALOG_LABELS).filter(function (k) { return c && c[k] && c[k].length; }).map(function (k) {
+		return CATALOG_LABELS[k] + ": " + (Array.isArray(c[k]) ? c[k].join("; ") : c[k]);
+	}).join("\n");
+}
+// Every field, so a line taken out clears it.
+function catalogParse(text) {
+	var out = {}, keys = { published: "year", year: "year", publisher: "publisher", language: "language", classification: "classification",
+		"call number": "classification", dewey: "classification", isbn: "isbn", subjects: "subjects", subject: "subjects", "subject headings": "subjects" };
+	Object.keys(CATALOG_LABELS).forEach(function (k) { out[k] = ""; });
+	text.split("\n").forEach(function (line) {
+		var m = /^\s*([^:]+):(.*)$/.exec(line), k = m && keys[m[1].trim().toLowerCase()];
+		if (k) out[k] = m[2].trim();
+	});
+	return out;
+}
 function fillDetailsRecord(rec) {
 	details.record = rec;
+	$("dCatalog").value = rec ? catalogText(rec.catalog) : "";
 	$("dBlurb").value = rec && rec.blurb || "";
 	$("dPages").value = rec && rec.pages ? String(rec.pages) : "";
 	$("dAppeal").value = rec ? appealText(rec.appeal) : "";
@@ -9396,6 +9620,7 @@ function fillDetailsRecord(rec) {
 	$("dRecStatus").textContent = !rec ? "" : !rec.filled ? "Not looked up yet." : [
 		from.blurb && from.blurb !== "edited" && "copy from " + ({ file: "the file", openlibrary: "Open Library", google: "Google Books", ai: "AI" }[from.blurb] || from.blurb),
 		from.pages === "estimate" && "pages estimated",
+		from.loc === "none" && "no Library of Congress record",
 		from.appeal && from.appeal !== "edited" && "terms by " + from.appeal,
 		from.appeal_error && "no appeal factors: " + from.appeal_error
 	].filter(Boolean).join(", ");
@@ -9416,6 +9641,8 @@ function recordPatch(patch) {
 	if (blurb !== (rec.blurb || "")) patch.blurb = blurb;
 	if (pages !== (rec.pages ? String(rec.pages) : "")) patch.pages = pages ? parseInt(pages, 10) || null : null;
 	if (appealText(appeal) !== appealText(rec.appeal)) patch.appeal = appeal;
+	var catalog = catalogParse($("dCatalog").value);
+	if (catalogText(catalog) !== catalogText(rec.catalog)) patch.catalog = catalog;
 }
 function closeDetails() {
 	if (details && details.url) URL.revokeObjectURL(details.url);
