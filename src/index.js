@@ -96,10 +96,13 @@
 //   POST   /api/family/request     {name, note?, check?} -> {ok}: asks for a library card (no token needed; check is
 //                                  the Turnstile token when it's set up); shows on the Family screen
 //   GET    /api/people/:id/downloads -> {"downloads": [{at, book_id, title, author}]}, newest first
-//   GET    /api/family/me          -> {"name", "owner"} (name null for the owner; owner from OWNER_NAME); renews the cookie
+//   GET    /api/family/me          -> {"name", "owner", "left", "today"} (name null for the owner; owner from OWNER_NAME;
+//                                  left and today: downloads left in the last 24 hours and the book ids already
+//                                  taken, null for the owner); renews the cookie
 //   GET    /api/family/books       -> {"books": [...each with tags: [names]]}, without any tagged "Hide from family"
 //   GET    /api/family/books/:id/cover   as /api/books/:id/cover
-//   GET    /api/family/books/:id/file    the file as a download named "Title - Author.ext" (logged for a family member)
+//   GET    /api/family/books/:id/file    the file as a download named "Title - Author.ext" (logged for a family member,
+//                                        who gets 10 different books in any 24 hours; a page saying so after that)
 //
 // Email (Cloudflare Email Routing -> "Send to a Worker" -> this Worker):
 //   each message sent to the routed address (news@brandonj.ink, say) becomes
@@ -2712,7 +2715,9 @@ async function familyApi(request, env, url, who) {
 	const p = url.pathname;
 	if (m !== "GET") return null;
 	if (p === "/api/family/me") {
-		const res = json({ name: who.person ? who.person.name : null, owner: str(env.OWNER_NAME, 60) });
+		const today = who.person ? await downloadedToday(env, who.person.id) : null;
+		const res = json({ name: who.person ? who.person.name : null, owner: str(env.OWNER_NAME, 60),
+			left: today && Math.max(0, DOWNLOADS_PER_DAY - today.length), today });
 		if (who.person) res.headers.set("Set-Cookie", familyCookie(who.person.token));
 		return res;
 	}
@@ -2759,8 +2764,33 @@ function downloadName(book) {
 	return (base || "Book") + "." + ext;
 }
 
+// 10 different books a person in any 24 hours, so the library's connection
+// isn't swamped. Taking a book again within the day doesn't count twice. The
+// owner has no limit.
+const DOWNLOADS_PER_DAY = 10;
+async function downloadedToday(env, personId) {
+	const { results } = await env.DB.prepare("SELECT DISTINCT book_id FROM downloads WHERE person_id = ? AND at > ?")
+		.bind(personId, Date.now() - 86400000).all();
+	return results.map((r) => r.book_id);
+}
+function limitPage() {
+	return new Response(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Come back tomorrow</title>
+<body style="font: 18px/1.5 Georgia, serif; background: #f4ecd8; color: #3b2f22; max-width: 32em; margin: 0 auto; padding: 48px 20px">
+<h1 style="font-size: 26px">That's today's ${DOWNLOADS_PER_DAY} books</h1>
+<p>Each card gets ${DOWNLOADS_PER_DAY} downloads a day, so the library's internet holds up. Come back tomorrow for more.</p>
+<p><a href="/library" style="color: #8b2e1f">Back to the library</a></p>`, {
+		status: 429,
+		headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'" },
+	});
+}
+
 async function familyDownload(env, id, person) {
 	const book = await familyBook(env, id);
+	if (person) {
+		const today = await downloadedToday(env, person.id);
+		if (!today.includes(id) && today.length >= DOWNLOADS_PER_DAY) return limitPage();
+	}
 	const obj = await env.BOOKS.get(book.r2_key);
 	if (!obj) throw new HttpError(404, "The file is missing from storage");
 	if (person) await env.DB.prepare("INSERT INTO downloads (person_id, book_id, at) VALUES (?, ?, ?)").bind(person.id, id, Date.now()).run();
@@ -3109,6 +3139,8 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	summary { cursor: pointer; color: var(--accent); }
 	.go { appearance: none; width: 100%; border: 0; border-radius: 10px; background: var(--accent); color: var(--on-accent); font-weight: 600; font-size: 17px; min-height: 48px; margin-top: 10px; cursor: pointer; }
 	.sub { margin: -8px 0 14px; font-size: 14px; }
+	.intro { max-width: 640px; margin: 0 0 20px; font: 400 17px/1.55 var(--display); }
+	.intro p { margin: 0 0 10px; }
 	/* The landing page: noir. Near-black, light through venetian blinds,
 	   white type, one red accent. */
 	body.landing { background: #0a0a0b; color: #ece8e1; min-height: 100vh; }
@@ -3168,6 +3200,10 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	</section>
 	<h1 id="head" hidden>The Back Alley Library</h1>
 	<p id="sub" class="sub muted" hidden></p>
+	<div id="intro" class="intro" hidden>
+		<p>Welcome to the Back Alley Library. All of the books in the collection are DRM free and work anywhere. Consolidating the history of my digital purchases is a big job and I add more to the collection when I have time.</p>
+		<p>I put a download limit of 10 books per person per day so you guys don't hog my internet. Happy Reading!</p>
+	</div>
 	<p id="note" class="muted">Loading…</p>
 	<section id="welcome" class="welcome" hidden>
 		<p id="wIntro">Browse, then download any book to read in Apple Books or your favorite app. They're yours to keep.</p>
@@ -3244,6 +3280,7 @@ function drawnCover(b) {
 function card(b) {
 	var li = h("li"), a = h("a"), cov = h("div", "cover");
 	a.href = "/api/family/books/" + b.id + "/file";
+	a.addEventListener("click", function (e) { downloading(e, b); });
 	a.setAttribute("aria-label", "Download " + b.title + (b.author ? " by " + b.author : "") + ", " + KIND[b.type]);
 	cov.append(drawnCover(b));
 	if (b.cover === "yes" || (b.cover !== "none" && (b.type === "epub" || b.type === "cbz"))) {
@@ -3482,6 +3519,25 @@ function render() {
 		: shown.length === books.length ? books.length + (books.length === 1 ? " book" : " books") : shown.length + " of " + books.length;
 }
 
+function showSub() {
+	if (!me.name) return;
+	var left = me.left == null ? "" : " · " + (me.left === 1 ? "1 download" : me.left + " downloads") + " left today";
+	$("sub").textContent = "Signed in as " + me.name + left;
+	$("sub").hidden = false;
+}
+// The Worker enforces the daily limit; this just says so before the tap
+// leads to its page, and keeps the count on the page current.
+function downloading(e, b) {
+	if (!me || me.left == null || me.today.indexOf(b.id) >= 0) return;
+	if (me.left <= 0) {
+		e.preventDefault();
+		alert("That's today's 10 books. Come back tomorrow for more.");
+		return;
+	}
+	me.today.push(b.id);
+	me.left--;
+	showSub();
+}
 async function load() {
 	var invite = /[#&]invite=([\w-]+)/.exec(location.hash), used = invite ? await signIn(invite[1]) : "";
 	var res = await fetch("/api/family/me");
@@ -3489,7 +3545,8 @@ async function load() {
 	if (!res.ok) throw new Error("Couldn't reach the library.");
 	me = await res.json();
 	$("head").hidden = false;
-	if (me.name) { $("sub").textContent = "Signed in as " + me.name; $("sub").hidden = false; }
+	showSub();
+	$("intro").hidden = false;
 	if (invite || !read("familyWelcomed")) welcome(true);
 	var data = await (await fetch("/api/family/books")).json();
 	books = (data.books || []).slice().sort(function (a, b) {
