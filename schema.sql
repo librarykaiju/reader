@@ -98,7 +98,15 @@ CREATE TABLE IF NOT EXISTS books (
 	volume TEXT,
 	-- A comic's layout (migration 0009): NULL = decided on first opening,
 	-- 'pages', 'scroll' (webtoon) or 'rtl' (manga).
-	layout TEXT
+	layout TEXT,
+	-- The book's record on the family library (migration 0014): jacket copy,
+	-- page count, appeal terms (JSON), where each came from (JSON), and when
+	-- it was looked up (NULL = not yet). See "Book records" in src/index.js.
+	blurb TEXT,
+	pages INTEGER,
+	appeal TEXT,
+	record_from TEXT,
+	record_at INTEGER
 );
 
 -- Tags for feeds. A feed can carry any number of them, and the page filters

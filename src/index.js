@@ -9,7 +9,8 @@
 //   BOOKS                R2 bucket binding -> "reader-books" (kept private)
 //   READER_TOKEN         secret; any long random string, entered once on the page (the owner)
 //   AI                   Workers AI binding, optional; turns on "Compare coverage" (see Coverage below)
-//   ANTHROPIC_API_KEY    secret, optional; compares with Claude instead, when there's no AI binding
+//   ANTHROPIC_API_KEY    secret, optional; compares with Claude instead, when there's no AI binding; and picks
+//                        the family library's appeal terms (Workers AI does without it; see "Book records")
 //   OWNER_NAME           optional; your name on the family welcome page ("Welcome to Brandon's library")
 //   TURNSTILE_SITE_KEY   optional; with TURNSTILE_SECRET (a secret), a Cloudflare Turnstile check on the
 //                        library card request form (docs/setup.md, "Family library")
@@ -71,11 +72,14 @@
 //   GET    /api/books/:id/file     the file itself (?dl=1: saving it for offline, so not "opened")
 //   GET    /api/books/:id/part?at=&len=  len bytes of the file from byte at (up to 4 MB; for drawing a PDF's cover)
 //   GET    /api/books/:id/cover    the cover image (an EPUB's or a comic's first page is found the first time); 404 if none
+//   GET    /api/books/:id/record  -> {"id", "record": {blurb, pages, appeal, from, filled}} (?fill=1: looks it up if it
+//                                  hasn't been; ?refresh=1: looks it all up again, keeping what was edited)
 //   POST   /api/books/:id/genres  {title?, author?, online?} -> {"book", "added": [tag names], "from": "file"|"online"|""}
 //                                  adds genre tags from the file's own subjects, else Open Library's (never removes any)
 //   PUT    /api/books/:id/cover    body = a JPEG/PNG/WebP: a PDF's first page the page drew, or one chosen in Edit details
 //   DELETE /api/books/:id/cover    back to the automatic cover (the file's own, or a PDF's first page)
-//   PATCH  /api/books/:id          {title?, author?, series?, volume?, position?, finished?, opened?, tags?, reread?, layout?}
+//   PATCH  /api/books/:id          {title?, author?, series?, volume?, position?, finished?, opened?, tags?, reread?, layout?,
+//                                  blurb?, pages?, appeal?} (the last three: the Record page's, see "Book records")
 //                                  (layout, a comic's: "pages", "scroll" (webtoon), "rtl" (manga), or null)
 //                                  (author/series/volume: the page reads them from an EPUB's own details;
 //                                  reread: fill them in from a .txt's YAML header or a comic's ComicInfo.xml)
@@ -100,6 +104,8 @@
 //                                  left and today: downloads left in the last 24 hours and the book ids already
 //                                  taken, null for the owner); renews the cookie
 //   GET    /api/family/books       -> {"books": [...each with tags: [names]]}, without any tagged "Hide from family"
+//   GET    /api/family/books/:id  -> {"id", "record"}: the book's Record (as /api/books/:id/record), looked up the
+//                                  first time it's opened; 404 for a hidden book
 //   GET    /api/family/books/:id/cover   as /api/books/:id/cover
 //   GET    /api/family/books/:id/file    the file as a download named "Title - Author.ext" (logged for a family member,
 //                                        who gets 10 different books in any 24 hours; a page saying so after that)
@@ -277,6 +283,8 @@ async function api(request, env, url) {
 	if (part && m === "GET") return bookPart(env, toId(part[1]), url);
 	const genres = p.match(/^\/api\/books\/(\d+)\/genres$/);
 	if (genres && m === "POST") return tagGenres(request, env, toId(genres[1]));
+	const record = p.match(/^\/api\/books\/(\d+)\/record$/);
+	if (record && m === "GET") return ownerRecord(env, toId(record[1]), url);
 	const cover = p.match(/^\/api\/books\/(\d+)\/cover$/);
 	if (cover) {
 		if (m === "GET") return bookCover(env, toId(cover[1]));
@@ -2067,6 +2075,27 @@ async function updateBook(request, env, id) {
 		sets.push("last_opened_at = ?");
 		params.push(Date.now());
 	}
+	// The Record page's details as typed in Edit details: marked "edited", so
+	// a lookup never replaces them. Emptied, a lookup may fill it again.
+	if (["blurb", "pages", "appeal"].some((k) => body[k] !== undefined)) {
+		const cur = await env.DB.prepare("SELECT record_from FROM books WHERE id = ?").bind(id).first();
+		if (!cur) throw new HttpError(404, "No such book");
+		let from = {};
+		try { from = JSON.parse(cur.record_from || "{}") || {}; } catch {}
+		const vals = {};
+		if (body.blurb !== undefined) vals.blurb = typeof body.blurb === "string" ? blurbText(body.blurb) : null;
+		if (body.pages !== undefined) vals.pages = body.pages === null || body.pages === "" ? null : clampInt(body.pages, 1, 100000, null);
+		if (body.appeal !== undefined) { const a = cleanAppeal(body.appeal, false); vals.appeal = a && JSON.stringify(a); }
+		for (const [k, v] of Object.entries(vals)) {
+			sets.push(k + " = ?");
+			params.push(v || null);
+			if (v) from[k] = "edited";
+			else delete from[k];
+			if (k === "blurb") delete from.blurb_model;
+		}
+		sets.push("record_from = ?", "record_at = COALESCE(record_at, ?)");
+		params.push(JSON.stringify(from), Date.now());
+	}
 	if (body.reread) {
 		const book = await getBook(env, id);
 		if (book.type === "txt") await applyFrontMatter(env, book);
@@ -2722,6 +2751,8 @@ async function familyApi(request, env, url, who) {
 		return res;
 	}
 	if (p === "/api/family/books") return familyBooks(env);
+	const record = p.match(/^\/api\/family\/books\/(\d+)$/);
+	if (record) return familyRecord(env, toId(record[1]));
 	const cover = p.match(/^\/api\/family\/books\/(\d+)\/cover$/);
 	if (cover) {
 		await familyBook(env, toId(cover[1]));
@@ -2805,6 +2836,273 @@ async function familyDownload(env, id, person) {
 			"Content-Security-Policy": "default-src 'none'; sandbox",
 		},
 	});
+}
+
+// Book records: what the family library's Record page shows about a book
+// before it's downloaded. The jacket copy (blurb) and page count come from
+// the file first (an EPUB's dc:description, a comic's ComicInfo.xml Summary
+// and its pages), then Open Library, then Google Books, matched the way the
+// genre tags are (same title, an author sharing a word). With no page count
+// anywhere, the text's length gives an estimate ("About 320 pages").
+//
+// Appeal terms are the readers' advisory kind a librarian uses (Joyce
+// Saricks' appeal factors, as NoveList has them): pacing, tone, writing
+// style, characters and storyline. No free catalog has them, so a model
+// picks them from the fixed lists below, from what it knows of the book and
+// the blurb: Claude when ANTHROPIC_API_KEY is set (it knows far more books),
+// else Workers AI. When neither has a blurb, the model writes a short one if
+// it knows the book, marked as such on the page. A book it doesn't know and
+// has nothing on gets no terms rather than guessed ones.
+//
+// A record is filled the first time anyone opens it and kept (record_at);
+// one that got no appeal terms is tried again after a week. Anything typed
+// in Edit details is marked "edited" and never replaced.
+
+const APPEAL = {
+	pacing: ["Fast-paced", "Steady", "Leisurely", "Slow-building", "Unhurried", "Episodic"],
+	tone: ["Adventurous", "Atmospheric", "Bleak", "Creepy", "Dark", "Darkly humorous", "Epic", "Funny", "Gritty", "Haunting",
+		"Heartwarming", "Hopeful", "Intense", "Melancholy", "Menacing", "Moving", "Nostalgic", "Offbeat", "Playful",
+		"Reflective", "Romantic", "Suspenseful", "Thought-provoking", "Upbeat", "Whimsical", "Wry"],
+	style: ["Accessible", "Archaic", "Compelling", "Conversational", "Dense", "Descriptive", "Dialogue-rich", "Engaging",
+		"Informative", "Lyrical", "Poetic", "Richly detailed", "Scholarly", "Spare", "Stylistically complex", "Witty"],
+	characters: ["Antihero", "Complex", "Ensemble cast", "Flawed", "Larger than life", "Likeable", "Memorable villain",
+		"Morally ambiguous", "Quirky", "Strong female lead", "Sympathetic", "Unreliable narrator", "Well-developed"],
+	story: ["Action-packed", "Character-driven", "Coming-of-age", "Interconnected stories", "Intricately plotted",
+		"Issue-oriented", "Mystery to solve", "Multiple perspectives", "Nonlinear", "Open-ended", "Plot-driven",
+		"Political intrigue", "Quest", "Survival", "Sweeping", "Twisty", "World-building"],
+};
+const RECORD_CLAUDE_MODEL = "claude-opus-5-5";
+const RECORD_AI_MODEL = COVERAGE_AI_MODEL;
+const BLURB_MAX = 4000;
+const RECORD_RETRY_MS = 7 * 24 * 60 * 60 * 1000;
+// Words to a printed page, for an estimate.
+const WORDS_PER_PAGE = 275;
+
+// The named entities descriptions use besides XML's own.
+const HTML_ENTITIES = { nbsp: " ", ldquo: "\u201c", rdquo: "\u201d", lsquo: "\u2018", rsquo: "\u2019", mdash: "\u2014", ndash: "\u2013",
+	hellip: "\u2026", eacute: "\u00e9", egrave: "\u00e8", aacute: "\u00e1", iacute: "\u00ed", oacute: "\u00f3", uacute: "\u00fa",
+	ouml: "\u00f6", uuml: "\u00fc", auml: "\u00e4", ccedil: "\u00e7", ntilde: "\u00f1", copy: "\u00a9", reg: "\u00ae", trade: "\u2122", laquo: "\u00ab", raquo: "\u00bb" };
+// HTML or plain description text -> paragraphs separated by blank lines,
+// without Open Library's trailing "----------" link lists and [n] links.
+function blurbText(s) {
+	let t = String(s || "")
+		.replace(/<\s*br\s*\/?>/gi, "\n")
+		.replace(/<\/\s*(p|div|li|h\d)\s*>/gi, "\n\n")
+		.replace(/<[^>]+>/g, "");
+	t = decodeXml(t)
+		.replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+		.replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
+		.replace(/&([a-z]+);/gi, (m, n) => HTML_ENTITIES[n] ?? m);
+	t = t.split(/\n\s*-{4,}\s*\n|\n\s*\[1\]:/)[0]
+		.replace(/\(\[source\]\[\d+\]\)/gi, "")
+		.replace(/\[([^\]]+)\]\[\d+\]/g, "$1")
+		.replace(/[ \t]+/g, " ")
+		.split(/\n\s*\n/).map((p) => p.replace(/\s*\n\s*/g, " ").trim()).filter(Boolean).join("\n\n");
+	if (t.length > BLURB_MAX) t = t.slice(0, BLURB_MAX).replace(/\s+\S*$/, "") + "…";
+	return t || null;
+}
+
+// What the file says: {blurb, pages, words} (each null when it doesn't say).
+async function fileRecord(env, book) {
+	const type = bookType(book), out = { blurb: null, pages: null, words: null };
+	if (type === "epub") {
+		const zip = await r2Zip(env, book.r2_key, book.size);
+		if (!zip) return out;
+		const { opf } = await epubPackage(env, zip);
+		const md = (/<(?:\w+:)?metadata\b[\s\S]*?<\/(?:\w+:)?metadata>/i.exec(opf) || [opf])[0];
+		const desc = /<dc:description\b[^>]*>([\s\S]*?)<\/dc:description>/i.exec(md);
+		// The description is often escaped HTML (&lt;p&gt;), so it's unescaped before the tags go.
+		if (desc) out.blurb = blurbText(decodeXml(desc[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")));
+		// About 6 characters a word once the markup is gone, which is roughly a third of an XHTML file.
+		const chars = zip.files.filter((f) => /\.x?html?$/i.test(f.name)).reduce((n, f) => n + f.usize, 0);
+		if (chars) out.words = Math.round(chars * 0.35 / 6);
+	} else if (type === "cbz") {
+		const zip = await r2Zip(env, book.r2_key, book.size);
+		if (!zip) return out;
+		out.pages = zip.files.filter((f) => COVER_IMAGE.test(f.name) && !/(^|\/)(__MACOSX\/|\.)/.test(f.name)).length || null;
+		const el = await comicInfo(env, book);
+		if (el) out.blurb = blurbText(el("Summary"));
+	} else if (type === "pdf") {
+		// Known once it has been opened in the reader.
+		try { out.pages = JSON.parse(book.position || "null")?.pages || null; } catch {}
+	} else if (type === "txt") {
+		out.words = Math.round((book.size || 0) / 6);
+	}
+	return out;
+}
+
+// Open Library, then Google Books: {blurb, pages, from: {blurb, pages}}, each
+// only from a match with the same title and author.
+async function onlineRecord(title, author) {
+	const want = looseTitle(title), out = { blurb: null, pages: null, from: {} };
+	if (!want) return out;
+	const surname = looseTitle(String(author || "").split(/,|&| and /)[0]).split(" ").pop();
+	const same = (t) => { const a = looseTitle(t); return a === want || want.startsWith(a + " ") || a.startsWith(want + " "); };
+	const byAuthor = (names) => !surname || (names || []).some((n) => looseTitle(n).split(" ").includes(surname));
+	await within(async () => {
+		const q = [title, author].filter(Boolean).join(" ");
+		const data = await lookupJSON("https://openlibrary.org/search.json?" + new URLSearchParams({ q, fields: "key,title,author_name,number_of_pages_median", limit: "10" }));
+		const hit = (data.docs || []).find((d) => same(d.title) && byAuthor(d.author_name) && /^\/works\/OL\d+W$/.test(d.key || ""));
+		if (!hit) return;
+		if (Number.isInteger(hit.number_of_pages_median) && hit.number_of_pages_median > 0) { out.pages = hit.number_of_pages_median; out.from.pages = "openlibrary"; }
+		const work = await lookupJSON(`https://openlibrary.org${hit.key}.json`);
+		const desc = blurbText(typeof work.description === "string" ? work.description : work.description?.value);
+		if (desc) { out.blurb = desc; out.from.blurb = "openlibrary"; }
+	}, null, 8000);
+	if (out.blurb && out.pages) return out;
+	await within(async () => {
+		const q = [`intitle:${title}`].concat(author ? [`inauthor:${String(author).split(",")[0]}`] : []).join(" ");
+		const data = await lookupJSON("https://www.googleapis.com/books/v1/volumes?" + new URLSearchParams({ q, maxResults: "5", printType: "books" }));
+		for (const it of data.items || []) {
+			const v = it.volumeInfo || {};
+			if (!same(v.title || "") || !byAuthor(v.authors)) continue;
+			if (!out.blurb && v.description) { out.blurb = blurbText(v.description); if (out.blurb) out.from.blurb = "google"; }
+			if (!out.pages && Number.isInteger(v.pageCount) && v.pageCount > 0) { out.pages = v.pageCount; out.from.pages = "google"; }
+			if (out.blurb && out.pages) break;
+		}
+	}, null, 8000);
+	return out;
+}
+
+const APPEAL_SYSTEM = `You are a readers' advisory librarian. For one book in a family's home library, you pick its appeal terms: the words a librarian uses to say what a book feels like to read (Joyce Saricks' appeal factors, as NoveList uses them), so someone can tell if it suits them.
+
+Rules:
+- Base it on what you know of this book (title, author, series) and on the jacket copy if there is one. Describe this book, not its genre in general.
+- Pick from the allowed terms only: one to three per factor, the ones that fit best. Leave a factor empty if none fits (poetry and reference books often have no characters or storyline).
+- If you don't recognize the book and the jacket copy is missing or tells you too little, set "known" to false and leave every factor empty. Never guess from the title alone.
+- "blurb": only when no jacket copy is given and you know the book well, two or three sentences of jacket copy: what it's about and why someone would enjoy it, without spoilers past the opening. Otherwise "".`;
+
+const APPEAL_SCHEMA = {
+	type: "object",
+	additionalProperties: false,
+	required: ["known", "pacing", "tone", "style", "characters", "story", "blurb"],
+	properties: {
+		known: { type: "boolean", description: "Whether you know enough about this book to describe it." },
+		...Object.fromEntries(Object.entries(APPEAL).map(([k, terms]) => [k, { type: "array", items: { type: "string", enum: terms } }])),
+		blurb: { type: "string" },
+	},
+};
+
+function appealPrompt(book, blurb, tags) {
+	const lines = [
+		`Title: ${book.title}`,
+		book.author && `Author: ${book.author}`,
+		book.series && `Series: ${book.series}${book.volume ? `, book ${book.volume}` : ""}`,
+		bookType(book) === "cbz" && "Format: comic",
+		tags.length && `Library tags: ${tags.join(", ")}`,
+	].filter(Boolean);
+	return `${lines.join("\n")}\n\n${blurb ? `<jacket_copy>\n${blurb}\n</jacket_copy>` : "No jacket copy."}\n\nPick this book's appeal terms.`;
+}
+
+// -> {appeal, blurb, model}, or null with no model to ask.
+async function appealTerms(env, book, blurb, tags) {
+	if (!env.ANTHROPIC_API_KEY && !env.AI) return null;
+	let answer, model;
+	if (env.ANTHROPIC_API_KEY) {
+		const res = await fetch("https://api.anthropic.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"x-api-key": env.ANTHROPIC_API_KEY.trim(),
+				"anthropic-version": "2023-06-01",
+				"anthropic-beta": "server-side-fallback-2026-07-01",
+			},
+			body: JSON.stringify({
+				model: RECORD_CLAUDE_MODEL,
+				max_tokens: 4000,
+				fallbacks: "default",
+				thinking: { type: "adaptive" },
+				output_config: { effort: "low", format: { type: "json_schema", schema: APPEAL_SCHEMA } },
+				system: APPEAL_SYSTEM,
+				messages: [{ role: "user", content: appealPrompt(book, blurb, tags) }],
+			}),
+		});
+		const data = await res.json().catch(() => ({}));
+		if (!res.ok) throw new Error(`Anthropic API ${res.status}: ${data.error?.message || ""}`);
+		if (data.stop_reason !== "end_turn") throw new Error("Anthropic API stopped: " + data.stop_reason);
+		answer = JSON.parse((data.content || []).filter((b) => b.type === "text").map((b) => b.text).join(""));
+		model = RECORD_CLAUDE_MODEL;
+	} else {
+		const out = await env.AI.run(RECORD_AI_MODEL, {
+			messages: [{ role: "system", content: APPEAL_SYSTEM }, { role: "user", content: appealPrompt(book, blurb, tags) }],
+			response_format: { type: "json_schema", json_schema: APPEAL_SCHEMA },
+			max_tokens: 800,
+		});
+		answer = typeof out?.response === "string" ? JSON.parse(out.response) : out?.response;
+		model = RECORD_AI_MODEL.replace(/^@cf\/[^/]+\//, "");
+	}
+	if (!answer || typeof answer !== "object") throw new Error("No answer");
+	return { appeal: answer.known === false ? null : cleanAppeal(answer, true), blurb: blurb ? null : blurbText(answer.blurb), model };
+}
+
+// Only known factors, each a short list of short terms; strict: only the
+// allowed ones (a model's), else anything (typed in Edit details). null when empty.
+function cleanAppeal(a, strict) {
+	if (!a || typeof a !== "object") return null;
+	const out = {};
+	for (const [k, terms] of Object.entries(APPEAL)) {
+		const got = Array.isArray(a[k]) ? a[k] : [];
+		const list = [...new Set(got.map((t) => str(t, 40)).filter((t) => t && (!strict || terms.includes(t))))].slice(0, strict ? 3 : 6);
+		if (list.length) out[k] = list;
+	}
+	return Object.keys(out).length ? out : null;
+}
+
+function recordJSON(book) {
+	let appeal = null, from = {};
+	try { appeal = JSON.parse(book.appeal || "null"); } catch {}
+	try { from = JSON.parse(book.record_from || "{}") || {}; } catch {}
+	return { blurb: book.blurb || null, pages: book.pages || null, appeal, from, filled: !!book.record_at };
+}
+function recordDue(book) {
+	if (!book.record_at) return true;
+	const r = recordJSON(book);
+	return !r.appeal && r.from.appeal !== "edited" && Date.now() - book.record_at > RECORD_RETRY_MS;
+}
+
+// Fills in what's missing (all of it with refresh, except anything edited)
+// and saves it. book: a books row (with r2_key). -> the record.
+async function fillRecord(env, book, refresh) {
+	const had = recordJSON(book), from = { ...had.from };
+	const keep = (k) => from[k] === "edited" || (!refresh && had[k]);
+	let blurb = keep("blurb") ? had.blurb : null, pages = keep("pages") ? had.pages : null, appeal = keep("appeal") ? had.appeal : null;
+	if (!keep("blurb")) delete from.blurb;
+	if (!keep("pages")) delete from.pages;
+	if (!keep("appeal")) delete from.appeal;
+	let file = { blurb: null, pages: null, words: null };
+	try { file = await fileRecord(env, book); } catch (err) { console.warn("record file", book.id, err); }
+	if (!blurb && file.blurb) { blurb = file.blurb; from.blurb = "file"; }
+	if (!pages && file.pages) { pages = file.pages; from.pages = "file"; }
+	if (!blurb || !pages) {
+		const online = await onlineRecord(book.title, book.author || "");
+		if (!blurb && online.blurb) { blurb = online.blurb; from.blurb = online.from.blurb; }
+		if (!pages && online.pages) { pages = online.pages; from.pages = online.from.pages; }
+	}
+	if (!pages && file.words > 2000) { pages = Math.max(1, Math.round(file.words / WORDS_PER_PAGE)); from.pages = "estimate"; }
+	if (!keep("appeal")) {
+		const { results } = await env.DB.prepare("SELECT t.name FROM book_tag_links l JOIN book_tags t ON t.id = l.tag_id WHERE l.book_id = ?").bind(book.id).all();
+		const tags = results.map((r) => r.name).filter((t) => t.toLowerCase() !== HIDE_TAG.toLowerCase() && t.toLowerCase() !== "books");
+		const got = await within(() => appealTerms(env, book, blurb, tags).catch((err) => { console.warn("appeal", book.id, err); return null; }), null, 40000);
+		if (got?.appeal) { appeal = got.appeal; from.appeal = got.model; }
+		if (got?.blurb && !blurb) { blurb = got.blurb; from.blurb = "ai"; from.blurb_model = got.model; }
+	}
+	const row = await env.DB.prepare("UPDATE books SET blurb = ?, pages = ?, appeal = ?, record_from = ?, record_at = ? WHERE id = ? RETURNING blurb, pages, appeal, record_from, record_at")
+		.bind(blurb, pages, appeal ? JSON.stringify(appeal) : null, JSON.stringify(from), Date.now(), book.id).first();
+	return recordJSON(row || {});
+}
+
+// GET /api/family/books/:id: a book's record, looked up the first time.
+async function familyRecord(env, id) {
+	const book = await familyBook(env, id);
+	const record = recordDue(book) ? await fillRecord(env, book, false) : recordJSON(book);
+	return json({ id, record });
+}
+// GET /api/books/:id/record (?refresh=1 looks it up again, keeping edits).
+async function ownerRecord(env, id, url) {
+	const book = await getBook(env, id);
+	const refresh = url.searchParams.has("refresh");
+	const record = refresh || (url.searchParams.has("fill") && recordDue(book)) ? await fillRecord(env, book, refresh) : recordJSON(book);
+	return json({ id, record });
 }
 
 // Asking for a library card, from the landing page: anyone can, so it's
@@ -3026,7 +3324,8 @@ function page() {
 // The family page: a separate small page, so none of the app's code or data
 // reaches family. It signs in from the invite link, then shows the books as
 // covers (A-Z, a series in volume order) in the Sepia theme, with search and
-// a format filter. Tapping a book downloads it.
+// a format filter. Tapping a book opens its Record (#book=<id>): the jacket
+// copy, page count and appeal terms, and the download button.
 function familyPage(env) {
 	const nonce = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))));
 	// Turnstile (the library card form's check) runs from Cloudflare's own address, in a frame.
@@ -3175,6 +3474,41 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.check:empty { margin: 0; }
 	.hp { position: absolute !important; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
 	footer { margin-top: 36px; padding-top: 14px; border-top: 1px solid var(--line); font-size: 14px; text-align: center; }
+	/* A book's Record: a catalog record, with the download button on it. */
+	.record { max-width: 820px; }
+	.rtop { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 28px; align-items: start; margin-top: 14px; }
+	.rcover { margin: 0; }
+	.rcover .gencover .gt { font-size: 21px; }
+	.rcover .gencover .ga { font-size: 15px; }
+	.eyebrow { font: 600 12px/1.2 var(--sans); letter-spacing: .16em; text-transform: uppercase; color: var(--muted); margin: 2px 0 8px; }
+	.record h1 { font-size: 34px; margin: 0 0 6px; overflow-wrap: anywhere; }
+	.record h1:focus { outline: none; }
+	.rby { font: italic 400 19px/1.35 var(--display); margin: 0 0 4px; }
+	.rseries { margin: 0; font-size: 15px; }
+	.facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 16px; margin: 18px 0 20px; font-size: 15px; }
+	.facts dt { color: var(--muted); font: 600 11px/1.2 var(--sans); letter-spacing: .14em; text-transform: uppercase; padding-top: 4px; }
+	.facts dd { margin: 0; }
+	.rdl { display: flex; align-items: center; justify-content: center; gap: 8px; max-width: 340px; text-decoration: none; margin-top: 0; }
+	.rdl.off { background: var(--line); color: var(--muted); }
+	.rleft { font-size: 14px; margin: 8px 0 0; }
+	.rsec { border-top: 1px solid var(--line); margin-top: 30px; padding-top: 18px; }
+	.rsec h2 { font: 600 12px/1.2 var(--sans); letter-spacing: .16em; text-transform: uppercase; color: var(--muted); margin: 0 0 12px; }
+	.blurb p { font: 400 18px/1.6 var(--display); margin: 0 0 14px; max-width: 62ch; }
+	.blurb .muted { font: 400 16px/1.5 var(--sans); }
+	.note { font-size: 13px; color: var(--muted); margin: 4px 0 0; }
+	.appeal { display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: 12px 16px; margin: 0; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+	.appeal dt { font: 600 16px/1.3 var(--display); padding-top: 4px; }
+	.appeal dd { margin: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+	.term { border: 1px solid var(--line); background: var(--bg); border-radius: 999px; padding: 3px 12px; font-size: 14px; line-height: 1.5; }
+	@media (max-width: 600px) {
+		.rtop { grid-template-columns: 1fr; gap: 18px; }
+		.rcover { width: 56%; max-width: 230px; justify-self: center; }
+		.record h1 { font-size: 29px; }
+		.rdl { max-width: none; }
+		.appeal { grid-template-columns: 1fr; gap: 4px; }
+		.appeal dd { margin-bottom: 10px; }
+		.appeal dd:last-child { margin-bottom: 0; }
+	}
 </style>
 </head>
 <body>
@@ -3216,6 +3550,7 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 		<button id="wGo" class="go" type="button">Go to the library</button>
 	</section>
 	<div id="lib" hidden>
+		<div id="browse">
 		<div id="tools">
 			<label class="vh" for="q">Search</label>
 			<input id="q" type="search" placeholder="Search title, author, series" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="search">
@@ -3235,6 +3570,32 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 		<p id="count" class="count muted"></p>
 		<ul id="books" class="covers"></ul>
 		<p id="none" class="empty" hidden>Nothing matches.</p>
+		</div>
+		<article id="record" class="record" hidden>
+			<a id="rBack" class="up" href="/library">‹ Back</a>
+			<div class="rtop">
+				<div id="rCover" class="cover rcover"></div>
+				<div>
+					<p class="eyebrow">Record</p>
+					<h1 id="rTitle" tabindex="-1"></h1>
+					<p id="rBy" class="rby"></p>
+					<p id="rSeries" class="rseries"></p>
+					<dl id="rFacts" class="facts"></dl>
+					<a id="rDl" class="go rdl" href="#"></a>
+					<p id="rLeft" class="rleft muted"></p>
+				</div>
+			</div>
+			<section id="rBlurbSec" class="rsec">
+				<h2>From the jacket</h2>
+				<div id="rBlurb" class="blurb"></div>
+				<p id="rBlurbNote" class="note" hidden></p>
+			</section>
+			<section id="rAppealSec" class="rsec" hidden>
+				<h2>Appeal factors</h2>
+				<dl id="rAppeal" class="appeal"></dl>
+				<p id="rAppealNote" class="note" hidden></p>
+			</section>
+		</article>
 		<footer><a id="howLink" href="#">How to save this page</a></footer>
 	</div>
 </main>
@@ -3248,6 +3609,9 @@ var COLORS = ["#7a3b2e", "#2f4f6f", "#3d5a3a", "#5b3f6e", "#8a6a1f", "#1f5e5e", 
 var books = [], format = "", query = "", tag = "", me = {};
 // Showing one series' volumes: the address carries it (#series=Name) so Back returns to all books.
 function openSeries() { var m = /^#series=(.+)$/.exec(location.hash); return m ? decodeURIComponent(m[1]) : null; }
+// A book's Record: #book=<id>.
+function openBook() { var m = /^#book=(\d+)$/.exec(location.hash); return m ? Number(m[1]) : null; }
+var listScroll = 0, viaList = false, onRecord = false, records = {}, common = {};
 function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 function read(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
 
@@ -3277,11 +3641,8 @@ function drawnCover(b) {
 	return g;
 }
 // The drawn cover sits underneath; a real one covers it once it loads.
-function card(b) {
-	var li = h("li"), a = h("a"), cov = h("div", "cover");
-	a.href = "/api/family/books/" + b.id + "/file";
-	a.addEventListener("click", function (e) { downloading(e, b); });
-	a.setAttribute("aria-label", "Download " + b.title + (b.author ? " by " + b.author : "") + ", " + KIND[b.type]);
+function fillCover(cov, b) {
+	cov.textContent = "";
 	cov.append(drawnCover(b));
 	if (b.cover === "yes" || (b.cover !== "none" && (b.type === "epub" || b.type === "cbz"))) {
 		var img = h("img");
@@ -3292,10 +3653,18 @@ function card(b) {
 		img.src = "/api/family/books/" + b.id + "/cover";
 		cov.append(img);
 	}
+	return cov;
+}
+// Tapping a book opens its Record; Back returns to the same place in the list.
+function card(b) {
+	var li = h("li"), a = h("a"), cov = fillCover(h("div", "cover"), b);
+	a.href = "#book=" + b.id;
+	a.addEventListener("click", function () { listScroll = window.scrollY; viaList = true; });
+	a.setAttribute("aria-label", b.title + (b.author ? " by " + b.author : "") + ", " + KIND[b.type]);
 	var by = [b.author, b.series ? b.series + (b.volume ? " " + b.volume : "") : null].filter(Boolean).join(" · ");
 	a.append(cov, h("span", "ct", b.title));
 	if (by) a.append(h("span", "ca", by));
-	a.append(h("span", "dl", "⤓ " + KIND[b.type] + " · " + bytes(b.size)));
+	a.append(h("span", "dl", KIND[b.type] + " · " + bytes(b.size)));
 	li.append(a);
 	return li;
 }
@@ -3449,6 +3818,8 @@ function renderRecs() {
 	// A tag every book has (like "Books") isn't a collection.
 	var everywhere = {};
 	books.forEach(function (b) { b.tags.forEach(function (t) { everywhere[t] = (everywhere[t] || 0) + 1; }); });
+	common = {};
+	Object.keys(everywhere).forEach(function (t) { if (everywhere[t] === books.length && books.length > 1) common[t] = 1; });
 	books.forEach(function (b) {
 		if (!b.tags.some(function (t) { return NONFIC.test(fold(t)); })) return;
 		b.tags.forEach(function (t) { if (!NONFIC.test(fold(t)) && everywhere[t] < books.length) counts[t] = (counts[t] || 0) + 1; });
@@ -3488,6 +3859,14 @@ function renderTags() {
 	sel.hidden = !list.length;
 }
 function render() {
+	var id = openBook(), rb = id && books.filter(function (b) { return b.id === id; })[0];
+	$("browse").hidden = !!rb;
+	$("record").hidden = !rb;
+	$("intro").hidden = !!rb;
+	onRecord = !!rb;
+	if (rb) { $("head").hidden = $("sub").hidden = true; showRecord(rb); return; }
+	document.title = "The Back Alley Library";
+	$("head").hidden = false;
 	var series = openSeries(), words = fold(query).split(/\s+/).filter(Boolean);
 	var shown = books.filter(function (b) {
 		if (series != null && b.series !== series) return false;
@@ -3538,6 +3917,89 @@ function downloading(e, b) {
 	me.left--;
 	showSub();
 }
+
+// The Record: what's known about the book at once, then its jacket copy,
+// pages and appeal terms, which the Worker looks up the first time.
+var APPEAL = [["pacing", "Pacing"], ["tone", "Tone"], ["style", "Writing style"], ["characters", "Characters"], ["story", "Storyline"]];
+function showRecord(b) {
+	document.title = b.title + " · The Back Alley Library";
+	fillCover($("rCover"), b);
+	$("rTitle").textContent = b.title;
+	$("rBy").textContent = b.author ? "by " + b.author : "";
+	$("rBy").hidden = !b.author;
+	var sr = $("rSeries");
+	sr.textContent = "";
+	sr.hidden = !b.series;
+	if (b.series) {
+		var link = h("a", null, b.series);
+		link.href = "#series=" + encodeURIComponent(b.series);
+		if (b.volume) sr.append("Book " + b.volume + " of ");
+		sr.append(link);
+	}
+	recordFacts(b, records[b.id]);
+	var dl = $("rDl");
+	dl.href = "/api/family/books/" + b.id + "/file";
+	dl.onclick = function (e) { downloading(e, b); setTimeout(function () { recordLeft(b); }, 0); };
+	recordLeft(b);
+	if (records[b.id]) return recordDetails(b, records[b.id]);
+	$("rBlurbSec").hidden = false;
+	$("rBlurb").innerHTML = '<p class="muted">Looking this book up…</p>';
+	$("rBlurbNote").hidden = $("rAppealSec").hidden = true;
+	fetch("/api/family/books/" + b.id).then(function (res) {
+		if (!res.ok) throw new Error();
+		return res.json();
+	}).then(function (d) {
+		records[b.id] = d.record;
+		if (openBook() === b.id) { recordFacts(b, d.record); recordDetails(b, d.record); }
+	}).catch(function () {
+		if (openBook() === b.id) $("rBlurb").innerHTML = '<p class="muted">Couldn\'t look this book up just now.</p>';
+	});
+}
+function recordFacts(b, rec) {
+	var dl = $("rFacts"), add = function (k, v) { if (v) dl.append(h("dt", null, k), h("dd", null, v)); };
+	dl.textContent = "";
+	add("Format", KIND[b.type] + " · " + bytes(b.size));
+	if (rec && rec.pages) add("Length", (rec.from.pages === "estimate" ? "About " : "") + rec.pages.toLocaleString() + (rec.pages === 1 ? " page" : " pages"));
+	add("Shelved", b.tags.filter(function (t) { return !common[t]; }).join(", "));
+}
+function recordLeft(b) {
+	var dl = $("rDl"), left = $("rLeft"), took = me.today && me.today.indexOf(b.id) >= 0, out = me.left != null && me.left <= 0 && !took;
+	dl.textContent = out ? "That's today's " + 10 + " books" : "Download " + KIND[b.type];
+	dl.classList.toggle("off", out);
+	dl.setAttribute("aria-label", out ? "No downloads left today" : "Download " + b.title + ", " + KIND[b.type] + ", " + bytes(b.size));
+	left.hidden = me.left == null;
+	if (me.left == null) return;
+	left.textContent = took ? "Downloaded today, so taking it again doesn't count." : out ? "Come back tomorrow for more."
+		: (me.left === 1 ? "1 download" : me.left + " downloads") + " left today.";
+}
+function recordDetails(b, rec) {
+	var box = $("rBlurb"), note = $("rBlurbNote"), who = function (m) { return /^claude/.test(m || "") ? "Claude" : "an AI model"; };
+	box.textContent = "";
+	(rec.blurb || "").split(/\n\s*\n/).forEach(function (p) { if (p.trim()) box.append(h("p", null, p.trim())); });
+	var said = { openlibrary: "From Open Library.", google: "From Google Books.",
+		ai: "This one had no jacket copy, so " + who(rec.from.blurb_model) + " wrote this summary." }[rec.from.blurb];
+	note.textContent = said || "";
+	note.hidden = !said || !rec.blurb;
+	$("rBlurbSec").hidden = !rec.blurb;
+	var dl = $("rAppeal"), any = false;
+	dl.textContent = "";
+	APPEAL.forEach(function (f) {
+		var terms = rec.appeal && rec.appeal[f[0]];
+		if (!terms || !terms.length) return;
+		var dd = h("dd");
+		terms.forEach(function (t) { dd.append(h("span", "term", t)); });
+		dl.append(h("dt", null, f[1]), dd);
+		any = true;
+	});
+	$("rAppealSec").hidden = !any;
+	var an = $("rAppealNote"), by = rec.from.appeal;
+	an.textContent = by === "edited" ? "" : "Picked by " + who(by) + " from what it knows of the book, the way a librarian sums one up.";
+	an.hidden = !any || by === "edited";
+	if (!rec.blurb && !any) {
+		$("rBlurbSec").hidden = false;
+		box.innerHTML = '<p class="muted">Nothing more on this one yet.</p>';
+	}
+}
 async function load() {
 	var invite = /[#&]invite=([\w-]+)/.exec(location.hash), used = invite ? await signIn(invite[1]) : "";
 	var res = await fetch("/api/family/me");
@@ -3563,7 +4025,19 @@ async function load() {
 }
 $("q").addEventListener("input", function () { query = this.value; render(); });
 $("tag").addEventListener("change", function () { tag = this.value; if (tag && pick) { pick = null; renderRecs(); } render(); });
-window.addEventListener("hashchange", function () { render(); window.scrollTo(0, 0); });
+// Back from a Record opened from the list goes back to it; opened from a link, to all books.
+$("rBack").addEventListener("click", function (e) {
+	if (!viaList) return;
+	e.preventDefault();
+	history.back();
+});
+window.addEventListener("hashchange", function () {
+	var back = onRecord && !openBook();
+	if (back) viaList = false;
+	render();
+	window.scrollTo(0, back ? listScroll : 0);
+	if (onRecord) $("rTitle").focus({ preventScroll: true });
+});
 
 // The first time on a device: how to keep the page. The invite link works
 // only once, so the plain address is the one worth bookmarking.
@@ -3887,6 +4361,9 @@ const PAGE = String.raw`<!doctype html>
 	.details .gencover .gt { font-size: 11px; }
 	.details .gencover .ga, .details .gencover .gk { display: none; }
 	.details .dlook { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+	.details .drec { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 10px; }
+	.details .drec h3 { font-size: 13px; margin: 0 0 8px; }
+	.details label textarea { margin-top: 4px; }
 	.lookhits { list-style: none; margin: 0 0 10px; padding: 0; border-top: 1px solid var(--line); }
 	.lookhits button { display: flex; gap: 10px; align-items: center; width: 100%; text-align: left; background: none; border: 0; border-bottom: 1px solid var(--line); padding: 8px 2px; color: inherit; font: inherit; cursor: pointer; }
 	.lookhits button:hover, .lookhits button[aria-pressed=true] { background: var(--sel); }
@@ -4446,6 +4923,7 @@ const PAGE = String.raw`<!doctype html>
 		<button id="libSelNone" class="btn small" type="button">Clear</button>
 		<button id="libSelGenres" class="btn small" type="button">Tag genres</button>
 		<button id="libSelFill" class="btn small" type="button" title="Series, volume and title from each comic's ComicInfo.xml">Fill in details</button>
+		<button id="libSelRecord" class="btn small" type="button" title="Jacket copy, pages and appeal terms for the family library's Record page">Look up records</button>
 		<button id="libSelDel" class="btn small danger" type="button">Delete</button>
 	</div>
 	<ul id="books" class="tree books flat"></ul>
@@ -4544,6 +5022,17 @@ const PAGE = String.raw`<!doctype html>
 		<ul id="dHits" class="lookhits" hidden></ul>
 		<div id="dCovers" class="lookcovers" hidden></div>
 		<div id="dTags"></div>
+		<div class="drec">
+			<h3>Record <span class="hint">(the family library's page for this book)</span></h3>
+			<label>Jacket copy <textarea id="dBlurb" rows="5" maxlength="4000"></textarea></label>
+			<label>Appeal terms <span class="hint">(a line each: Pacing, Tone, Writing style, Characters, Storyline)</span>
+				<textarea id="dAppeal" rows="5" placeholder="Pacing: Fast-paced&#10;Tone: Suspenseful, Wry"></textarea></label>
+			<div class="dlook">
+				<label>Pages <input id="dPages" type="text" inputmode="numeric" maxlength="6" autocomplete="off" style="width: 90px"></label>
+				<button id="dRecord" class="btn small" type="button">Look it up again</button>
+				<span id="dRecStatus" class="hint"></span>
+			</div>
+		</div>
 		<div class="hlrow">
 			<button id="dCancel" class="btn ghost" type="button">Cancel</button>
 			<span></span>
@@ -8092,8 +8581,55 @@ function openDetails(b) {
 	show($("dCovers"), false);
 	renderDetailsCover();
 	renderDetailsTags();
+	fillDetailsRecord(null);
+	loadDetailsRecord(b, "");
 	show($("detailsBox"), true);
 	$("dTitle").focus();
+}
+// The Record's jacket copy, pages and appeal terms, as the family library shows them.
+var APPEAL_LABELS = { pacing: "Pacing", tone: "Tone", style: "Writing style", characters: "Characters", story: "Storyline" };
+function appealText(a) {
+	return Object.keys(APPEAL_LABELS).filter(function (k) { return a && a[k] && a[k].length; })
+		.map(function (k) { return APPEAL_LABELS[k] + ": " + a[k].join(", "); }).join("\n");
+}
+function appealParse(text) {
+	var out = {}, keys = {};
+	Object.keys(APPEAL_LABELS).forEach(function (k) { keys[APPEAL_LABELS[k].toLowerCase()] = k; keys[k] = k; });
+	keys.style = keys.writing = "style"; keys.characterization = "characters"; keys.story = keys["story line"] = "story";
+	text.split("\n").forEach(function (line) {
+		var m = /^\s*([^:]+):(.*)$/.exec(line), k = m && keys[m[1].trim().toLowerCase()];
+		if (k) out[k] = m[2].split(",").map(function (t) { return t.trim(); }).filter(Boolean);
+	});
+	return out;
+}
+function fillDetailsRecord(rec) {
+	details.record = rec;
+	$("dBlurb").value = rec && rec.blurb || "";
+	$("dPages").value = rec && rec.pages ? String(rec.pages) : "";
+	$("dAppeal").value = rec ? appealText(rec.appeal) : "";
+	var from = rec && rec.from || {};
+	$("dRecStatus").textContent = !rec ? "" : !rec.filled ? "Not looked up yet." : [
+		from.blurb && from.blurb !== "edited" && "copy from " + ({ file: "the file", openlibrary: "Open Library", google: "Google Books", ai: "AI" }[from.blurb] || from.blurb),
+		from.pages === "estimate" && "pages estimated",
+		from.appeal && from.appeal !== "edited" && "terms by " + from.appeal
+	].filter(Boolean).join(", ");
+}
+// how: "" (as saved), "fill" (look up if never done) or "refresh" (again, keeping edits).
+async function loadDetailsRecord(b, how) {
+	var d = details;
+	if (how) $("dRecStatus").textContent = "Looking it up…";
+	try {
+		var data = await apiJSON("/api/books/" + b.id + "/record" + (how ? "?" + how + "=1" : ""));
+		if (details === d) fillDetailsRecord(data.record);
+	} catch (e) { if (details === d) $("dRecStatus").textContent = e.message; }
+}
+function recordPatch(patch) {
+	var rec = details.record;
+	if (!rec) return;
+	var blurb = $("dBlurb").value.trim(), pages = $("dPages").value.trim(), appeal = appealParse($("dAppeal").value);
+	if (blurb !== (rec.blurb || "")) patch.blurb = blurb;
+	if (pages !== (rec.pages ? String(rec.pages) : "")) patch.pages = pages ? parseInt(pages, 10) || null : null;
+	if (appealText(appeal) !== appealText(rec.appeal)) patch.appeal = appeal;
 }
 function closeDetails() {
 	if (details && details.url) URL.revokeObjectURL(details.url);
@@ -8221,6 +8757,7 @@ async function saveDetails() {
 	var vals = { title: $("dTitle").value.trim(), author: $("dAuthor").value.trim(), series: $("dSeries").value.trim(), volume: $("dVolume").value.trim() };
 	if (!vals.title) { $("dTitle").focus(); return; }
 	Object.keys(vals).forEach(function (k) { if (vals[k] !== (b[k] || "")) patch[k] = vals[k]; });
+	recordPatch(patch);
 	$("dSave").disabled = true;
 	try {
 		if (Object.keys(patch).length) {
@@ -8257,6 +8794,10 @@ $("dGenres").addEventListener("click", async function (e) {
 		renderDetailsTags();
 	} catch (err) { if (details === d) $("dLookStatus").textContent = err.message; }
 	finally { btn.disabled = false; }
+});
+$("dRecord").addEventListener("click", function (e) {
+	e.stopPropagation();
+	if (details) loadDetailsRecord(details.book, details.record && details.record.filled ? "refresh" : "fill");
 });
 $("dCoverPick").addEventListener("click", function () { $("dCoverFile").click(); });
 $("dCoverFile").addEventListener("change", async function () {
@@ -8321,6 +8862,7 @@ function renderLibSel() {
 	$("libSelDel").disabled = !n;
 	$("libSelGenres").disabled = !n;
 	$("libSelFill").disabled = !n;
+	$("libSelRecord").disabled = !n;
 	$("libSelDel").textContent = n ? "Delete " + n : "Delete";
 }
 async function deleteSelected() {
@@ -8407,6 +8949,31 @@ async function fillSelected() {
 	renderBooks();
 	var msg = changed ? "Filled in details for " + changed + (changed === 1 ? " book." : " books.") : "Nothing new to fill in.";
 	if (failed.length) fail(new Error(msg + " Couldn't read " + failed.join(", ") + "."));
+	else toast(msg);
+}
+
+// Look up records: each selected book's jacket copy, pages and appeal terms
+// for the family library, ahead of anyone opening it there. Books already
+// looked up are skipped (Edit details has "Look it up again" for one).
+async function recordSelected() {
+	var books = selectedBooks(), btn = $("libSelRecord");
+	if (!books.length) return;
+	btn.disabled = true;
+	var done = 0, terms = 0, failed = [];
+	for (var i = 0; i < books.length; i++) {
+		$("libSelN").textContent = "Looking up " + (i + 1) + " of " + books.length + "…";
+		try {
+			var d = await apiJSON("/api/books/" + books[i].id + "/record?fill=1");
+			done++;
+			if (d.record.appeal) terms++;
+		} catch (e) {
+			if (e.message === UNAUTH) return;
+			failed.push(books[i].title);
+		}
+	}
+	renderBooks();
+	var msg = done ? "Records ready for " + done + (done === 1 ? " book" : " books") + (terms < done ? " (" + (done - terms) + " without appeal terms)." : ".") : "";
+	if (failed.length) fail(new Error((msg ? msg + " " : "") + "Couldn't look up " + failed.join(", ") + "."));
 	else toast(msg);
 }
 
@@ -10720,6 +11287,7 @@ $("libSelNone").addEventListener("click", function () { state.libSel = {}; rende
 $("libSelDel").addEventListener("click", deleteSelected);
 $("libSelGenres").addEventListener("click", tagGenresSelected);
 $("libSelFill").addEventListener("click", fillSelected);
+$("libSelRecord").addEventListener("click", recordSelected);
 function libCtx(e) {
 	if (e.shiftKey || !e.target.closest) return;
 	var s = e.target.closest("a.sgroup");
