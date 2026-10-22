@@ -183,6 +183,7 @@ npx wrangler d1 execute reader --remote --file migrations/0013_request_email.sql
 npx wrangler d1 execute reader --remote --file migrations/0014_book_records.sql
 npx wrangler d1 execute reader --remote --file migrations/0015_previews.sql
 npx wrangler d1 execute reader --remote --file migrations/0016_book_catalog.sql
+npx wrangler d1 execute reader --remote --file migrations/0017_audiobooks.sql
 npx wrangler deploy
 ```
 
@@ -331,6 +332,32 @@ The model is Llama 3.3 70B. Workers AI gives every account 10,000 free Neurons a
 
 Expect rougher digests than Claude would write, and probably more misquotes; those points are dropped (the digest says how many). To use Claude instead, remove the `AI` binding and add an Anthropic API key with credit as the secret `ANTHROPIC_API_KEY` (about 5 to 15 cents a comparison). With both set, Workers AI is used.
 
+## Part 8: Audiobooks from Audiobookshelf
+
+This puts the audiobooks from your Audiobookshelf (ABS) server into the family library. Family can listen to them on the page or download them, 2 a day each on top of the 10 books. They never get ABS accounts, and ABS stays off the internet: Reader reaches it through a Cloudflare Tunnel that only Reader's service token gets through. Run migration `0017` first (Updating).
+
+1. **A read-only ABS user.** In ABS go to Settings → **Users** → **Add User**: username `reader`, type **User**. Turn on **Can Download**, **Access all libraries**, **Access all tags** and explicit content. Turn off Update, Delete and Upload.
+2. **An API key** (ABS 2.26 or later): Settings → **API Keys** → **Add API Key**, name `Reader`, never expires, acting as `reader`. Copy it; it's shown once.
+3. **The tunnel.** Cloudflare dashboard → Zero Trust → Networks → **Tunnels** → **Create a tunnel** → Cloudflared, named `unraid`, and copy its token. On Unraid, install **cloudflared** from Apps with that token (or post arguments `tunnel --no-autoupdate run --token <TOKEN>`). Back on the tunnel, add a **Public Hostname**: subdomain `abs`, your domain, type HTTP, URL `<Unraid LAN IP>:13378` (or wherever ABS listens).
+4. **Lock it.** Zero Trust → Access → Service Auth → **Service Tokens** → Create `reader-worker`, non-expiring; copy the Client ID and Secret. Then Access → Applications → **Add** → Self-hosted, domain `abs.<your domain>`, with one policy: action **Service Auth**, include Service Token `reader-worker`.
+5. **Test it.** `https://abs.<your domain>` in a browser should be blocked. This should list your libraries:
+   ```
+   curl https://abs.<your domain>/api/libraries -H "CF-Access-Client-Id: <id>" -H "CF-Access-Client-Secret: <secret>" -H "Authorization: Bearer <API key>"
+   ```
+6. **Secrets on the Worker:** Workers → `reader` → Settings → Variables and Secrets, each as a **Secret**: `ABS_URL` (`https://abs.<your domain>`), `ABS_TOKEN` (the API key), `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`.
+7. Deploy. The cron in `wrangler.toml` reads ABS every 30 minutes. To read it now:
+   ```
+   curl -X POST https://reader.brandonj.ink/api/audiobooks/sync -H "Authorization: Bearer <READER_TOKEN>"
+   ```
+   It answers with how many were added, updated and gone.
+
+How it behaves:
+- Every ABS book library is included, except items with no audio (ebook-only) and ones ABS marks missing. One removed from ABS disappears from the library at the next sync, and comes back if it returns.
+- Covers come from ABS once and are kept in R2. Records use ABS's description, then the usual lookups; Length is the running time, and the narrator gets a line.
+- **Listen** on a Record plays the whole book on the page with chapters, ±30 s and speed, and remembers the place on that device. It isn't counted. **Download** sends the .m4b as it is, or a zip when the book is several files.
+- While the server, the tunnel or the home internet is down, the library still browses; playing and downloading say the server is offline.
+- Audiobooks aren't in your own Library in the app yet; that comes with the app's audiobook player.
+
 ## If something goes wrong
 
 | You see | Fix |
@@ -338,6 +365,8 @@ Expect rougher digests than Claude would write, and probably more misquotes; tho
 | "That token didn't work." | The token doesn't match `READER_TOKEN`. Paste it again. |
 | Errors mentioning `DB` or `no such table` | Check the `DB` binding points at `reader`, and that the SQL in Part 2 ran. |
 | Upload fails straight away | Check the `BOOKS` binding points at `reader-books`. |
+| Audiobooks: "Cloudflare Access turned Reader away" | `CF_ACCESS_CLIENT_ID` or `_SECRET` is wrong, or the Access policy isn't **Service Auth** with that token. |
+| Audiobooks: "turned down Reader's API key" | `ABS_TOKEN` is wrong or expired, or the `reader` user is disabled. |
 | "No feed, watching the page" but no articles show up | The site builds its pages with JavaScript or blocks servers. Delete it and try the site's feed address directly (often `/feed` or `/rss`). |
 | "Couldn't load the PDF viewer from cdnjs" | The PDF viewer loads from cdnjs when you open a PDF. Check you're online, then reload. |
 | "Couldn't find the article text on that page." | Tap **Original ↗** to read it on the site. |
