@@ -4395,6 +4395,8 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.ct { font: 600 15px/1.25 var(--display); overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
 	.ca { font-size: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 	.dl { font-size: 13px; color: var(--accent); font-weight: 600; }
+	.fmt { display: flex; gap: 8px; margin-top: 2px; }
+	.fmt svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 	.empty { color: var(--muted); padding: 24px 0; text-align: center; }
 	.filters { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 10px 0 4px; }
 	.filters .formats { margin: 0; }
@@ -4739,6 +4741,10 @@ function fillCover(cov, b) {
 	}
 	return cov;
 }
+// A card shows its formats as icons (the Record spells them out): an open
+// book for anything to read, headphones for an audiobook.
+var READ_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 4.5h6a4 4 0 0 1 4 4V20a3 3 0 0 0-3-3H2zM22 4.5h-6a4 4 0 0 0-4 4V20a3 3 0 0 1 3-3h7z"/></svg>';
+var LISTEN_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></svg>';
 // Tapping a book opens its Record; Back returns to the same place in the list.
 function card(b) {
 	var li = h("li"), a = h("a"), cov = fillCover(h("div", "cover"), b);
@@ -4748,7 +4754,9 @@ function card(b) {
 	var by = [b.author, b.series ? b.series + (b.volume ? " " + b.volume : "") : null].filter(Boolean).join(" · ");
 	a.append(cov, h("span", "ct", b.title));
 	if (by) a.append(h("span", "ca", by));
-	a.append(h("span", "dl", KIND[b.type] + " · " + (b.type === "audiobook" ? hours(b.duration) : b.audio ? "Audiobook" : bytes(b.size))));
+	var fm = h("span", "dl fmt");
+	fm.innerHTML = (b.type === "audiobook" ? "" : READ_ICON) + (b.type === "audiobook" || b.audio ? LISTEN_ICON : "");
+	a.append(fm);
 	li.append(a);
 	return li;
 }
