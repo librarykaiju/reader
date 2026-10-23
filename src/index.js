@@ -16,6 +16,10 @@
 //   OWNER_NAME           optional; your name on the family welcome page ("Welcome to Brandon's library")
 //   TURNSTILE_SITE_KEY   optional; with TURNSTILE_SECRET (a secret), a Cloudflare Turnstile check on the
 //                        library card request form (docs/setup.md, "Family library")
+//   ABS_URL, ABS_TOKEN   optional; Audiobookshelf's address (through a Cloudflare Tunnel) and an API key for a
+//                        read-only user there: its audiobooks join the family library (see "Audiobooks")
+//   CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET
+//                        secrets, optional; the Cloudflare Access service token in front of ABS_URL
 //   ALLOW_PRIVATE_FETCH  dev only: "1" lets /api/fetch reach localhost and
 //                        private IPs, for local test fixtures. Never in production.
 //
@@ -61,7 +65,9 @@
 //                                  and how many library card requests are waiting
 //   GET    /api/media?url=         a podcast episode's file, streamed through for
 //                                  downloading (podcast hosts rarely allow CORS)
-//   GET    /api/books              -> {"books": [...each with tags: [book tag ids]]}
+//   GET    /api/books              -> {"books": [...each with tags: [book tag ids]]} (not audiobooks, for now)
+//   POST   /api/audiobooks/sync    -> {"added", "updated", "gone", "total"}: reads Audiobookshelf now (a cron also
+//                                  does every 30 minutes); 503 when it isn't set up
 //   PUT    /api/books?name=&tag=  body = a .txt, .pdf, .cbz or .epub file -> {"book"} (tag: a book tag id to put on it)
 //                                  (a file name already in the Library replaces that book's file: {"book", "replaced": true})
 //   POST   /api/books/uploads?name=  a file over 95 MB, sent in pieces -> {key, upload_id, part_size}
@@ -102,9 +108,10 @@
 //   POST   /api/family/request     {name, note?, check?} -> {ok}: asks for a library card (no token needed; check is
 //                                  the Turnstile token when it's set up); shows on the Family screen
 //   GET    /api/people/:id/downloads -> {"downloads": [{at, book_id, title, author}]}, newest first
-//   GET    /api/family/me          -> {"name", "owner", "left", "today"} (name null for the owner; owner from OWNER_NAME;
-//                                  left and today: downloads left in the last 24 hours and the book ids already
-//                                  taken, null for the owner); renews the cookie
+//   GET    /api/family/me          -> {"name", "owner", "left", "today", "audio_left", "audio_today"} (name null for
+//                                  the owner; owner from OWNER_NAME; left and today: downloads left in the last 24
+//                                  hours and the book ids already taken, null for the owner; audio_: the same for
+//                                  audiobooks, which have their own limit); renews the cookie
 //   GET    /api/family/books       -> {"books": [...each with tags: [names]]}, without any tagged "Hide from family"
 //   GET    /api/catalog           -> {"books": [{id, title, author, series, volume, pages, pages_estimated,
 //                                  year?, publisher?, language?, classification?, isbn?}]}: catalog details for the
@@ -113,10 +120,13 @@
 //                                  first time it's opened; 404 for a hidden book
 //   GET    /api/family/books/:id/cover   as /api/books/:id/cover
 //   GET    /api/family/books/:id/file    the file as a download named "Title - Author.ext" (logged for a family member,
-//                                        who gets 10 different books in any 24 hours; a page saying so after that)
+//                                        who gets 10 different books in any 24 hours; a page saying so after that;
+//                                        an audiobook is its .m4b, or a zip of its files, 2 a day)
+//   GET    /api/family/books/:id/audio/:n  an audiobook's file n (from 0), streamed from Audiobookshelf with ranged
+//                                  reads for the player; not a download, so not counted
 //   GET    /api/family/books/:id/preview  -> a sample to read before downloading (not counted as a download; see
-//                                  "Previews"): {"type": "epub"|"txt", "blocks", "more"}, {"type": "cbz", "pages", "of"}
-//                                  or {"type": "pdf", "size", "pages"}
+//                                  "Previews"): {"type": "epub"|"txt", "blocks", "more"}, {"type": "cbz", "pages", "of"},
+//                                  {"type": "pdf", "size", "pages"} or {"type": "audiobook", "files", "chapters", "duration"}
 //   GET    /api/family/books/:id/preview/page/:n  a comic's page n (from 0), only the preview's pages
 //   GET    /api/family/books/:id/preview/part?at=&len=  len bytes of a PDF from byte at, for pdf.js (a family
 //                                  member gets at most 40% of a PDF's bytes this way)
@@ -146,9 +156,12 @@ const BOOK_TYPES = { txt: "text/plain; charset=utf-8", pdf: "application/pdf", c
 // because the live books table only allows 'txt' and 'pdf' and changing that
 // means rebuilding the table. Its .cbz or .epub file name is what marks it,
 // so the type read back from the database comes from that.
-const BOOK_TYPE = "CASE WHEN filename LIKE '%.cbz' THEN 'cbz' WHEN filename LIKE '%.epub' THEN 'epub' ELSE type END";
+// An audiobook from Audiobookshelf is the same: 'pdf', with a name ending
+// .audiobook (see "Audiobooks").
+const BOOK_TYPE = "CASE WHEN filename LIKE '%.cbz' THEN 'cbz' WHEN filename LIKE '%.epub' THEN 'epub' WHEN filename LIKE '%.audiobook' THEN 'audiobook' ELSE type END";
 function storedType(ext) { return ext === "cbz" || ext === "epub" ? "pdf" : ext; }
-function bookType(book) { const m = /\.(cbz|epub)$/i.exec(book.filename); return m ? m[1].toLowerCase() : book.type; }
+function bookType(book) { const m = /\.(cbz|epub|audiobook)$/i.exec(book.filename); return m ? m[1].toLowerCase() : book.type; }
+const NOT_AUDIOBOOK = "filename NOT LIKE '%.audiobook'";
 // Every book column but r2_key, which never leaves the Worker.
 const BOOK_COLUMNS = `id, title, filename, ${BOOK_TYPE} AS type, size, position, finished_at, created_at, last_opened_at, author, series, volume, layout, pages`;
 // An item with a media file is a podcast episode, or a video if the file is
@@ -212,6 +225,11 @@ export default {
 
 	async email(message, env) {
 		await receiveEmail(message, env);
+	},
+
+	// Every 30 minutes (wrangler.toml): new and changed audiobooks from Audiobookshelf.
+	async scheduled(event, env, ctx) {
+		if (absOn(env)) ctx.waitUntil(absSync(env).catch((err) => console.warn("audiobooks", err)));
 	},
 };
 
@@ -284,6 +302,7 @@ async function api(request, env, url) {
 		if (m === "PATCH") return updateItem(request, env, id);
 	}
 
+	if (p === "/api/audiobooks/sync" && m === "POST") return json(await absSync(env));
 	if (p === "/api/books") {
 		if (m === "GET") return listBooks(env);
 		if (m === "PUT") return uploadBook(request, env, url);
@@ -1797,7 +1816,7 @@ async function sha256Hex(bytes) {
 async function listBooks(env) {
 	const { results } = await env.DB.prepare(
 		`SELECT ${BOOK_COLUMNS}, (SELECT json_group_array(t.tag_id) FROM book_tag_links t WHERE t.book_id = books.id) AS tags, r2_key
-		FROM books ORDER BY COALESCE(last_opened_at, created_at) DESC, id DESC`,
+		FROM books WHERE ${NOT_AUDIOBOOK} ORDER BY COALESCE(last_opened_at, created_at) DESC, id DESC`,
 	).all();
 	const covers = await coverStates(env, new Map(results.map((b) => [b.id, b.r2_key])));
 	for (const b of results) {
@@ -2496,12 +2515,19 @@ async function bookCover(env, id) {
 	}
 	if (stored) await stored.arrayBuffer().catch(() => {});
 	const type = bookType(book);
-	if (type !== "epub" && type !== "cbz") throw new HttpError(404, "No cover");
+	if (type !== "epub" && type !== "cbz" && type !== "audiobook") throw new HttpError(404, "No cover");
 	let img = null;
-	try {
-		img = await findZipCover(env, book.r2_key, book.size, type);
-	} catch (err) {
-		console.warn("cover", id, err);
+	if (type === "audiobook") {
+		// Audiobookshelf's, kept here so the home server is asked once.
+		const res = await absFetch(env, `/api/items/${encodeURIComponent(book.abs_id)}/cover?format=jpeg`);
+		if (res.ok && Number(res.headers.get("Content-Length") || 0) <= MAX_COVER_BYTES) img = new Uint8Array(await res.arrayBuffer());
+		else await res.body?.cancel();
+	} else {
+		try {
+			img = await findZipCover(env, book.r2_key, book.size, type);
+		} catch (err) {
+			console.warn("cover", id, err);
+		}
 	}
 	const kind = img && imageType(img);
 	await env.BOOKS.put(coverKey(id), kind ? img : new Uint8Array(0), { customMetadata: { src: book.r2_key, type: kind || "" } });
@@ -2780,7 +2806,8 @@ async function familyApi(request, env, url, who) {
 	if (p === "/api/family/me") {
 		const today = who.person ? await downloadedToday(env, who.person.id) : null;
 		const res = json({ name: who.person ? who.person.name : null, owner: str(env.OWNER_NAME, 60),
-			left: today && Math.max(0, DOWNLOADS_PER_DAY - today.length), today });
+			left: today && Math.max(0, DOWNLOADS_PER_DAY - today.books.length), today: today && today.books,
+			audio_left: today && Math.max(0, AUDIOBOOKS_PER_DAY - today.audio.length), audio_today: today && today.audio });
 		if (who.person) res.headers.set("Set-Cookie", familyCookie(who.person.token));
 		return res;
 	}
@@ -2800,6 +2827,8 @@ async function familyApi(request, env, url, who) {
 	if (page) return previewComicPage(env, toId(page[1]), Number(page[2]));
 	const part = p.match(/^\/api\/family\/books\/(\d+)\/preview\/part$/);
 	if (part) return previewPart(env, toId(part[1]), url, who.person);
+	const audio = p.match(/^\/api\/family\/books\/(\d+)\/audio\/(\d+)$/);
+	if (audio) return audioFile(request, env, toId(audio[1]), Number(audio[2]));
 	return null;
 }
 
@@ -2808,22 +2837,23 @@ const NOT_HIDDEN = `NOT EXISTS (SELECT 1 FROM book_tag_links l JOIN book_tags t 
 
 async function familyBooks(env) {
 	const { results } = await env.DB.prepare(
-		`SELECT id, title, ${BOOK_TYPE} AS type, size, created_at, author, series, volume, r2_key,
+		`SELECT id, title, ${BOOK_TYPE} AS type, size, created_at, author, series, volume, narrator, duration, r2_key,
 			(SELECT json_group_array(t.name) FROM book_tag_links l JOIN book_tags t ON t.id = l.tag_id WHERE l.book_id = books.id) AS tags
-		FROM books WHERE ${NOT_HIDDEN} ORDER BY created_at DESC, id DESC`,
+		FROM books WHERE ${NOT_HIDDEN} AND gone_at IS NULL ORDER BY created_at DESC, id DESC`,
 	).all();
 	const covers = await coverStates(env, new Map(results.map((b) => [b.id, b.r2_key])));
 	for (const b of results) {
 		b.tags = JSON.parse(b.tags || "[]");
 		b.cover = covers.get(b.id) || null;
 		delete b.r2_key;
+		if (b.type !== "audiobook") { delete b.narrator; delete b.duration; }
 	}
 	return json({ books: results });
 }
 
 // A hidden book answers as if it weren't there.
 async function familyBook(env, id) {
-	const book = await env.DB.prepare(`SELECT * FROM books WHERE id = ? AND ${NOT_HIDDEN}`).bind(id).first();
+	const book = await env.DB.prepare(`SELECT * FROM books WHERE id = ? AND ${NOT_HIDDEN} AND gone_at IS NULL`).bind(id).first();
 	if (!book) throw new HttpError(404, "No such book");
 	return book;
 }
@@ -2836,20 +2866,28 @@ function downloadName(book) {
 }
 
 // 10 different books a person in any 24 hours, so the library's connection
-// isn't swamped. Taking a book again within the day doesn't count twice. The
-// owner has no limit.
+// isn't swamped, and 2 audiobooks on top: one is 300 MB to 1 GB, sent from
+// the home server over its upload. Taking a book again within the day
+// doesn't count twice. The owner has no limit.
 const DOWNLOADS_PER_DAY = 10;
+const AUDIOBOOKS_PER_DAY = 2;
+// -> {books: [ids], audio: [ids]}
 async function downloadedToday(env, personId) {
-	const { results } = await env.DB.prepare("SELECT DISTINCT book_id FROM downloads WHERE person_id = ? AND at > ?")
-		.bind(personId, Date.now() - 86400000).all();
-	return results.map((r) => r.book_id);
+	const { results } = await env.DB.prepare(
+		`SELECT DISTINCT d.book_id, b.filename LIKE '%.audiobook' AS audio FROM downloads d JOIN books b ON b.id = d.book_id
+		WHERE d.person_id = ? AND d.at > ?`,
+	).bind(personId, Date.now() - 86400000).all();
+	return { books: results.filter((r) => !r.audio).map((r) => r.book_id), audio: results.filter((r) => r.audio).map((r) => r.book_id) };
 }
-function limitPage() {
+function limitPage(audio) {
+	const n = audio ? AUDIOBOOKS_PER_DAY : DOWNLOADS_PER_DAY, what = audio ? "audiobooks" : "books";
+	const why = audio ? `Audiobooks are big, so each card gets ${n} a day on top of the ${DOWNLOADS_PER_DAY} books. You can still listen to any of them on the page.`
+		: `Each card gets ${n} downloads a day, so the library's internet holds up.`;
 	return new Response(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Come back tomorrow</title>
 <body style="font: 18px/1.5 Georgia, serif; background: #f4ecd8; color: #3b2f22; max-width: 32em; margin: 0 auto; padding: 48px 20px">
-<h1 style="font-size: 26px">That's today's ${DOWNLOADS_PER_DAY} books</h1>
-<p>Each card gets ${DOWNLOADS_PER_DAY} downloads a day, so the library's internet holds up. Come back tomorrow for more.</p>
+<h1 style="font-size: 26px">That's today's ${n} ${what}</h1>
+<p>${why} Come back tomorrow for more.</p>
 <p><a href="/library" style="color: #8b2e1f">Back to the library</a></p>`, {
 		status: 429,
 		headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'" },
@@ -2858,10 +2896,12 @@ function limitPage() {
 
 async function familyDownload(env, id, person) {
 	const book = await familyBook(env, id);
+	const audio = bookType(book) === "audiobook";
 	if (person) {
-		const today = await downloadedToday(env, person.id);
-		if (!today.includes(id) && today.length >= DOWNLOADS_PER_DAY) return limitPage();
+		const today = await downloadedToday(env, person.id), taken = audio ? today.audio : today.books;
+		if (!taken.includes(id) && taken.length >= (audio ? AUDIOBOOKS_PER_DAY : DOWNLOADS_PER_DAY)) return limitPage(audio);
 	}
+	if (audio) return audiobookDownload(env, book, person);
 	const obj = await env.BOOKS.get(book.r2_key);
 	if (!obj) throw new HttpError(404, "The file is missing from storage");
 	if (person) await env.DB.prepare("INSERT INTO downloads (person_id, book_id, at) VALUES (?, ?, ?)").bind(person.id, id, Date.now()).run();
@@ -2876,6 +2916,193 @@ async function familyDownload(env, id, person) {
 			"Content-Security-Policy": "default-src 'none'; sandbox",
 		},
 	});
+}
+
+// Audiobooks: from Audiobookshelf (ABS) on the home server, which keeps the
+// files and has already read their details and chapters. Reader is the
+// catalog: each audiobook is a books row (type 'pdf', named
+// "<title>.audiobook", r2_key "abs/<item id>", migration 0017) that family
+// browse, look up and download like any other book, while the audio itself
+// comes from ABS when someone plays or downloads it.
+//   * Reaching ABS: through a Cloudflare Tunnel at ABS_URL, behind a
+//     Cloudflare Access service token (CF_ACCESS_CLIENT_ID and _SECRET), with
+//     an API key (ABS_TOKEN) for a read-only ABS user. ABS itself is never
+//     public, and family never get ABS accounts.
+//   * Sync (the cron, or POST /api/audiobooks/sync): lists every ABS book
+//     library and adds or updates a row per audiobook. One that's gone from
+//     ABS is hidden (gone_at), and comes back if it returns. Its files and
+//     chapters (abs_media) are fetched the first time someone plays or
+//     downloads it, and again after ABS changes it.
+//   * Playing: /api/family/books/:id/audio/:n streams file n with ranged
+//     reads, so the player can seek. It isn't a download and isn't counted.
+//   * Downloading: one file goes out as it is (an .m4b, usually); a book in
+//     several files goes out as the zip ABS makes. 2 a day per person.
+//   * When the server, the tunnel or the home internet is down, the library
+//     still browses (it's all in D1) and playing says the server is offline.
+function absOn(env) { return !!(env.ABS_URL && env.ABS_TOKEN); }
+const ABS_OFFLINE = "The home server is offline just now, so audiobooks can't play. Try again later.";
+const ABS_PAGE = 200;
+
+async function absFetch(env, path, init = {}) {
+	if (!absOn(env)) throw new HttpError(503, "Audiobooks aren't set up (ABS_URL and ABS_TOKEN)");
+	const headers = new Headers(init.headers);
+	headers.set("Authorization", `Bearer ${env.ABS_TOKEN}`);
+	if (env.CF_ACCESS_CLIENT_ID) {
+		headers.set("CF-Access-Client-Id", env.CF_ACCESS_CLIENT_ID);
+		headers.set("CF-Access-Client-Secret", env.CF_ACCESS_CLIENT_SECRET || "");
+	}
+	let res;
+	try {
+		res = await fetch(env.ABS_URL.replace(/\/+$/, "") + path, { ...init, headers, redirect: "manual" });
+	} catch (err) {
+		console.warn("abs", path, err);
+		throw new HttpError(502, ABS_OFFLINE);
+	}
+	// Access sends anyone without the service token to its sign-in page.
+	if (res.status >= 300 && res.status < 400) {
+		await res.body?.cancel();
+		throw new HttpError(502, "Cloudflare Access turned Reader away from Audiobookshelf (check the service token)");
+	}
+	if (res.status === 401 || res.status === 403) {
+		await res.body?.cancel();
+		throw new HttpError(502, "Audiobookshelf turned down Reader's API key (ABS_TOKEN)");
+	}
+	// 502-504 and 530 are Cloudflare's: the tunnel or the server is down.
+	if (res.status >= 500) {
+		await res.body?.cancel();
+		throw new HttpError(502, ABS_OFFLINE);
+	}
+	return res;
+}
+async function absJSON(env, path) {
+	const res = await absFetch(env, path);
+	if (!res.ok) {
+		await res.body?.cancel();
+		throw new HttpError(res.status === 404 ? 404 : 502, res.status === 404 ? "Audiobookshelf no longer has this audiobook" : `Audiobookshelf answered ${res.status}`);
+	}
+	return res.json();
+}
+
+// "Mistborn #1" -> ["Mistborn", "1"]; several series ("A #1, B #3"): the first.
+function absSeries(name) {
+	const first = String(name || "").split(/,\s+(?=[^,]*#)/)[0].trim();
+	const m = /^(.*?)\s+#\s*([\d.]+\S*)$/.exec(first);
+	return m ? [m[1].trim(), m[2]] : [first || null, null];
+}
+
+// -> {added, updated, gone, total}
+async function absSync(env) {
+	const { libraries = [] } = await absJSON(env, "/api/libraries");
+	const items = [];
+	for (const lib of libraries) {
+		if (lib.mediaType && lib.mediaType !== "book") continue;
+		for (let page = 0; ; page++) {
+			const d = await absJSON(env, `/api/libraries/${encodeURIComponent(lib.id)}/items?minified=1&limit=${ABS_PAGE}&page=${page}`);
+			const got = d.results || [];
+			items.push(...got);
+			if (got.length < ABS_PAGE || (page + 1) * ABS_PAGE >= (d.total || 0)) break;
+		}
+	}
+	const { results } = await env.DB.prepare("SELECT id, abs_id, abs_updated, gone_at FROM books WHERE abs_id IS NOT NULL").all();
+	const have = new Map(results.map((r) => [r.abs_id, r]));
+	const seen = new Set(), stmts = [], now = Date.now();
+	let added = 0, updated = 0;
+	for (const it of items) {
+		const media = it.media || {}, md = media.metadata || {};
+		// Ebook-only items, and ones ABS can't find on disk, aren't audiobooks here.
+		if (!it.id || it.isMissing || it.isInvalid || !(media.duration > 0)) continue;
+		seen.add(it.id);
+		const title = str(md.title, 300) || "Untitled";
+		const [series, volume] = absSeries(md.seriesName);
+		const vals = [title, `${title.replace(/[\\/]/g, " ")}.audiobook`, Math.max(0, Math.round(it.size || media.size || 0)),
+			str(md.authorName, 300), str(series, 300), str(volume, 20), str(md.narratorName, 300), Math.round(media.duration), it.updatedAt || now];
+		const row = have.get(it.id);
+		if (!row) {
+			stmts.push(env.DB.prepare(
+				`INSERT INTO books (title, filename, type, size, r2_key, created_at, author, series, volume, narrator, duration, abs_updated, abs_id)
+				VALUES (?1, ?2, 'pdf', ?3, ?10, ?11, ?4, ?5, ?6, ?7, ?8, ?9, ?12)`,
+			).bind(...vals, `abs/${it.id}`, it.addedAt || now, it.id));
+			added++;
+		} else if (row.abs_updated !== vals[8] || row.gone_at) {
+			stmts.push(env.DB.prepare(
+				`UPDATE books SET title = ?1, filename = ?2, size = ?3, author = ?4, series = ?5, volume = ?6, narrator = ?7, duration = ?8,
+				abs_updated = ?9, abs_media = NULL, gone_at = NULL WHERE id = ?10`,
+			).bind(...vals, row.id));
+			updated++;
+		}
+	}
+	let gone = 0;
+	for (const r of results) {
+		if (seen.has(r.abs_id) || r.gone_at) continue;
+		stmts.push(env.DB.prepare("UPDATE books SET gone_at = ? WHERE id = ?").bind(now, r.id));
+		gone++;
+	}
+	for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
+	return { added, updated, gone, total: seen.size };
+}
+
+// An audiobook's files and chapters, from ABS the first time:
+// {files: [{ino, size, duration, mime, ext}], chapters: [{start, title}]}.
+async function absMedia(env, book) {
+	try {
+		const kept = JSON.parse(book.abs_media || "null");
+		if (kept) return kept;
+	} catch {}
+	const item = await absJSON(env, `/api/items/${encodeURIComponent(book.abs_id)}?expanded=1`);
+	const files = (item.media?.audioFiles || [])
+		.filter((f) => !f.exclude && !f.invalid && f.ino)
+		.sort((a, b) => (a.index || 0) - (b.index || 0))
+		.map((f) => ({
+			ino: String(f.ino), size: f.metadata?.size || 0, duration: f.duration || 0,
+			mime: MEDIA_TYPE.test(f.mimeType || "") ? f.mimeType : "audio/mpeg", ext: String(f.metadata?.ext || "").replace(/[^\w]/g, "").slice(0, 8),
+		}));
+	if (!files.length) throw new HttpError(404, "Audiobookshelf has no audio for this book");
+	const chapters = (item.media?.chapters || [])
+		.map((c) => ({ start: Math.max(0, Number(c.start) || 0), title: str(String(c.title ?? ""), 200) || "" }))
+		.sort((a, b) => a.start - b.start);
+	const media = { files, chapters };
+	await env.DB.prepare("UPDATE books SET abs_media = ? WHERE id = ?").bind(JSON.stringify(media), book.id).run();
+	return media;
+}
+
+const AUDIO_PASS = ["Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"];
+async function audioFile(request, env, id, n) {
+	const book = await familyBook(env, id);
+	if (bookType(book) !== "audiobook") throw new HttpError(404, "Not an audiobook");
+	const file = (await absMedia(env, book)).files[n];
+	if (!file) throw new HttpError(404, "No such file");
+	const range = request.headers.get("Range");
+	const res = await absFetch(env, `/api/items/${encodeURIComponent(book.abs_id)}/file/${encodeURIComponent(file.ino)}`, { headers: range ? { Range: range } : {} });
+	if (!res.ok) {
+		await res.body?.cancel();
+		// ABS changed under us: look its files up again next time.
+		if (res.status === 404) await env.DB.prepare("UPDATE books SET abs_media = NULL WHERE id = ?").bind(id).run();
+		throw new HttpError(res.status === 416 ? 416 : 502, `Audiobookshelf answered ${res.status}`);
+	}
+	const headers = new Headers({ "Content-Type": file.mime, "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" });
+	for (const k of AUDIO_PASS) if (res.headers.get(k)) headers.set(k, res.headers.get(k));
+	return new Response(res.body, { status: res.status, headers });
+}
+
+async function audiobookDownload(env, book, person) {
+	const media = await absMedia(env, book);
+	const one = media.files.length === 1 ? media.files[0] : null;
+	const res = await absFetch(env, `/api/items/${encodeURIComponent(book.abs_id)}` + (one ? `/file/${encodeURIComponent(one.ino)}` : "/download"));
+	if (!res.ok) {
+		await res.body?.cancel();
+		throw new HttpError(502, `Audiobookshelf answered ${res.status}`);
+	}
+	if (person) await env.DB.prepare("INSERT INTO downloads (person_id, book_id, at) VALUES (?, ?, ?)").bind(person.id, book.id, Date.now()).run();
+	const name = downloadName(book).replace(/\.audiobook$/, "." + (one ? one.ext || "m4b" : "zip"));
+	const headers = new Headers({
+		"Content-Type": one ? one.mime : "application/zip",
+		"Content-Disposition": `attachment; filename="${name.replace(/[^\x20-\x7e]/g, "_").replace(/"/g, "'")}"; filename*=UTF-8''${encodeURIComponent(name)}`,
+		"Cache-Control": "private, no-store",
+		"X-Content-Type-Options": "nosniff",
+		"Content-Security-Policy": "default-src 'none'; sandbox",
+	});
+	if (res.headers.get("Content-Length")) headers.set("Content-Length", res.headers.get("Content-Length"));
+	return new Response(res.body, { headers });
 }
 
 // Previews: a sample of a book read in the page, before deciding to
@@ -2913,6 +3140,10 @@ function wordCount(s) {
 async function familyPreview(env, id) {
 	const book = await familyBook(env, id);
 	const type = bookType(book);
+	if (type === "audiobook") {
+		const media = await absMedia(env, book);
+		return json({ type, files: media.files.map((f) => ({ duration: f.duration })), chapters: media.chapters, duration: book.duration });
+	}
 	if (type === "epub") return json({ type, ...(await epubPreview(env, book)) });
 	if (type === "txt") return json({ type, ...(await txtPreview(env, book)) });
 	if (type === "cbz") {
@@ -3542,6 +3773,10 @@ async function fileRecord(env, book) {
 		try { out.pages = JSON.parse(book.position || "null")?.pages || null; } catch {}
 	} else if (type === "txt") {
 		out.words = Math.round((book.size || 0) / 6);
+	} else if (type === "audiobook") {
+		const md = (await absJSON(env, `/api/items/${encodeURIComponent(book.abs_id)}`)).media?.metadata || {};
+		out.blurb = blurbText(md.description);
+		out.catalog = cleanCatalog({ year: md.publishedYear, publisher: md.publisher, language: md.language, isbn: md.isbn });
 	}
 	return out;
 }
@@ -3630,6 +3865,7 @@ function appealPrompt(book, blurb, tags) {
 		book.author && `Author: ${book.author}`,
 		book.series && `Series: ${book.series}${book.volume ? `, book ${book.volume}` : ""}`,
 		bookType(book) === "cbz" && "Format: comic",
+		bookType(book) === "audiobook" && `Format: audiobook${book.narrator ? `, narrated by ${book.narrator}` : ""}`,
 		tags.length && `Library tags: ${tags.join(", ")}`,
 	].filter(Boolean);
 	return `${lines.join("\n")}\n\n${blurb ? `<jacket_copy>\n${blurb}\n</jacket_copy>` : "No jacket copy."}\n\nPick this book's appeal terms.`;
@@ -3725,6 +3961,8 @@ async function fillRecord(env, book, refresh) {
 	if (!keep("blurb")) delete from.blurb;
 	if (!keep("pages")) delete from.pages;
 	if (!keep("appeal")) delete from.appeal;
+	// An audiobook's length is its duration (on the row), so it gets no page count.
+	const audio = bookType(book) === "audiobook";
 	let file = { blurb: null, pages: null, words: null, catalog: {} };
 	try { file = await fileRecord(env, book); } catch (err) { console.warn("record file", book.id, err); }
 	if (!blurb && file.blurb) { blurb = file.blurb; from.blurb = "file"; }
@@ -3737,10 +3975,10 @@ async function fillRecord(env, book, refresh) {
 	}
 	for (const [k, v] of Object.entries(file.catalog || {})) if (!catalog[k]) { catalog[k] = v; catFrom[k] = "file"; }
 	const need = CATALOG_FIELDS.filter((k) => !catalog[k]);
-	if (!blurb || !pages || need.length) {
+	if (!blurb || (!pages && !audio) || need.length) {
 		const online = await onlineRecord(book.title, book.author || "", need);
 		if (!blurb && online.blurb) { blurb = online.blurb; from.blurb = online.from.blurb; }
-		if (!pages && online.pages) { pages = online.pages; from.pages = online.from.pages; }
+		if (!pages && !audio && online.pages) { pages = online.pages; from.pages = online.from.pages; }
 		for (const [k, v] of Object.entries(online.catalog)) { catalog[k] = v; catFrom[k] = online.from.catalog[k]; }
 	}
 	// The Library of Congress's call number and subject headings win over
@@ -3779,7 +4017,7 @@ async function fillRecord(env, book, refresh) {
 // catalog facts: no files, tags, reading progress or family details.
 async function catalogFeed(env) {
 	const { results } = await env.DB.prepare(
-		"SELECT id, title, author, series, volume, pages, catalog, record_from FROM books ORDER BY id",
+		`SELECT id, title, author, series, volume, pages, catalog, record_from FROM books WHERE ${NOT_AUDIOBOOK} ORDER BY id`,
 	).all();
 	const books = results.map((b) => {
 		const r = recordJSON(b);
@@ -4037,6 +4275,8 @@ function familyPage(env) {
 		`script-src 'nonce-${nonce}' 'wasm-unsafe-eval' https://cdnjs.cloudflare.com${ts}`,
 		`style-src 'nonce-${nonce}'`,
 		"img-src 'self' data: blob:",
+		// An audiobook's player streams from /api/family/books/:id/audio/:n.
+		"media-src 'self'",
 		"font-src 'self' data:",
 		"connect-src 'self' https://cdn.jsdelivr.net",
 		"worker-src blob: https://cdnjs.cloudflare.com",
@@ -4193,6 +4433,8 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.rdl { display: flex; align-items: center; justify-content: center; gap: 8px; max-width: 340px; text-decoration: none; margin-top: 0; }
 	.rdl.off { background: var(--line); color: var(--muted); }
 	.rleft { font-size: 14px; margin: 8px 0 0; }
+	/* The audiobook's buttons, under the ebook's when the library has both. */
+	.raudio { margin-top: 16px; }
 	.rsec { border-top: 1px solid var(--line); margin-top: 30px; padding-top: 18px; }
 	.rsec h2 { font: 600 12px/1.2 var(--sans); letter-spacing: .16em; text-transform: uppercase; color: var(--muted); margin: 0 0 12px; }
 	.blurb p { font: 400 18px/1.6 var(--display); margin: 0 0 14px; max-width: 62ch; }
@@ -4237,6 +4479,19 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.pvpdf { position: relative; }
 	.pvpdf canvas { display: block; width: 100%; height: 100%; }
 	.pvpdf .pn { position: absolute; right: 8px; bottom: 6px; font-size: 12px; color: #999; }
+	/* Listening to an audiobook: the player, speed, and its chapters. */
+	.player { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
+	.player audio { display: block; width: 100%; }
+	.pctl { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+	.pctl button, .chapters button { appearance: none; border: 1px solid var(--line); background: var(--bg); color: inherit; border-radius: 999px; padding: 5px 12px; min-height: 36px; font: inherit; font-size: 14px; cursor: pointer; }
+	.pctl button[aria-pressed=true] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+	.pctl .lbl { font-size: 13px; margin-right: 2px; }
+	.pfile { font-size: 13px; margin: 10px 0 0; }
+	.chapters { list-style: none; margin: 18px 0 0; padding: 0; }
+	.chapters li { border-top: 1px solid var(--line); }
+	.chapters button { display: flex; width: 100%; justify-content: space-between; gap: 12px; border: 0; border-radius: 0; background: transparent; padding: 10px 4px; text-align: left; font-size: 15px; }
+	.chapters button[aria-current=true] { color: var(--accent); font-weight: 600; }
+	.chapters .chtime { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 	.pvend { text-align: center; border-top: 1px solid var(--line); margin-top: 30px; padding-top: 22px; }
 	.pvend p { margin: 0 0 6px; font: 400 18px/1.5 var(--display); }
 	.pvend .rbtns { margin: 6px auto 0; justify-content: center; }
@@ -4332,6 +4587,13 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 						<a id="rPv" class="rpv" href="#">Preview</a>
 					</div>
 					<p id="rLeft" class="rleft muted"></p>
+					<div id="rAudio" class="raudio" hidden>
+						<div class="rbtns">
+							<a id="rAdl" class="go rdl" href="#"></a>
+							<a id="rListen" class="rpv" href="#">Listen</a>
+						</div>
+						<p id="rALeft" class="rleft muted"></p>
+					</div>
 				</div>
 			</div>
 			<section id="rBlurbSec" class="rsec">
@@ -4346,7 +4608,7 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 		</article>
 		<article id="preview" class="preview" hidden>
 			<a id="pvBack" class="up" href="/library">‹ Back</a>
-			<p class="eyebrow pveye">Preview</p>
+			<p id="pvEye" class="eyebrow pveye">Preview</p>
 			<h1 id="pvTitle" tabindex="-1"></h1>
 			<p id="pvBy" class="pvby"></p>
 			<p id="pvNote" class="pvnote muted"></p>
@@ -4364,8 +4626,8 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 var $ = function (id) { return document.getElementById(id); };
 function h(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
 function say(msg) { $("note").textContent = msg; $("note").hidden = !msg; }
-var FORMATS = { epub: "EPUB", pdf: "PDF", cbz: "Comics", txt: "Text" };
-var KIND = { epub: "EPUB", pdf: "PDF", cbz: "Comic", txt: "Text" };
+var FORMATS = { epub: "EPUB", pdf: "PDF", cbz: "Comics", txt: "Text", audiobook: "Audiobooks" };
+var KIND = { epub: "EPUB", pdf: "PDF", cbz: "Comic", txt: "Text", audiobook: "Audiobook" };
 var COLORS = ["#7a3b2e", "#2f4f6f", "#3d5a3a", "#5b3f6e", "#8a6a1f", "#1f5e5e", "#6b2f45", "#4a4f63", "#7b4a1c", "#35524a"];
 var books = [], format = "", query = "", tag = "", me = {};
 // Showing one series' volumes: the address carries it (#series=Name) so Back returns to all books.
@@ -4378,6 +4640,17 @@ var listScroll = 0, viaList = false, viaRecord = false, onRecord = false, onPrev
 function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 function read(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
 
+// 33,120 seconds -> "9 h 12 min"
+function hours(sec) {
+	var m = Math.round((sec || 0) / 60);
+	return m < 60 ? Math.max(1, m) + " min" : Math.floor(m / 60) + " h" + (m % 60 ? " " + (m % 60) + " min" : "");
+}
+// 3725 -> "1:02:05"
+function clock(sec) {
+	sec = Math.max(0, Math.floor(sec || 0));
+	var hh = Math.floor(sec / 3600), mm = Math.floor(sec / 60) % 60, ss = sec % 60;
+	return (hh ? hh + ":" + (mm < 10 ? "0" : "") : "") + mm + ":" + (ss < 10 ? "0" : "") + ss;
+}
 function bytes(n) { return n < 1048576 ? Math.max(1, Math.round(n / 1024)) + " KB" : (n / 1048576).toFixed(n < 10485760 ? 1 : 0) + " MB"; }
 function fold(s) { return String(s || "").normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase(); }
 
@@ -4407,7 +4680,9 @@ function drawnCover(b) {
 function fillCover(cov, b) {
 	cov.textContent = "";
 	cov.append(drawnCover(b));
-	if (b.cover === "yes" || (b.cover !== "none" && (b.type === "epub" || b.type === "cbz"))) {
+	// An ebook with no cover of its own borrows its audiobook's (which is square, so it's second choice).
+	if (b.audio && b.audio.cover !== "none" && (b.cover === "none" || (b.cover == null && b.type !== "epub" && b.type !== "cbz"))) b = b.audio;
+	if (b.cover === "yes" || (b.cover !== "none" && (b.type === "epub" || b.type === "cbz" || b.type === "audiobook"))) {
 		var img = h("img");
 		img.alt = "";
 		img.loading = "lazy";
@@ -4423,18 +4698,57 @@ function card(b) {
 	var li = h("li"), a = h("a"), cov = fillCover(h("div", "cover"), b);
 	a.href = "#book=" + b.id;
 	a.addEventListener("click", function () { listScroll = window.scrollY; viaList = true; });
-	a.setAttribute("aria-label", b.title + (b.author ? " by " + b.author : "") + ", " + KIND[b.type]);
+	a.setAttribute("aria-label", b.title + (b.author ? " by " + b.author : "") + ", " + KIND[b.type] + (b.audio ? " and audiobook" : ""));
 	var by = [b.author, b.series ? b.series + (b.volume ? " " + b.volume : "") : null].filter(Boolean).join(" · ");
 	a.append(cov, h("span", "ct", b.title));
 	if (by) a.append(h("span", "ca", by));
-	a.append(h("span", "dl", KIND[b.type] + " · " + bytes(b.size)));
+	a.append(h("span", "dl", KIND[b.type] + " · " + (b.type === "audiobook" ? hours(b.duration) : b.audio ? "Audiobook" : bytes(b.size))));
 	li.append(a);
 	return li;
 }
 
+// A book the library has as an ebook and an audiobook is one Record with
+// both: the audiobook joins the ebook with the same title (before any
+// subtitle) and an author sharing a word, as b.audio (and it gets .parent).
+// An audiobook with no ebook stays a book of its own.
+function titleKey(b) { return fold(b.title).split(/[:(\[]/)[0].replace(/[^a-z0-9]+/g, " ").trim(); }
+function authorWords(b) { return fold(b.author).replace(/[^a-z]+/g, " ").trim().split(" ").filter(function (w) { return w.length > 1; }); }
+function pairAudio(list) {
+	var ebooks = {};
+	list.forEach(function (b) {
+		var k = titleKey(b);
+		if (b.type !== "audiobook" && k) (ebooks[k] = ebooks[k] || []).push(b);
+	});
+	return list.filter(function (b) {
+		if (b.type !== "audiobook") return true;
+		var words = authorWords(b), e = (ebooks[titleKey(b)] || []).filter(function (x) {
+			var theirs = authorWords(x);
+			return !x.audio && (!words.length && !theirs.length || words.some(function (w) { return theirs.indexOf(w) >= 0; }));
+		})[0];
+		if (!e) return true;
+		e.audio = b;
+		b.parent = e;
+		// Audiobookshelf's title, author and series are shown for both.
+		e.fileTitle = e.title;
+		e.title = b.title;
+		if (b.author) e.author = b.author;
+		if (b.series) { e.series = b.series; e.volume = b.volume; }
+		return false;
+	});
+}
+function findBook(id) {
+	for (var i = 0; i < books.length; i++) {
+		if (books[i].id === id) return books[i];
+		if (books[i].audio && books[i].audio.id === id) return books[i].audio;
+	}
+	return null;
+}
 function renderFormats() {
 	var box = $("formats"), have = {};
-	books.forEach(function (b) { have[b.type] = (have[b.type] || 0) + 1; });
+	books.forEach(function (b) {
+		have[b.type] = (have[b.type] || 0) + 1;
+		if (b.audio) have.audiobook = (have.audiobook || 0) + 1;
+	});
 	var kinds = Object.keys(FORMATS).filter(function (k) { return have[k]; });
 	box.textContent = "";
 	box.hidden = kinds.length < 2;
@@ -4639,8 +4953,9 @@ function renderTags() {
 	sel.hidden = !list.length;
 }
 function render() {
-	var id = openBook(), rb = id && books.filter(function (b) { return b.id === id; })[0];
-	var pid = openPreview(), pb = pid && books.filter(function (b) { return b.id === pid; })[0];
+	// An audiobook paired with its ebook opens the ebook's Record, and plays on its own.
+	var id = openBook(), rb = id && findBook(id), pid = openPreview(), pb = pid && findBook(pid);
+	if (rb && rb.parent) rb = rb.parent;
 	$("browse").hidden = !!(rb || pb);
 	$("record").hidden = !rb;
 	$("preview").hidden = !pb;
@@ -4655,10 +4970,10 @@ function render() {
 	var series = openSeries(), words = fold(query).split(/\s+/).filter(Boolean);
 	var shown = books.filter(function (b) {
 		if (series != null && fold(b.series) !== fold(series)) return false;
-		if (format && b.type !== format) return false;
+		if (format && b.type !== format && !(format === "audiobook" && b.audio)) return false;
 		if (tag && b.tags.indexOf(tag) < 0) return false;
 		if (pick && !pick.test(b)) return false;
-		var text = fold([b.title, b.author, b.series].join(" "));
+		var text = fold([b.title, b.author, b.series, b.fileTitle].join(" "));
 		return words.every(function (w) { return text.indexOf(w) >= 0; });
 	});
 	var ul = $("books");
@@ -4685,21 +5000,29 @@ function render() {
 
 function showSub() {
 	if (!me.name) return;
-	var left = me.left == null ? "" : " · " + (me.left === 1 ? "1 download" : me.left + " downloads") + " left today";
+	var audio = books.some(function (b) { return b.type === "audiobook"; }) && me.audio_left != null
+		? ", " + (me.audio_left === 1 ? "1 audiobook" : me.audio_left + " audiobooks") : "";
+	var left = me.left == null ? "" : " · " + (me.left === 1 ? "1 download" : me.left + " downloads") + audio + " left today";
 	$("sub").textContent = "Signed in as " + me.name + left;
 	$("sub").hidden = false;
 }
 // The Worker enforces the daily limit; this just says so before the tap
 // leads to its page, and keeps the count on the page current.
+// Audiobooks have their own limit: 2 a day, on top of the 10 books.
+function limits(b) {
+	return b.type === "audiobook" ? { left: me.audio_left, today: me.audio_today || [], key: "audio_left" }
+		: { left: me.left, today: me.today || [], key: "left" };
+}
 function downloading(e, b) {
-	if (!me || me.left == null || me.today.indexOf(b.id) >= 0) return;
-	if (me.left <= 0) {
+	var l = me && limits(b);
+	if (!me || l.left == null || l.today.indexOf(b.id) >= 0) return;
+	if (l.left <= 0) {
 		e.preventDefault();
-		alert("That's today's 10 books. Come back tomorrow for more.");
+		alert("That's today's " + (b.type === "audiobook" ? "2 audiobooks" : "10 books") + ". Come back tomorrow for more.");
 		return;
 	}
-	me.today.push(b.id);
-	me.left--;
+	l.today.push(b.id);
+	me[l.key]--;
 	showSub();
 }
 
@@ -4723,28 +5046,60 @@ function showRecord(b) {
 	}
 	recordFacts(b, records[b.id]);
 	downloadButton($("rDl"), $("rLeft"), b);
-	var pv = $("rPv");
+	var pv = $("rPv"), listen = b.type === "audiobook";
 	pv.href = "#preview=" + b.id;
-	pv.setAttribute("aria-label", "Preview " + b.title);
+	pv.textContent = listen ? "Listen" : "Preview";
+	pv.setAttribute("aria-label", (listen ? "Listen to " : "Preview ") + b.title);
 	pv.onclick = function () { viaRecord = true; };
+	$("rAudio").hidden = !b.audio;
+	if (b.audio) {
+		downloadButton($("rAdl"), $("rALeft"), b.audio);
+		$("rListen").href = "#preview=" + b.audio.id;
+		$("rListen").setAttribute("aria-label", "Listen to " + b.title);
+		$("rListen").onclick = function () { viaRecord = true; };
+	}
 	if (records[b.id]) return recordDetails(b, records[b.id]);
 	$("rBlurbSec").hidden = false;
 	$("rBlurb").innerHTML = '<p class="muted">Looking this book up…</p>';
 	$("rBlurbNote").hidden = $("rAppealSec").hidden = true;
-	fetch("/api/family/books/" + b.id).then(function (res) {
-		if (!res.ok) throw new Error();
-		return res.json();
-	}).then(function (d) {
-		records[b.id] = d.record;
-		if (openBook() === b.id) { recordFacts(b, d.record); recordDetails(b, d.record); }
+	var get = function (id) {
+		return fetch("/api/family/books/" + id).then(function (res) {
+			if (!res.ok) throw new Error();
+			return res.json();
+		}).then(function (d) { return d.record; });
+	};
+	Promise.all([get(b.id), b.audio ? get(b.audio.id).catch(function () { return null; }) : null]).then(function (r) {
+		var rec = records[b.id] = withAudio(r[0], r[1]);
+		if (openBook() === b.id) { recordFacts(b, rec); recordDetails(b, rec); }
 	}).catch(function () {
 		if (openBook() === b.id) $("rBlurb").innerHTML = '<p class="muted">Couldn\'t look this book up just now.</p>';
 	});
+}
+// A book with an audiobook too: Audiobookshelf's details (usually
+// Audible's, once matched there) come first for what the two share. Its
+// description wins over any but one edited by hand. Publisher, year and
+// ISBN describe an edition, and the audiobook's are the recording's, so
+// the ebook's stay and the audiobook's only fill gaps. Appeal terms the
+// ebook lacks come from the audiobook's record.
+function withAudio(rec, audio) {
+	if (!audio) return rec;
+	var out = Object.assign({}, rec, { from: Object.assign({}, rec.from), catalog: Object.assign({}, rec.catalog) });
+	if (audio.blurb && audio.from.blurb === "file" && rec.from.blurb !== "edited") {
+		out.blurb = audio.blurb;
+		out.from.blurb = "abs";
+	}
+	Object.keys(audio.catalog || {}).forEach(function (k) {
+		if (k !== "isbn" && !out.catalog[k]) out.catalog[k] = audio.catalog[k];
+	});
+	if (!rec.appeal && audio.appeal) out.appeal = audio.appeal;
+	return out;
 }
 function recordFacts(b, rec) {
 	var dl = $("rFacts"), add = function (k, v) { if (v) dl.append(h("dt", null, k), h("dd", null, v)); };
 	dl.textContent = "";
 	add("Format", KIND[b.type] + " · " + bytes(b.size));
+	if (b.type === "audiobook") { add("Length", hours(b.duration)); add("Narrator", b.narrator); }
+	if (b.audio) { add("Audiobook", hours(b.audio.duration) + " · " + bytes(b.audio.size)); add("Narrator", b.audio.narrator); }
 	if (rec && rec.pages) add("Length", (rec.from.pages === "estimate" ? "About " : "") + rec.pages.toLocaleString() + (rec.pages === 1 ? " page" : " pages"));
 	var c = rec && rec.catalog || {};
 	add("Published", c.year);
@@ -4761,20 +5116,22 @@ function downloadButton(dl, left, b) {
 	recordLeft(dl, left, b);
 }
 function recordLeft(dl, left, b) {
-	var took = me.today && me.today.indexOf(b.id) >= 0, out = me.left != null && me.left <= 0 && !took;
-	dl.textContent = out ? "That's today's " + 10 + " books" : "Download " + KIND[b.type];
+	var l = limits(b), audio = b.type === "audiobook";
+	var took = l.today.indexOf(b.id) >= 0, out = l.left != null && l.left <= 0 && !took;
+	dl.textContent = out ? "That's today's " + (audio ? "2 audiobooks" : "10 books") : "Download " + KIND[b.type];
 	dl.classList.toggle("off", out);
 	dl.setAttribute("aria-label", out ? "No downloads left today" : "Download " + b.title + ", " + KIND[b.type] + ", " + bytes(b.size));
-	left.hidden = me.left == null;
-	if (me.left == null) return;
-	left.textContent = took ? "Downloaded today, so taking it again doesn't count." : out ? "Come back tomorrow for more."
-		: (me.left === 1 ? "1 download" : me.left + " downloads") + " left today.";
+	left.hidden = l.left == null;
+	if (l.left == null) return;
+	left.textContent = took ? "Downloaded today, so taking it again doesn't count." : out ? "Come back tomorrow for more." + (audio ? " You can still listen here." : "")
+		: audio ? (l.left === 1 ? "1 audiobook download" : l.left + " audiobook downloads") + " left today. Listening here doesn't count."
+		: (l.left === 1 ? "1 download" : l.left + " downloads") + " left today.";
 }
 function recordDetails(b, rec) {
 	var box = $("rBlurb"), note = $("rBlurbNote"), who = function (m) { return /^claude/.test(m || "") ? "Claude" : "an AI model"; };
 	box.textContent = "";
 	(rec.blurb || "").split(/\n\s*\n/).forEach(function (p) { if (p.trim()) box.append(h("p", null, p.trim())); });
-	var said = { openlibrary: "From Open Library.", google: "From Google Books.",
+	var said = { openlibrary: "From Open Library.", google: "From Google Books.", abs: "From the audiobook's details.",
 		ai: "This one had no jacket copy, so " + who(rec.from.blurb_model) + " wrote this summary." }[rec.from.blurb];
 	note.textContent = said || "";
 	note.hidden = !said || !rec.blurb;
@@ -4810,8 +5167,10 @@ function closePreview() {
 	pv = null;
 }
 function showPreview(b) {
-	document.title = "Preview: " + b.title + " · The Back Alley Library";
-	$("pvBack").href = "#book=" + b.id;
+	var listen = b.type === "audiobook";
+	document.title = (listen ? "Listen: " : "Preview: ") + b.title + " · The Back Alley Library";
+	$("pvEye").textContent = listen ? "Listen" : "Preview";
+	$("pvBack").href = "#book=" + (b.parent || b).id;
 	$("pvBack").textContent = "‹ Back to the record";
 	$("pvTitle").textContent = b.title;
 	$("pvBy").textContent = b.author ? "by " + b.author : "";
@@ -4819,7 +5178,7 @@ function showPreview(b) {
 	if (pv && pv.id === b.id) return;
 	closePreview();
 	var sess = pv = { id: b.id, alive: true, cleanup: [] };
-	$("pvNote").textContent = "Loading the preview…";
+	$("pvNote").textContent = listen ? "Loading…" : "Loading the preview…";
 	$("pvEnd").hidden = true;
 	$("pvBody").textContent = "";
 	fetch("/api/family/books/" + b.id + "/preview").then(function (res) {
@@ -4829,6 +5188,7 @@ function showPreview(b) {
 		});
 	}).then(function (d) {
 		if (!sess.alive) return;
+		if (d.type === "audiobook") return previewAudio(sess, b, d);
 		if (d.type === "pdf") return previewPdf(sess, b, d);
 		if (d.type === "cbz") return previewComic(sess, b, d);
 		previewText(sess, b, d);
@@ -4843,6 +5203,116 @@ function previewEnd(b, text) {
 	$("pvEndText").hidden = !text;
 	downloadButton($("pvDl"), $("pvLeft"), b);
 	$("pvEnd").hidden = false;
+}
+// Listening: the whole audiobook, streamed from the home server a piece at a
+// time, so it isn't a download and isn't counted. A book in several files
+// plays them in turn; the chapters list jumps across them. The place and
+// the speed are kept on this device.
+var SPEEDS = [1, 1.25, 1.5, 2];
+function previewAudio(sess, b, d) {
+	$("pvNote").textContent = [b.narrator ? "Read by " + b.narrator : "", hours(d.duration || b.duration)].filter(Boolean).join(" · ");
+	var files = d.files || [], starts = [], total = 0;
+	files.forEach(function (f) { starts.push(total); total += f.duration || 0; });
+	var box = h("div", "player"), audio = h("audio"), cur = -1, pending = null, saved = 0;
+	var rate = parseFloat(read("listenRate")) || 1, part = h("p", "pfile muted");
+	audio.controls = true;
+	audio.preload = "metadata";
+	var now = function () { return cur < 0 ? 0 : starts[cur] + (audio.currentTime || 0); };
+	var load = function (n, at, play) {
+		cur = n;
+		pending = at;
+		audio.src = "/api/family/books/" + b.id + "/audio/" + n;
+		audio.defaultPlaybackRate = audio.playbackRate = rate;
+		part.textContent = "Part " + (n + 1) + " of " + files.length;
+		part.hidden = files.length < 2;
+		if (play) audio.play().catch(function () {});
+	};
+	// A place in the whole book -> the file it's in, and the time in it.
+	var seek = function (t, play) {
+		t = Math.max(0, Math.min(t, Math.max(0, total - 1)));
+		var n = 0;
+		while (n + 1 < files.length && starts[n + 1] <= t) n++;
+		if (n !== cur) return load(n, t - starts[n], play);
+		audio.currentTime = t - starts[n];
+		if (play) audio.play().catch(function () {});
+	};
+	var keep = function () { if (cur >= 0) store("listen:" + b.id, String(Math.floor(now()))); };
+	audio.addEventListener("loadedmetadata", function () {
+		if (pending) audio.currentTime = pending;
+		pending = null;
+	});
+	audio.addEventListener("ended", function () {
+		if (cur + 1 < files.length) load(cur + 1, 0, true);
+		else store("listen:" + b.id, "0");
+	});
+	audio.addEventListener("timeupdate", function () {
+		var t = now();
+		if (Math.abs(t - saved) >= 5) { saved = t; keep(); }
+		markChapter(t);
+	});
+	audio.addEventListener("pause", keep);
+	audio.addEventListener("error", function () {
+		if (sess.alive && audio.error) $("pvNote").textContent = "This audiobook couldn't play just now. The home server may be offline, so try again later.";
+	});
+
+	var ctl = h("div", "pctl"), sp = h("div", "pctl"), speeds = [];
+	var jump = function (label, by) {
+		var btn = h("button", null, label);
+		btn.type = "button";
+		btn.addEventListener("click", function () { seek(now() + by, !audio.paused); });
+		return btn;
+	};
+	ctl.append(jump("‹ 30 s", -30), jump("30 s ›", 30));
+	sp.append(h("span", "lbl muted", "Speed"));
+	SPEEDS.forEach(function (r) {
+		var btn = h("button", null, r + "×");
+		btn.type = "button";
+		btn.setAttribute("aria-label", "Speed " + r);
+		btn.setAttribute("aria-pressed", String(r === rate));
+		btn.addEventListener("click", function () {
+			rate = audio.defaultPlaybackRate = audio.playbackRate = r;
+			store("listenRate", String(r));
+			speeds.forEach(function (x) { x[1].setAttribute("aria-pressed", String(x[0] === r)); });
+		});
+		speeds.push([r, btn]);
+		sp.append(btn);
+	});
+	box.append(audio, ctl, sp, part);
+
+	var chapters = d.chapters || [], items = [], marked = -1;
+	var markChapter = function (t) {
+		var i = -1;
+		while (i + 1 < chapters.length && chapters[i + 1].start <= t + 0.5) i++;
+		if (i === marked) return;
+		if (items[marked]) items[marked].removeAttribute("aria-current");
+		if (items[i]) items[i].setAttribute("aria-current", "true");
+		marked = i;
+	};
+	if (chapters.length > 1) {
+		var ol = h("ol", "chapters");
+		chapters.forEach(function (c, i) {
+			var li = h("li"), btn = h("button");
+			btn.type = "button";
+			btn.append(h("span", null, c.title || "Chapter " + (i + 1)), h("span", "chtime", clock(c.start)));
+			btn.addEventListener("click", function () { seek(c.start, true); });
+			items.push(btn);
+			li.append(btn);
+			ol.append(li);
+		});
+		box.append(ol);
+	}
+	$("pvBody").append(box);
+	var from = parseFloat(read("listen:" + b.id)) || 0;
+	seek(from, false);
+	markChapter(from);
+	if (from > 5) $("pvNote").textContent += " · Picks up at " + clock(from);
+	sess.cleanup.push(function () {
+		keep();
+		audio.pause();
+		audio.removeAttribute("src");
+		audio.load();
+	});
+	previewEnd(b, "");
 }
 function previewText(sess, b, d) {
 	var box = h("div", "pvtext");
@@ -4981,7 +5451,7 @@ async function load() {
 	$("intro").hidden = false;
 	if (invite || !read("familyWelcomed")) welcome(true);
 	var data = await (await fetch("/api/family/books")).json();
-	books = (data.books || []).slice().sort(function (a, b) {
+	books = pairAudio((data.books || []).slice()).sort(function (a, b) {
 		return fold(a.series || a.title).localeCompare(fold(b.series || b.title)) || (parseFloat(a.volume) || 0) - (parseFloat(b.volume) || 0) || fold(a.title).localeCompare(fold(b.title));
 	});
 	sameSeries(books);

@@ -109,8 +109,19 @@ CREATE TABLE IF NOT EXISTS books (
 	record_at INTEGER,
 	-- Catalog details as JSON (migration 0016): year, publisher, language,
 	-- classification, isbn, subjects. Also fed to the site's book logs (GET /api/catalog).
-	catalog TEXT
+	catalog TEXT,
+	-- Audiobooks from Audiobookshelf (migration 0017): its item id, narrator,
+	-- length in seconds, when ABS last changed it, its files and chapters
+	-- (JSON), and when it left ABS (hidden from family). See "Audiobooks" in src/index.js.
+	abs_id TEXT,
+	narrator TEXT,
+	duration INTEGER,
+	abs_updated INTEGER,
+	abs_media TEXT,
+	gone_at INTEGER
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS books_abs_id ON books (abs_id) WHERE abs_id IS NOT NULL;
 
 -- Tags for feeds. A feed can carry any number of them, and the page filters
 -- the feed and item lists by one. Names are unique ignoring case. Removing a
