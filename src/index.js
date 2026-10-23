@@ -66,8 +66,9 @@
 //   GET    /api/media?url=         a podcast episode's file, streamed through for
 //                                  downloading (podcast hosts rarely allow CORS)
 //   GET    /api/books              -> {"books": [...each with tags: [book tag ids]]} (not audiobooks, for now)
-//   POST   /api/audiobooks/sync    -> {"added", "updated", "gone", "total"}: reads Audiobookshelf now (a cron also
-//                                  does every 30 minutes); 503 when it isn't set up
+//   POST   /api/audiobooks/sync    -> {"added", "updated", "gone", "total", "covers"}: reads Audiobookshelf now (a cron
+//                                  also does every 30 minutes), and fetches up to 40 covers not kept yet; 503 when
+//                                  it isn't set up
 //   PUT    /api/books?name=&tag=  body = a .txt, .pdf, .cbz or .epub file -> {"book"} (tag: a book tag id to put on it)
 //                                  (a file name already in the Library replaces that book's file: {"book", "replaced": true})
 //   POST   /api/books/uploads?name=  a file over 95 MB, sent in pieces -> {key, upload_id, part_size}
@@ -229,7 +230,7 @@ export default {
 
 	// Every 30 minutes (wrangler.toml): new and changed audiobooks from Audiobookshelf.
 	async scheduled(event, env, ctx) {
-		if (absOn(env)) ctx.waitUntil(absSync(env).catch((err) => console.warn("audiobooks", err)));
+		if (absOn(env)) ctx.waitUntil(absSync(env).then(() => absWarmCovers(env)).catch((err) => console.warn("audiobooks", err)));
 	},
 };
 
@@ -302,7 +303,7 @@ async function api(request, env, url) {
 		if (m === "PATCH") return updateItem(request, env, id);
 	}
 
-	if (p === "/api/audiobooks/sync" && m === "POST") return json(await absSync(env));
+	if (p === "/api/audiobooks/sync" && m === "POST") return json({ ...(await absSync(env)), covers: await absWarmCovers(env) });
 	if (p === "/api/books") {
 		if (m === "GET") return listBooks(env);
 		if (m === "PUT") return uploadBook(request, env, url);
@@ -2516,18 +2517,16 @@ async function bookCover(env, id) {
 	if (stored) await stored.arrayBuffer().catch(() => {});
 	const type = bookType(book);
 	if (type !== "epub" && type !== "cbz" && type !== "audiobook") throw new HttpError(404, "No cover");
-	let img = null;
 	if (type === "audiobook") {
-		// Audiobookshelf's, 600 px wide (an original can be a few MB), kept here so the home server is asked once.
-		const res = await absFetch(env, `/api/items/${encodeURIComponent(book.abs_id)}/cover?format=jpeg&width=600`);
-		if (res.ok && Number(res.headers.get("Content-Length") || 0) <= MAX_COVER_BYTES) img = new Uint8Array(await res.arrayBuffer());
-		else await res.body?.cancel();
-	} else {
-		try {
-			img = await findZipCover(env, book.r2_key, book.size, type);
-		} catch (err) {
-			console.warn("cover", id, err);
-		}
+		const got = await absCover(env, book);
+		if (!got) throw new HttpError(404, "No cover");
+		return coverResponse(got.img, got.kind);
+	}
+	let img = null;
+	try {
+		img = await findZipCover(env, book.r2_key, book.size, type);
+	} catch (err) {
+		console.warn("cover", id, err);
 	}
 	const kind = img && imageType(img);
 	await env.BOOKS.put(coverKey(id), kind ? img : new Uint8Array(0), { customMetadata: { src: book.r2_key, type: kind || "" } });
@@ -2929,7 +2928,8 @@ async function familyDownload(env, id, person) {
 //     an API key (ABS_TOKEN) for a read-only ABS user. ABS itself is never
 //     public, and family never get ABS accounts.
 //   * Sync (the cron, or POST /api/audiobooks/sync): lists every ABS book
-//     library and adds or updates a row per audiobook. One that's gone from
+//     library and adds or updates a row per audiobook, then fetches the next
+//     40 covers not kept in R2 yet. One that's gone from
 //     ABS is hidden (gone_at), and comes back if it returns. Its files and
 //     chapters (abs_media) are fetched the first time someone plays or
 //     downloads it, and again after ABS changes it.
@@ -3063,6 +3063,39 @@ async function absMedia(env, book) {
 	const media = { files, chapters };
 	await env.DB.prepare("UPDATE books SET abs_media = ? WHERE id = ?").bind(JSON.stringify(media), book.id).run();
 	return media;
+}
+
+// An audiobook's cover from Audiobookshelf, 600 px wide (an original can be
+// a few MB), kept in R2 like the others so the home server is asked once.
+// -> {img, kind}, or null when it has none.
+async function absCover(env, book) {
+	const res = await absFetch(env, `/api/items/${encodeURIComponent(book.abs_id)}/cover?format=jpeg&width=600`);
+	let img = null;
+	if (res.ok && Number(res.headers.get("Content-Length") || 0) <= MAX_COVER_BYTES) img = new Uint8Array(await res.arrayBuffer());
+	else await res.body?.cancel();
+	const kind = img && imageType(img);
+	await env.BOOKS.put(coverKey(book.id), kind ? img : new Uint8Array(0), { customMetadata: { src: book.r2_key, type: kind || "" } });
+	return kind ? { img, kind } : null;
+}
+
+// Covers are fetched ahead, a batch each sync (newest first), so browsing
+// /library never waits on the home server: hundreds of first-time covers
+// at once tie up the Worker and the home upload, and slow the app with them.
+// -> how many were fetched.
+const ABS_COVERS_PER_RUN = 40;
+async function absWarmCovers(env) {
+	const { results } = await env.DB.prepare(
+		"SELECT id, r2_key, abs_id FROM books WHERE abs_id IS NOT NULL AND gone_at IS NULL ORDER BY created_at DESC, id DESC",
+	).all();
+	const have = await coverStates(env, new Map(results.map((b) => [b.id, b.r2_key])));
+	let n = 0;
+	for (const b of results) {
+		if (have.has(b.id)) continue;
+		if (n >= ABS_COVERS_PER_RUN) break;
+		await absCover(env, b);
+		n++;
+	}
+	return n;
 }
 
 const AUDIO_PASS = ["Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"];
@@ -4362,6 +4395,8 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.ct { font: 600 15px/1.25 var(--display); overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
 	.ca { font-size: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 	.dl { font-size: 13px; color: var(--accent); font-weight: 600; }
+	.fmt { display: flex; gap: 8px; margin-top: 2px; }
+	.fmt svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 	.empty { color: var(--muted); padding: 24px 0; text-align: center; }
 	.filters { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 10px 0 4px; }
 	.filters .formats { margin: 0; }
@@ -4706,6 +4741,10 @@ function fillCover(cov, b) {
 	}
 	return cov;
 }
+// A card shows its formats as icons (the Record spells them out): an open
+// book for anything to read, headphones for an audiobook.
+var READ_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 4.5h6a4 4 0 0 1 4 4V20a3 3 0 0 0-3-3H2zM22 4.5h-6a4 4 0 0 0-4 4V20a3 3 0 0 1 3-3h7z"/></svg>';
+var LISTEN_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></svg>';
 // Tapping a book opens its Record; Back returns to the same place in the list.
 function card(b) {
 	var li = h("li"), a = h("a"), cov = fillCover(h("div", "cover"), b);
@@ -4715,7 +4754,9 @@ function card(b) {
 	var by = [b.author, b.series ? b.series + (b.volume ? " " + b.volume : "") : null].filter(Boolean).join(" · ");
 	a.append(cov, h("span", "ct", b.title));
 	if (by) a.append(h("span", "ca", by));
-	a.append(h("span", "dl", KIND[b.type] + " · " + (b.type === "audiobook" ? hours(b.duration) : b.audio ? "Audiobook" : bytes(b.size))));
+	var fm = h("span", "dl fmt");
+	fm.innerHTML = (b.type === "audiobook" ? "" : READ_ICON) + (b.type === "audiobook" || b.audio ? LISTEN_ICON : "");
+	a.append(fm);
 	li.append(a);
 	return li;
 }
@@ -5815,6 +5856,9 @@ const PAGE = String.raw`<!doctype html>
 		min-height: 52px; max-width: 1100px; margin: 0 auto; }
 	.logo { width: 40px; height: 40px; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,.2); flex: none; display: block; }
 	.wordmark { display: block; flex: none; color: var(--fg); line-height: 0; }
+	/* The logo and wordmark: a link to "/", which loads the app afresh (a hash-only change wouldn't). */
+	.home { display: flex; align-items: center; gap: 8px; flex: none; text-decoration: none; border-radius: 10px; }
+	.home:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 	.wordmark svg { height: 28px; width: auto; display: block; }
 	.token h1 .wordmark { display: inline-block; vertical-align: middle; }
 	.token h1 .wordmark svg { height: 40px; }
@@ -6254,8 +6298,7 @@ const PAGE = String.raw`<!doctype html>
 <header class="top" id="top">
 	<div class="bar">
 		<button id="back" class="btn ghost" type="button" hidden>&lsaquo; Back</button>
-		<img id="logo" class="logo" src="__ICON__" alt="">
-		<span id="wordmark" class="wordmark" role="img" aria-label="Reader">__WORDMARK__</span>
+		<a id="home" class="home" href="/" title="Reload Reader"><img id="logo" class="logo" src="__ICON__" alt=""><span id="wordmark" class="wordmark" role="img" aria-label="Reader">__WORDMARK__</span></a>
 		<h1 id="heading"></h1>
 		<span id="progress" class="progress" hidden></span>
 		<button id="markBtn" class="btn" type="button" aria-label="Bookmark this place" aria-pressed="false" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg></button>
@@ -8073,8 +8116,7 @@ function showView(name) {
 	show($("bookMenuBtn"), name === "book");
 	show($("markBtn"), name === "book");
 	$("heading").textContent = "";
-	show($("logo"), top);
-	show($("wordmark"), top);
+	show($("home"), top);
 }
 async function route() {
 	var r = parseHash(), prev = state.route;
