@@ -2518,8 +2518,8 @@ async function bookCover(env, id) {
 	if (type !== "epub" && type !== "cbz" && type !== "audiobook") throw new HttpError(404, "No cover");
 	let img = null;
 	if (type === "audiobook") {
-		// Audiobookshelf's, kept here so the home server is asked once.
-		const res = await absFetch(env, `/api/items/${encodeURIComponent(book.abs_id)}/cover?format=jpeg`);
+		// Audiobookshelf's, 600 px wide (an original can be a few MB), kept here so the home server is asked once.
+		const res = await absFetch(env, `/api/items/${encodeURIComponent(book.abs_id)}/cover?format=jpeg&width=600`);
 		if (res.ok && Number(res.headers.get("Content-Length") || 0) <= MAX_COVER_BYTES) img = new Uint8Array(await res.arrayBuffer());
 		else await res.body?.cancel();
 	} else {
@@ -4481,7 +4481,20 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.pvpdf .pn { position: absolute; right: 8px; bottom: 6px; font-size: 12px; color: #999; }
 	/* Listening to an audiobook: the player, speed, and its chapters. */
 	.player { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
-	.player audio { display: block; width: 100%; }
+	/* The bar: play, the place in the whole book, and a slider across it (the browser's own player can't take the theme). */
+	.pbar { display: flex; align-items: center; gap: 12px; }
+	.pplay { appearance: none; flex: none; width: 52px; height: 52px; border: 0; border-radius: 50%; background: var(--accent); color: var(--on-accent); display: grid; place-items: center; cursor: pointer; padding: 0; }
+	.pplay svg { width: 22px; height: 22px; fill: currentColor; }
+	.pplay:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+	.ptime { font-size: 13px; font-variant-numeric: tabular-nums; color: var(--muted); white-space: nowrap; min-width: 3.4em; }
+	.ptime.end { text-align: right; }
+	.pseek { flex: 1; min-width: 0; height: 28px; margin: 0; background: transparent; cursor: pointer; -webkit-appearance: none; appearance: none; --p: 0%; }
+	.pseek::-webkit-slider-runnable-track { height: 6px; border-radius: 3px; background: linear-gradient(to right, var(--accent) var(--p), var(--line) var(--p)); }
+	.pseek::-moz-range-track { height: 6px; border-radius: 3px; background: var(--line); }
+	.pseek::-moz-range-progress { height: 6px; border-radius: 3px; background: var(--accent); }
+	.pseek::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; margin-top: -6px; border-radius: 50%; background: var(--accent); border: 3px solid var(--card); box-shadow: 0 0 0 1px var(--accent); }
+	.pseek::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: var(--accent); border: 3px solid var(--card); box-shadow: 0 0 0 1px var(--accent); }
+	.pseek:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
 	.pctl { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
 	.pctl button, .chapters button { appearance: none; border: 1px solid var(--line); background: var(--bg); color: inherit; border-radius: 999px; padding: 5px 12px; min-height: 36px; font: inherit; font-size: 14px; cursor: pointer; }
 	.pctl button[aria-pressed=true] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
@@ -5215,7 +5228,6 @@ function previewAudio(sess, b, d) {
 	files.forEach(function (f) { starts.push(total); total += f.duration || 0; });
 	var box = h("div", "player"), audio = h("audio"), cur = -1, pending = null, saved = 0;
 	var rate = parseFloat(read("listenRate")) || 1, part = h("p", "pfile muted");
-	audio.controls = true;
 	audio.preload = "metadata";
 	var now = function () { return cur < 0 ? 0 : starts[cur] + (audio.currentTime || 0); };
 	var load = function (n, at, play) {
@@ -5249,7 +5261,10 @@ function previewAudio(sess, b, d) {
 		var t = now();
 		if (Math.abs(t - saved) >= 5) { saved = t; keep(); }
 		markChapter(t);
+		showTime(t);
 	});
+	audio.addEventListener("play", function () { showPlaying(); });
+	audio.addEventListener("pause", function () { showPlaying(); });
 	audio.addEventListener("pause", keep);
 	audio.addEventListener("error", function () {
 		if (sess.alive && audio.error) $("pvNote").textContent = "This audiobook couldn't play just now. The home server may be offline, so try again later.";
@@ -5277,7 +5292,45 @@ function previewAudio(sess, b, d) {
 		speeds.push([r, btn]);
 		sp.append(btn);
 	});
-	box.append(audio, ctl, sp, part);
+	// The bar runs across the whole book, whichever of its files is playing.
+	var bar = h("div", "pbar"), play = h("button", "pplay"), at = h("span", "ptime"), seekBar = h("input", "pseek"), end = h("span", "ptime end", clock(total));
+	var dragging = false;
+	play.type = "button";
+	seekBar.type = "range";
+	seekBar.min = 0;
+	seekBar.max = Math.max(1, Math.floor(total));
+	seekBar.step = 1;
+	seekBar.setAttribute("aria-label", "Place in the book");
+	var showPlaying = function () {
+		var on = !audio.paused;
+		play.innerHTML = on ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>'
+			: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>';
+		play.setAttribute("aria-label", on ? "Pause" : "Play");
+	};
+	var showTime = function (t) {
+		at.textContent = clock(t);
+		if (dragging) return;
+		seekBar.value = Math.floor(t);
+		seekBar.style.setProperty("--p", (total ? Math.min(100, t / total * 100) : 0) + "%");
+		seekBar.setAttribute("aria-valuetext", clock(t) + " of " + clock(total));
+	};
+	play.addEventListener("click", function () {
+		if (audio.paused) audio.play().catch(function () {});
+		else audio.pause();
+	});
+	seekBar.addEventListener("input", function () {
+		dragging = true;
+		at.textContent = clock(+seekBar.value);
+		seekBar.style.setProperty("--p", (+seekBar.value / seekBar.max * 100) + "%");
+	});
+	seekBar.addEventListener("change", function () {
+		dragging = false;
+		seek(+seekBar.value, !audio.paused);
+		showTime(+seekBar.value);
+	});
+	showPlaying();
+	bar.append(play, at, seekBar, end);
+	box.append(audio, bar, ctl, sp, part);
 
 	var chapters = d.chapters || [], items = [], marked = -1;
 	var markChapter = function (t) {
@@ -5305,6 +5358,7 @@ function previewAudio(sess, b, d) {
 	var from = parseFloat(read("listen:" + b.id)) || 0;
 	seek(from, false);
 	markChapter(from);
+	showTime(from);
 	if (from > 5) $("pvNote").textContent += " · Picks up at " + clock(from);
 	sess.cleanup.push(function () {
 		keep();
