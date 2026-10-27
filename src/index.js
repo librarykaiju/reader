@@ -100,8 +100,7 @@
 //                                  blurb?, pages?, appeal?} (the last three: the Record page's, see "Book records")
 //                                  (layout, a comic's: "pages", "scroll" (webtoon), "rtl" (manga), or null)
 //                                  (author/series/volume: the page reads them from an EPUB's own details;
-//                                  reread: fill them in from a .txt's YAML header or a comic's ComicInfo.xml)
-//                                  (reread: fill the details again from a .txt's YAML header)
+//                                  reread: fill them in again from a .txt's YAML header or a comic's ComicInfo.xml)
 //                                  (position null = start over)
 //   DELETE /api/books/:id          also deletes the file from R2
 //   GET    /api/books/:id/highlights -> {"highlights": [...]} in the order they come in the book
@@ -1451,7 +1450,15 @@ async function askWorkersAI(env, sources) {
 	return { answer, model: COVERAGE_AI_MODEL.replace(/^@cf\/[^/]+\//, "") };
 }
 
-async function askClaude(env, sources) {
+function askClaude(env, sources) {
+	return claudeJSON(env, { model: COVERAGE_CLAUDE_MODEL, maxTokens: 16000, effort: "medium", schema: COVERAGE_SCHEMA, system: COVERAGE_SYSTEM, user: coverageDocs(sources) })
+		.then((answer) => ({ answer, model: COVERAGE_CLAUDE_MODEL }));
+}
+
+// One answer from Claude in the shape of a JSON schema (structured
+// outputs), for the coverage digest and the appeal terms. -> the answer,
+// parsed; an HttpError saying what went wrong otherwise.
+async function claudeJSON(env, { model, maxTokens, effort, schema, system, user }) {
 	let res;
 	try {
 		res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -1464,13 +1471,13 @@ async function askClaude(env, sources) {
 				"anthropic-beta": "server-side-fallback-2026-07-01",
 			},
 			body: JSON.stringify({
-				model: COVERAGE_CLAUDE_MODEL,
-				max_tokens: 16000,
+				model,
+				max_tokens: maxTokens,
 				fallbacks: "default",
 				thinking: { type: "adaptive" },
-				output_config: { effort: "medium", format: { type: "json_schema", schema: COVERAGE_SCHEMA } },
-				system: COVERAGE_SYSTEM,
-				messages: [{ role: "user", content: coverageDocs(sources) }],
+				output_config: { effort, format: { type: "json_schema", schema } },
+				system,
+				messages: [{ role: "user", content: user }],
 			}),
 		});
 	} catch (err) {
@@ -1478,11 +1485,11 @@ async function askClaude(env, sources) {
 	}
 	const data = await res.json().catch(() => ({}));
 	if (!res.ok) throw new HttpError(502, `The Anthropic API answered ${res.status}: ${data.error?.message || "no details"}`);
-	if (data.stop_reason === "refusal") throw new HttpError(502, "The model declined to compare these articles.");
-	if (data.stop_reason === "max_tokens") throw new HttpError(502, "The comparison ran too long and was cut off. Try again.");
+	if (data.stop_reason === "refusal") throw new HttpError(502, "The model declined to answer.");
+	if (data.stop_reason === "max_tokens") throw new HttpError(502, "The model's answer ran too long and was cut off. Try again.");
 	const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
 	try {
-		return { answer: JSON.parse(text), model: COVERAGE_CLAUDE_MODEL };
+		return JSON.parse(text);
 	} catch {
 		throw new HttpError(502, "The model's answer wasn't readable. Try again.");
 	}
@@ -3229,7 +3236,8 @@ async function audiobookDownload(env, book, person) {
 //     keeps it a sample is that each person gets at most 40% of a PDF's
 //     bytes through previews, ever (the previews table, migration 0015).
 const PREVIEW_PAGES = 30;
-// The same pinned pdf.js the app's page uses (PDFJS and PDFJS_DATA there).
+// The pinned pdf.js: the family page's previews, the app's reader (PDFJS and
+// PDFJS_DATA there) and the service worker all take it from here.
 const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/";
 const PDFJS_DATA_URL = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/";
 const PREVIEW_COMIC_PAGES = 6;
@@ -3987,28 +3995,7 @@ async function appealTerms(env, book, blurb, tags) {
 	if (!env.ANTHROPIC_API_KEY && !env.AI) return null;
 	let answer, model;
 	if (env.ANTHROPIC_API_KEY) {
-		const res = await fetch("https://api.anthropic.com/v1/messages", {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				"x-api-key": env.ANTHROPIC_API_KEY.trim(),
-				"anthropic-version": "2023-06-01",
-				"anthropic-beta": "server-side-fallback-2026-07-01",
-			},
-			body: JSON.stringify({
-				model: RECORD_CLAUDE_MODEL,
-				max_tokens: 4000,
-				fallbacks: "default",
-				thinking: { type: "adaptive" },
-				output_config: { effort: "low", format: { type: "json_schema", schema: APPEAL_SCHEMA } },
-				system: APPEAL_SYSTEM,
-				messages: [{ role: "user", content: appealPrompt(book, blurb, tags) }],
-			}),
-		});
-		const data = await res.json().catch(() => ({}));
-		if (!res.ok) throw new Error(`Anthropic API ${res.status}: ${data.error?.message || ""}`);
-		if (data.stop_reason !== "end_turn") throw new Error("Anthropic API stopped: " + data.stop_reason);
-		answer = JSON.parse((data.content || []).filter((b) => b.type === "text").map((b) => b.text).join(""));
+		answer = await claudeJSON(env, { model: RECORD_CLAUDE_MODEL, maxTokens: 4000, effort: "low", schema: APPEAL_SCHEMA, system: APPEAL_SYSTEM, user: appealPrompt(book, blurb, tags) });
 		model = RECORD_CLAUDE_MODEL;
 	} else {
 		// Workers AI's JSON mode gives up ("JSON Mode couldn't be met") on a
@@ -4359,7 +4346,9 @@ function page() {
 		"form-action 'none'",
 		"frame-ancestors 'none'",
 	].join("; ");
-	return new Response(PAGE.replaceAll("__NONCE__", nonce).replaceAll("__ICON__", ICON_URI).replaceAll("__WORDMARK__", WORDMARK_SVG), {
+	const html = PAGE.replaceAll("__NONCE__", nonce).replaceAll("__ICON__", ICON_URI).replaceAll("__WORDMARK__", WORDMARK_SVG)
+		.replaceAll("__PDFJS__", PDFJS_URL).replaceAll("__PDFJS_DATA__", PDFJS_DATA_URL);
+	return new Response(html, {
 		headers: {
 			"Content-Type": "text/html; charset=utf-8",
 			"Content-Security-Policy": csp,
@@ -5783,7 +5772,7 @@ function serviceWorker() {
 	});
 }
 const SW = `var SHELL = "reader-shell-v1", LIBS = "reader-libs-v1";
-var PINNED = ["https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/", "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/"];
+var PINNED = ${JSON.stringify([PDFJS_URL, PDFJS_DATA_URL])};
 self.addEventListener("install", function (e) {
 	e.waitUntil(caches.open(SHELL).then(function (c) { return c.add("/"); }).catch(function () {}).then(function () { return self.skipWaiting(); }));
 });
@@ -5991,6 +5980,8 @@ const PAGE = String.raw`<!doctype html>
 	.details .gencover .gt { font-size: 11px; }
 	.details .gencover .ga, .details .gencover .gk { display: none; }
 	.details .dlook { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+	/* Here, not a style attribute: the page's CSP blocks those. */
+	#dPages { width: 90px; }
 	.details .drec { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 10px; }
 	.details .drec h3 { font-size: 13px; margin: 0 0 8px; }
 	.details label textarea { margin-top: 4px; }
@@ -6050,12 +6041,8 @@ const PAGE = String.raw`<!doctype html>
 	.row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 	.row .n { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
 	.row .tag { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 5px; padding: 0 4px; }
-	.fhead .name { font-weight: 600; }
 	.child > .row > a { padding-left: 40px; }
 	.flat .child > .row > a { padding-left: 8px; }
-	.chev { flex: none; width: 32px; height: 32px; border: 0; background: none; padding: 0; cursor: pointer; color: var(--muted); display: grid; place-items: center; border-radius: 8px; }
-	.chev::before { content: ""; width: 7px; height: 7px; border-right: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: rotate(45deg); margin-top: -4px; transition: transform .15s; }
-	.chev[aria-expanded=false]::before { transform: rotate(-45deg); margin: 0 0 0 -3px; }
 	.tools { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 0 8px 40px; }
 	.flat .tools { padding-left: 8px; }
 	.ferr { font-size: 13px; color: var(--bad); padding: 0 8px 6px 40px; overflow-wrap: anywhere; }
@@ -6859,7 +6846,7 @@ const PAGE = String.raw`<!doctype html>
 			<label>Appeal terms <span class="hint">(a line each: Pacing, Tone, Writing style, Characters, Storyline)</span>
 				<textarea id="dAppeal" rows="5" placeholder="Pacing: Fast-paced&#10;Tone: Suspenseful, Wry"></textarea></label>
 			<div class="dlook">
-				<label>Pages <input id="dPages" type="text" inputmode="numeric" maxlength="6" autocomplete="off" style="width: 90px"></label>
+				<label>Pages <input id="dPages" type="text" inputmode="numeric" maxlength="6" autocomplete="off"></label>
 				<button id="dRecord" class="btn small" type="button">Look it up again</button>
 				<span id="dRecStatus" class="hint"></span>
 			</div>
@@ -6885,12 +6872,12 @@ const PAGE = String.raw`<!doctype html>
 
 <script nonce="__NONCE__">
 var $ = function (id) { return document.getElementById(id); };
-var PDFJS = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/";
+var PDFJS = "__PDFJS__";
 // For HLS (.m3u8) video where the browser can't play it itself (everything but Safari).
 var HLSJS = { src: "https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js", integrity: "sha384-cciJ0zi8d1uMKC2zJd7jvPY4HQt7W4ByUI/FlMkltvBi31aW61rcpVBhpmW8/NwX" };
-var PDFJS_DATA = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/";
+var PDFJS_DATA = "__PDFJS_DATA__";
 var LIST_VIEWS = { unread: "Unread", saved: "Saved", all: "All" };
-// Both share the Podcasts section: same list, tags, downloads and player.
+// Both share the Podcasts section: same gallery, list, downloads and player.
 var MEDIA_TABS = { podcasts: "Podcasts", videos: "Videos" };
 var STALE_MS = 5 * 60 * 1000; // auto-refresh skips feeds fetched this recently
 var CHUNK = 50; // paragraphs per block in the .txt reader
@@ -7916,11 +7903,11 @@ function tagColor(id) { return "c" + ((Number(id) - 1) * 3) % 8; }
 // id 0 means "no tags".
 function hasTag(f, id) { return id === 0 ? !f.tags.length : f.tags.indexOf(id) >= 0; }
 function tagName(id) { var t = tagById(id); return id === 0 ? "Untagged" : t ? t.name : ""; }
-// A podcast or video channel: at least half its items are episodes or
-// videos (the same bar that gives a new one its channel tag).
+// A podcast or video channel: at least half its items are episodes or videos.
 function isMediaFeed(f) { var m = (f.episodes || 0) + (f.videos || 0); return m > 0 && m >= (f.articles || 0); }
-// A tag only podcast or video channels carry. These stay out of the news
-// tabs' tag list and switches, and show under Podcasts and Videos instead.
+// A tag only podcast or video channels carry (adding one used to tag it with
+// its own name, for a filter the galleries have since replaced). These stay
+// out of the news tabs' tag list and switches.
 function isChannelTag(id) {
 	var on = state.feeds.filter(function (f) { return hasTag(f, id); });
 	return on.length > 0 && on.every(isMediaFeed);
@@ -8139,8 +8126,7 @@ async function addFeed(e) {
 		var x = await follow(input, tagId ? [tagId] : []), r = x.found, data = x.data;
 		var what = r.mode === "feed" ? "RSS feed found (" + r.kind + "): " : "No feed, watching the page: ";
 		if (data.existing) { addStatus("Already following " + data.feed.title + "."); return; }
-		addStatus(what + data.feed.title + " — " + x.inserted + " item" + (x.inserted === 1 ? "" : "s")
-			+ (x.channel ? ", tagged “" + x.channel + "”." : "."));
+		addStatus(what + data.feed.title + " — " + x.inserted + " item" + (x.inserted === 1 ? "" : "s") + ".");
 		$("addUrl").value = "";
 		await loadFeeds();
 		fillTagSelect();
@@ -8153,35 +8139,16 @@ async function addFeed(e) {
 }
 // Find the feed at what was typed, save it and its items. Podcasts and
 // Videos sort themselves out by the items' files, so both adds use this.
-async function follow(input, tags) {
+// feedOnly: a page with no feed isn't kept (the galleries' + Add).
+async function follow(input, tags, feedOnly) {
 	var r = await discover(input);
+	if (feedOnly && r.mode !== "feed") throw new Error("there's no feed at that address");
 	var data = await apiJSON("/api/feeds", { method: "POST", json: {
 		url: r.url, feed_url: r.feed_url, mode: r.mode, title: r.title, site_url: r.site_url, tags: tags
 	} });
-	if (data.existing) return { found: r, data: data, inserted: 0, channel: null };
+	if (data.existing) return { found: r, data: data, inserted: 0 };
 	var saved = await saveItems(data.feed.id, r.items, r.image || await channelImage(data.feed, r.items));
-	return { found: r, data: data, inserted: saved.inserted, channel: await tagChannel(data.feed, r.items) };
-}
-// A new podcast or video channel gets a tag named after it, which keeps it
-// out of the news tabs' tag list. Only when most of what the
-// feed lists is audio or video, so a news site with one clip stays untagged.
-// Naming an existing tag reuses it. Returns the tag's name, or null.
-async function tagChannel(feed, items) {
-	var media = items.filter(function (it) { return it.media_url; }).length;
-	if (!media || media * 2 < items.length) return null;
-	try {
-		var name = feed.title.trim().slice(0, 80);
-		var tag = (await apiJSON("/api/tags", { method: "POST", json: { name: name } })).tag;
-		var ids = (feed.tags || []).slice();
-		if (ids.indexOf(tag.id) < 0) {
-			ids.push(tag.id);
-			await apiJSON("/api/feeds/" + feed.id, { method: "PATCH", json: { tags: ids } });
-		}
-		await loadTags();
-		return tag.name;
-	} catch (e) {
-		return null;
-	}
+	return { found: r, data: data, inserted: saved.inserted };
 }
 // The Add form's tag: its id, or null for none. "New tag…" asks for a name.
 async function chosenTag(sel) {
@@ -8466,8 +8433,7 @@ function renderTabs(name) {
 	var sub = listQuery(state.feed, state.tag);
 	document.querySelectorAll("#tabs a").forEach(function (a) {
 		var v = a.dataset.view;
-		a.href = "#/" + v + (LIST_VIEWS[v] ? sub : v === "library" && state.libTags.length ? "?tag=" + state.libTags.join(",")
-			: "");
+		a.href = "#/" + v + (LIST_VIEWS[v] ? sub : v === "library" && state.libTags.length ? "?tag=" + state.libTags.join(",") : "");
 		if (v === name) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
 	});
 }
@@ -8913,8 +8879,8 @@ async function loadFull(it) {
 // ---------- coverage
 // When other feeds carry the same story, a box above the article names them
 // and offers "Compare coverage": the Worker finds the matches (no AI), and
-// comparing sends each article's full text to it for a digest from Claude,
-// which it saves (see "Coverage" in the Worker). The text is what reading
+// comparing sends each article's full text to it for a digest from an AI
+// model, which it saves (see "Coverage" in the Worker). The text is what reading
 // the article would show: its saved copy, or for a feed that only sends a
 // teaser, the page fetched and extracted (and saved, as opening it would).
 // A saved digest opens at once, from any of the articles in it.
@@ -9196,7 +9162,9 @@ function applyFlags(it, patch) {
 	var listed = state.items.filter(function (x) { return x.id === it.id; })[0];
 	var feed = state.feeds.filter(function (f) { return f.id === it.feed_id; })[0];
 	var wasRead = row ? row.read : it.read;
-	if (patch.read != null && feed && !!patch.read !== !!wasRead) feed.unread += patch.read ? -1 : 1;
+	// An episode or video counts toward its show's unread, not the feed list's.
+	var count = !it.media_url ? "unread" : isAudio(it) ? "unread_episodes" : "unread_videos";
+	if (patch.read != null && feed && !!patch.read !== !!wasRead) feed[count] = Math.max(0, (feed[count] || 0) + (patch.read ? -1 : 1));
 	[it, listed].forEach(function (x) { if (x && patch.saved != null) x.saved = patch.saved; });
 	if (patch.read != null) {
 		it.read = patch.read;
@@ -9428,12 +9396,8 @@ async function epFollow(link, btn) {
 	$("epAddGo").disabled = true;
 	epAddStatus("Looking for a feed…");
 	try {
-		var x = await follow(link, []), feed = x.data.feed;
-		if (x.found.mode !== "feed" && !x.data.existing) {
-			// A page with no feed would be watched as news: not wanted here.
-			await apiJSON("/api/feeds/" + feed.id, { method: "DELETE" });
-			throw new Error("there's no feed at that address");
-		}
+		// A page with no feed would be watched as news: not wanted here.
+		var x = await follow(link, [], true), feed = x.data.feed;
 		await loadFeeds();
 		var mine = state.feeds.filter(function (y) { return y.id === feed.id; })[0] || feed;
 		var where = mine.videos > 0 && state.epKind !== "videos" ? " It's under Videos." : mine.episodes > 0 && state.epKind !== "podcasts" ? " It's under Podcasts."
@@ -9450,17 +9414,14 @@ async function epFollow(link, btn) {
 
 // A show's artwork; a tile with its name where it has none, or the picture
 // doesn't load.
-var HEADPHONES_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></svg>';
 var SCREEN_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="5" width="20" height="14" rx="3"/><path d="M10 9.5v5l4.5-2.5z"/></svg>';
 function showArt(box, f, videos) {
 	var draw = function () {
-		var n = 0, key = f.title || "";
-		for (var i = 0; i < key.length; i++) n = (n * 31 + key.charCodeAt(i)) >>> 0;
 		var g = h("div", "gen");
-		g.style.backgroundColor = COVER_COLORS[n % COVER_COLORS.length];
+		g.style.backgroundColor = coverColor(f.title);
 		g.setAttribute("aria-hidden", "true");
 		g.append(h("span", null, f.title));
-		g.insertAdjacentHTML("beforeend", videos ? SCREEN_SVG : HEADPHONES_SVG);
+		g.insertAdjacentHTML("beforeend", videos ? SCREEN_SVG : LISTEN_ICON);
 		box.prepend(g);
 	};
 	if (!f.image_url) return draw();
@@ -9571,8 +9532,10 @@ function setPlayed(ep, on) {
 	var pos = on ? real || 1 : 0, patch = { media_pos: pos };
 	if (on && !real) patch.media_len = 1;
 	if (!on && len && !real) patch.media_len = null;
-	// Unplayed is new again: back in its show's unread count.
+	// Unplayed is new again: back in its show's unread count (and a read
+	// mark still waiting to be sent mustn't undo that).
 	patch.read = on ? 1 : 0;
+	if (!on) dropPending(ep.id);
 	if (mine) { audio.pause(); player.savedAt = Date.now(); }
 	positions[ep.id] = pos;
 	store("readerPositions", JSON.stringify(positions));
@@ -10080,7 +10043,7 @@ function findListed(id) { return state.episodes.filter(function (e) { return e.i
 		if (!f) return;
 		try {
 			await apiJSON("/api/items/mark-read", { method: "POST", json: { feed: f.id } });
-			f.unread_episodes = 0;
+			f[state.epKind === "videos" ? "unread_videos" : "unread_episodes"] = 0;
 			renderEpHead();
 			await loadFeeds();
 		} catch (e) { fail(e); }
@@ -11092,10 +11055,13 @@ function sortBooks(books, how) {
 		return byTitle(a, b);
 	});
 }
+// How far through a book is, for its progress bar: a finished book's is
+// empty again (Finished says the rest), though its place is kept.
+function bookPct(b, pos) { return !b.finished_at && pos && pos.f ? Math.round(pos.f * 100) : 0; }
 function bookRow(b) {
 	var li = h("li", "child"), row = h("div", "row"), a = h("a");
 	a.href = "#/record/" + b.id;
-	var pos = parsePos(b.position), pct = pos && pos.f ? Math.round(pos.f * 100) : 0;
+	var pos = parsePos(b.position), pct = bookPct(b, pos);
 	var meta = isAudiobook(b) ? ["Audiobook", hours(b.duration)] : [b.type.toUpperCase(), bytes(b.size)];
 	if (b.audio) meta.push("Audiobook " + hours(b.audio.duration));
 	if (pos && b.type !== "txt" && pos.page) meta.push("p. " + pos.page + (pos.pages ? " of " + pos.pages : ""));
@@ -11161,7 +11127,7 @@ function bookCard(b) {
 	a.href = "#/record/" + b.id;
 	a.setAttribute("aria-label", b.title + (b.author ? ", " + b.author : "") + (b.audio ? ", ebook and audiobook" : isAudiobook(b) ? ", audiobook" : ""));
 	if (b.finished_at) cov.append(h("span", "badge cdone", "Finished"));
-	var pos = parsePos(b.position), pct = pos && pos.f ? Math.round(pos.f * 100) : 0;
+	var pos = parsePos(b.position), pct = bookPct(b, pos);
 	var bar = h("div", "bar-prog"), fill = h("span");
 	fill.style.width = pct + "%";
 	bar.append(fill);
@@ -11220,11 +11186,16 @@ function seriesCard(g) {
 	li.append(a);
 	return li;
 }
-function drawnCover(b) {
-	var n = 0, key = (b.title || "") + (b.author || "");
+// A drawn cover's color, the same for the same words every time.
+function coverColor(key) {
+	var n = 0;
+	key = key || "";
 	for (var i = 0; i < key.length; i++) n = (n * 31 + key.charCodeAt(i)) >>> 0;
+	return COVER_COLORS[n % COVER_COLORS.length];
+}
+function drawnCover(b) {
 	var g = h("div", "gencover");
-	g.style.backgroundColor = COVER_COLORS[n % COVER_COLORS.length];
+	g.style.backgroundColor = coverColor((b.title || "") + (b.author || ""));
 	g.setAttribute("aria-hidden", "true");
 	g.append(h("span", "gt", b.title));
 	if (b.author) g.append(h("span", "ga", b.author));
