@@ -11055,10 +11055,13 @@ function sortBooks(books, how) {
 		return byTitle(a, b);
 	});
 }
+// How far through a book is, for its progress bar: a finished book's is
+// empty again (Finished says the rest), though its place is kept.
+function bookPct(b, pos) { return !b.finished_at && pos && pos.f ? Math.round(pos.f * 100) : 0; }
 function bookRow(b) {
 	var li = h("li", "child"), row = h("div", "row"), a = h("a");
 	a.href = "#/record/" + b.id;
-	var pos = parsePos(b.position), pct = pos && pos.f ? Math.round(pos.f * 100) : 0;
+	var pos = parsePos(b.position), pct = bookPct(b, pos);
 	var meta = isAudiobook(b) ? ["Audiobook", hours(b.duration)] : [b.type.toUpperCase(), bytes(b.size)];
 	if (b.audio) meta.push("Audiobook " + hours(b.audio.duration));
 	if (pos && b.type !== "txt" && pos.page) meta.push("p. " + pos.page + (pos.pages ? " of " + pos.pages : ""));
@@ -11124,7 +11127,7 @@ function bookCard(b) {
 	a.href = "#/record/" + b.id;
 	a.setAttribute("aria-label", b.title + (b.author ? ", " + b.author : "") + (b.audio ? ", ebook and audiobook" : isAudiobook(b) ? ", audiobook" : ""));
 	if (b.finished_at) cov.append(h("span", "badge cdone", "Finished"));
-	var pos = parsePos(b.position), pct = pos && pos.f ? Math.round(pos.f * 100) : 0;
+	var pos = parsePos(b.position), pct = bookPct(b, pos);
 	var bar = h("div", "bar-prog"), fill = h("span");
 	fill.style.width = pct + "%";
 	bar.append(fill);
