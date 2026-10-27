@@ -43,7 +43,8 @@
 //                                  the same for book tags, a separate set
 //   GET    /api/feeds              -> {"feeds": [...each with an unread count, episodes, videos, articles, and tags: [tag ids]]}
 //                                  (podcast episodes and videos aren't in unread, or in Unread/All unless feed= is given;
-//                                  a show's unread episodes are unread_episodes, its newest one's date latest_episode)
+//                                  a show's unread episodes are unread_episodes, its newest one's date latest_episode;
+//                                  a video channel's, unread_videos and latest_video)
 //   POST   /api/feeds              {url, feed_url, mode, title, site_url, tags?}
 //   PATCH  /api/feeds/:id          {title?, feed_url?, mode?, site_url?, tags?}
 //                                  (tags: the feed's whole set of tag ids)
@@ -655,6 +656,8 @@ async function listFeeds(env) {
 			(SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND ${VIEWS.podcasts} AND i.read = 0) AS unread_episodes,
 			(SELECT MAX(COALESCE(i.published_at, i.created_at)) FROM items i WHERE i.feed_id = f.id AND ${VIEWS.podcasts}) AS latest_episode,
 			(SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND ${VIEWS.videos}) AS videos,
+			(SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND ${VIEWS.videos} AND i.read = 0) AS unread_videos,
+			(SELECT MAX(COALESCE(i.published_at, i.created_at)) FROM items i WHERE i.feed_id = f.id AND ${VIEWS.videos}) AS latest_video,
 			(SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND i.media_url IS NULL) AS articles,
 			(SELECT json_group_array(t.tag_id) FROM feed_tags t WHERE t.feed_id = f.id) AS tags
 		FROM feeds f ORDER BY lower(f.title), f.id`,
@@ -6611,7 +6614,6 @@ const PAGE = String.raw`<!doctype html>
 			<button id="epFilter" class="btn ghost small" type="button" aria-pressed="false">Downloaded</button>
 		</div>
 	</div>
-	<div id="epTags" class="tagbar" hidden></div>
 	<p id="epNote" class="hint" hidden></p>
 	<ul id="shows" class="shows" hidden></ul>
 	<ul id="episodes" class="items eps"></ul>
@@ -6878,7 +6880,7 @@ var UNAUTH = "Unauthorized";
 var state = {
 	route: null, prev: null, fromList: false, lastList: "#/unread",
 	view: "unread", feed: null, tag: null,
-	episodes: [], epNext: null, epTag: null, epOffline: false, epDownloadedOnly: false, epKind: "podcasts", epFeed: null, itemEp: null, fromPodcasts: false,
+	episodes: [], epNext: null, epOffline: false, epDownloadedOnly: false, epKind: "podcasts", epFeed: null, itemEp: null, fromPodcasts: false,
 	feeds: [], tags: [], books: null, bookTags: readJSON("readerBookTags") || [], libTag: null, libTags: [], libSearch: "", libSort: read("readerBookSort") || "recent", libFormat: read("readerBookFormat") || "", libScroll: 0, record: null, libView: read("readerBookView") === "covers" ? "covers" : "list",
 	items: [], next: null, listKey: "", listScroll: 0, stale: true,
 	refreshing: false, errors: {}, editFeeds: false, editBooks: false, libSel: {}, item: null
@@ -7160,6 +7162,7 @@ function atomHTML(node) {
 function parseAtom(root, base) {
 	return {
 		kind: "Atom", title: atomText(kid(root, "title")), siteUrl: atomLink(root, base) || base,
+		image: kidText(root, "logo") || kidText(root, "icon") ? absUrl(kidText(root, "logo") || kidText(root, "icon"), base) : null,
 		items: kids(root, "entry").map(function (e) {
 			var link = atomLink(e, base);
 			var who = kid(e, "author") || kid(root, "author");
@@ -8131,8 +8134,8 @@ async function addFeed(e) {
 		$("addBtn").disabled = false;
 	}
 }
-// A new podcast or video channel gets a tag named after it, so the Podcasts
-// and Videos tabs can pick it out with a pill. Only when most of what the
+// A new podcast or video channel gets a tag named after it, which keeps it
+// out of the news tabs' tag list. Only when most of what the
 // feed lists is audio or video, so a news site with one clip stays untagged.
 // Naming an existing tag reuses it. Returns the tag's name, or null.
 async function tagChannel(feed, items) {
@@ -8210,7 +8213,7 @@ async function refreshFeed(f) {
 			var p = parseFeed(r.text, r.url);
 			if (!p) throw new Error("that address no longer returns a feed");
 			items = p.items;
-			var image = p.image;
+			var image = p.image || await channelImage(f, items);
 		} else {
 			var pg = await proxyGet(f.site_url || f.url);
 			items = scrape(pg.text, pg.url).items;
@@ -8221,6 +8224,18 @@ async function refreshFeed(f) {
 		if (e.message === UNAUTH) throw e;
 		state.errors[f.id] = e.message;
 	}
+}
+
+// A video channel's picture: YouTube's feed has none, so it comes from the
+// channel's page (its og:image, the channel's avatar), once.
+async function channelImage(f, items) {
+	if (f.image_url || !f.site_url || !items.some(function (it) { return /^video\//.test(it.media_type || ""); })) return null;
+	try {
+		var pg = await proxyGet(f.site_url);
+		var m = parseHTML(pg.text).querySelector("meta[property='og:image'], meta[name='twitter:image']");
+		var url = m && m.getAttribute("content");
+		return url ? absUrl(url.trim(), pg.url) : null;
+	} catch (e) { return null; }
 }
 
 // ---------- item list
@@ -8424,7 +8439,7 @@ function renderTabs(name) {
 	document.querySelectorAll("#tabs a").forEach(function (a) {
 		var v = a.dataset.view;
 		a.href = "#/" + v + (LIST_VIEWS[v] ? sub : v === "library" && state.libTags.length ? "?tag=" + state.libTags.join(",")
-			: v === state.epKind && state.epTag != null ? "?tag=" + state.epTag : "");
+			: "");
 		if (v === name) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
 	});
 }
@@ -9214,22 +9229,20 @@ function epStatus(ep) {
 	return "";
 }
 
-// Podcasts tab: the shows, as a gallery of their artwork (a drawn tile where
-// a show has none yet), each with its unread episodes in the corner; a show
-// opens its own episodes (#/podcasts?feed=<id>). Videos, and what's
-// downloaded, stay one newest-first list.
-function galleryOn() { return state.epKind === "podcasts" && state.epFeed == null && !state.epDownloadedOnly; }
+// Podcasts and Videos: the shows (or channels), as a gallery of their
+// artwork (a drawn tile where one has none yet), each with its unread
+// episodes in the corner; a show opens its own episodes
+// (#/podcasts?feed=<id>). What's downloaded stays one newest-first list.
+function galleryOn() { return state.epFeed == null && !state.epDownloadedOnly; }
 async function showPodcasts(r) {
 	var back = state.prev && state.prev.name === "item";
-	var changed = !sameId(state.epTag, r.tag) || !sameId(state.epFeed, r.feed) || state.epKind !== r.name;
-	if (state.epKind !== r.name || !sameId(state.epFeed, r.feed)) state.episodes = [];
+	var changed = !sameId(state.epFeed, r.feed) || state.epKind !== r.name;
+	if (changed) state.episodes = [];
 	state.epKind = r.name;
-	state.epTag = r.tag;
 	state.epFeed = r.feed;
 	showView("podcasts");
 	renderTabs(r.name);
 	renderEpHead();
-	renderEpisodeTags();
 	if (!(back && !changed)) window.scrollTo(0, 0);
 	if (galleryOn()) return await loadShows();
 	if (back && !changed && state.episodes.length) { renderEpisodes(); return; }
@@ -9240,15 +9253,20 @@ function reloadPodcasts() { return galleryOn() ? loadShows() : loadEpisodes(fals
 function epShow() {
 	return state.epFeed == null ? null : state.feeds.filter(function (f) { return f.id === state.epFeed; })[0] || null;
 }
+// A feed's count, unread count and newest date for the tab being viewed.
+function showStats(f) {
+	return state.epKind === "videos" ? { n: f.videos || 0, unread: f.unread_videos || 0, latest: f.latest_video }
+		: { n: f.episodes || 0, unread: f.unread_episodes || 0, latest: f.latest_episode };
+}
 function renderEpHead() {
 	var f = epShow(), name = f ? f.title : MEDIA_TABS[state.epKind];
 	$("epHead").textContent = name;
 	document.title = name + " — Reader";
 	var up = $("epUp");
 	up.textContent = "‹ " + MEDIA_TABS[state.epKind];
-	up.href = "#/" + state.epKind + (state.epTag != null ? "?tag=" + state.epTag : "");
+	up.href = "#/" + state.epKind;
 	show(up, state.epFeed != null);
-	show($("epAllRead"), !!f && f.unread_episodes > 0);
+	show($("epAllRead"), !!f && showStats(f).unread > 0);
 }
 // Shows the gallery from the feeds already here at once, then again with
 // fresh counts (an episode opened since is read now).
@@ -9261,36 +9279,37 @@ async function loadShows() {
 		if (e.message === UNAUTH) return;
 		state.epOffline = true;
 	}
-	if (!state.route || state.route.name !== "podcasts" || !galleryOn()) return;
+	if (!state.route || !MEDIA_TABS[state.route.name] || state.route.name !== state.epKind || !galleryOn()) return;
 	// No connection and no shows to draw: what's downloaded still plays.
 	if (state.epOffline && !podShows().length) return await loadEpisodes(false);
 	renderEpHead();
-	renderEpisodeTags();
 	renderShows();
 }
-// Every feed with an episode in it, newest episode first.
+// Every feed with an episode (or a video) in it, newest first.
 function podShows() {
-	return state.feeds.filter(function (f) { return f.episodes > 0 && (state.epTag == null || hasTag(f, state.epTag)); })
-		.sort(function (a, b) { return (b.latest_episode || 0) - (a.latest_episode || 0) || a.title.localeCompare(b.title); });
+	return state.feeds.filter(function (f) { return showStats(f).n > 0; })
+		.sort(function (a, b) { return (showStats(b).latest || 0) - (showStats(a).latest || 0) || a.title.localeCompare(b.title); });
 }
 function renderShows() {
-	var ul = $("shows");
+	var ul = $("shows"), videos = state.epKind === "videos";
 	ul.textContent = "";
 	podShows().forEach(function (f) {
-		var li = h("li"), a = h("a"), art = h("div", "showart"), n = f.unread_episodes || 0;
-		a.href = "#/podcasts" + listQuery(f.id, state.epTag);
-		a.setAttribute("aria-label", f.title + (n ? ", " + n + " unread" : ""));
-		showArt(art, f);
-		if (n) art.append(h("span", "unreadn", n > 99 ? "99+" : String(n)));
+		var li = h("li"), a = h("a"), art = h("div", "showart"), x = showStats(f);
+		a.href = "#/" + state.epKind + "?feed=" + f.id;
+		a.setAttribute("aria-label", f.title + (x.unread ? ", " + x.unread + " unread" : ""));
+		showArt(art, f, videos);
+		if (x.unread) art.append(h("span", "unreadn", x.unread > 99 ? "99+" : String(x.unread)));
 		a.append(art, h("span", "ct", f.title),
-			h("span", "ca", [f.episodes + (f.episodes === 1 ? " episode" : " episodes"), ago(f.latest_episode)].filter(Boolean).join(" · ")));
+			h("span", "ca", [x.n + (videos ? (x.n === 1 ? " video" : " videos") : x.n === 1 ? " episode" : " episodes"), ago(x.latest)].filter(Boolean).join(" · ")));
 		li.append(a);
 		ul.append(li);
 	});
 	show(ul, true);
 	show($("episodes"), false);
 	show($("epMore"), false);
-	$("epEmpty").textContent = state.epOffline ? "You're offline." : "No podcasts yet. Add a podcast's feed to get started.";
+	$("epEmpty").textContent = state.epOffline ? "You're offline."
+		: videos ? "No videos yet. Add a YouTube channel, or another video feed, to get started."
+		: "No podcasts yet. Add a podcast's feed to get started.";
 	show($("epEmpty"), !ul.children.length);
 	$("epNote").textContent = "You're offline. The counts are from when you were last online.";
 	show($("epNote"), state.epOffline && !!ul.children.length);
@@ -9299,7 +9318,8 @@ function renderShows() {
 // A show's artwork; a tile with its name where it has none, or the picture
 // doesn't load.
 var HEADPHONES_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></svg>';
-function showArt(box, f) {
+var SCREEN_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="5" width="20" height="14" rx="3"/><path d="M10 9.5v5l4.5-2.5z"/></svg>';
+function showArt(box, f, videos) {
 	var draw = function () {
 		var n = 0, key = f.title || "";
 		for (var i = 0; i < key.length; i++) n = (n * 31 + key.charCodeAt(i)) >>> 0;
@@ -9307,7 +9327,7 @@ function showArt(box, f) {
 		g.style.backgroundColor = COVER_COLORS[n % COVER_COLORS.length];
 		g.setAttribute("aria-hidden", "true");
 		g.append(h("span", null, f.title));
-		g.insertAdjacentHTML("beforeend", HEADPHONES_SVG);
+		g.insertAdjacentHTML("beforeend", videos ? SCREEN_SVG : HEADPHONES_SVG);
 		box.append(g);
 	};
 	if (!f.image_url) return draw();
@@ -9323,7 +9343,7 @@ async function loadEpisodes(append) {
 	if (state.epDownloadedOnly) { state.episodes = downloadedList(); state.epNext = null; state.epOffline = false; renderEpisodes(); return; }
 	if (!append && !state.episodes.length) { $("epEmpty").textContent = "Loading…"; show($("epEmpty"), true); show($("shows"), false); }
 	try {
-		var data = await apiJSON("/api/items?view=" + state.epKind + "&limit=50" + (state.epFeed != null ? "&feed=" + state.epFeed : state.epTag != null ? "&tag=" + state.epTag : "") +
+		var data = await apiJSON("/api/items?view=" + state.epKind + "&limit=50" + (state.epFeed != null ? "&feed=" + state.epFeed : "") +
 			(append && state.epNext ? "&before=" + encodeURIComponent(state.epNext) : ""));
 		state.episodes = (append ? state.episodes : []).concat(data.items.map(epFields));
 		state.epNext = data.next;
@@ -9341,40 +9361,15 @@ function downloadedList() {
 	return Object.keys(downloads).map(function (id) { return downloads[id]; })
 		.filter(function (ep) {
 			if (!inTab(ep)) return false;
-			if (state.epFeed != null) return ep.feed_id === state.epFeed;
-			if (state.epTag == null) return true;
-			var f = state.feeds.filter(function (x) { return x.id === ep.feed_id; })[0];
-			return f ? hasTag(f, state.epTag) : false;
+			return state.epFeed == null || ep.feed_id === state.epFeed;
 		})
 		.sort(function (a, b) { return (b.published_at || b.created_at || 0) - (a.published_at || a.created_at || 0); });
-}
-// Tags that have a podcast (or video) on them, as a filter like the feed list's.
-// Not inside one show.
-function renderEpisodeTags() {
-	var kind = state.epKind, box = $("epTags");
-	var pods = state.feeds.filter(function (f) { return (kind === "videos" ? f.videos : f.episodes) > 0; });
-	box.textContent = "";
-	var list = state.epFeed != null ? [] : state.tags.filter(function (t) { return pods.some(function (f) { return hasTag(f, t.id); }); })
-		.map(function (t) { return { id: t.id, name: t.name, cls: tagColor(t.id) }; });
-	if (list.length && pods.some(function (f) { return !f.tags.length; })) list.push({ id: 0, name: "Untagged", cls: "untagged" });
-	show(box, list.length > 0);
-	box.classList.toggle("filtering", state.epTag != null);
-	var chips = h("div", "chips");
-	chips.setAttribute("aria-label", "Tags");
-	list.forEach(function (x) {
-		var on = sameId(state.epTag, x.id), c = chip(x.name, x.cls);
-		c.href = on ? "#/" + kind : "#/" + kind + "?tag=" + x.id;
-		if (on) c.setAttribute("aria-current", "true");
-		chips.append(c);
-	});
-	box.append(chips);
 }
 // An episode's line under its title; inside a show, without the show's name.
 function epMeta(ep) {
 	return [state.epFeed != null ? "" : ep.feed_title, ago(ep.published_at || ep.created_at), epStatus(ep)].filter(Boolean).join(" · ");
 }
 function renderEpisodes() {
-	renderEpisodeTags();
 	var ul = $("episodes");
 	ul.textContent = "";
 	state.episodes.forEach(function (ep) {
