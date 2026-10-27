@@ -9631,7 +9631,9 @@ function playFailed(e) {
 function renderPlayer() {
 	var ep = player.ep, audio = $("pAudio");
 	// The player page has the bar's controls, so the bar steps aside there.
-	var bar = !!ep && !(onListen() && ep.book === state.route.id);
+	// It only shows with the things it plays: Podcasts, Videos (and an episode
+	// opened from them) and the Library, not the feed lists or articles.
+	var bar = !!ep && barHere() && !(onListen() && ep.book === state.route.id);
 	show($("pbar"), bar);
 	document.body.classList.toggle("has-pbar", bar);
 	renderListen();
@@ -9644,6 +9646,11 @@ function renderPlayer() {
 	$("pPlay").innerHTML = audio.paused ? "&#9654;" : "&#10074;&#10074;";
 	$("pPlay").setAttribute("aria-label", audio.paused ? "Play" : "Pause");
 	$("pRate").textContent = player.rate + "×";
+}
+var BAR_ROUTES = { podcasts: 1, videos: 1, library: 1, record: 1, listen: 1 };
+function barHere() {
+	var r = state.route;
+	return !!r && (!!BAR_ROUTES[r.name] || (r.name === "item" && state.fromPodcasts));
 }
 // The played part of a slider (0 to 1000), for browsers that draw only the track.
 function seekFill(el) { el.style.setProperty("--p", el.value / 10 + "%"); }
