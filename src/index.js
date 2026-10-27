@@ -50,7 +50,7 @@
 //   GET    /api/items?view=unread|saved|all|podcasts|videos&feed=&tag=&before=&limit=
 //                                  newest first -> {"items", "next"} (tag=0: untagged feeds);
 //                                  Unread and All list a story once, with its other items in related
-//   POST   /api/items              {feed_id, items: [...]} -- one feed's refresh
+//   POST   /api/items              {feed_id, items: [...], image?} -- one feed's refresh (image: its artwork)
 //                                  (podcasts/videos: each with notes, a short plain-text preview of its show notes)
 //   GET    /api/items/:id          one item, with its content
 //   PATCH  /api/items/:id          {read?, saved?, content?, media_pos?, media_len?} (read covers its whole story)
@@ -749,7 +749,7 @@ async function deleteFeed(env, id) {
 
 const ITEM_LIST_COLUMNS = `i.id, i.feed_id, f.title AS feed_title, i.title, i.link, i.author,
 	i.published_at, i.created_at, i.read, i.saved, i.content IS NOT NULL AS has_content,
-	i.media_url, i.media_type, i.media_pos, i.media_len,
+	i.media_url, i.media_type, i.media_pos, i.media_len, f.image_url AS feed_image,
 	COALESCE(i.published_at, i.created_at) AS sort_at`;
 
 async function listItems(env, url) {
@@ -880,7 +880,7 @@ function itemPage(results, limit) {
 
 async function getItem(env, id) {
 	const item = await env.DB.prepare(
-		`SELECT i.*, f.title AS feed_title, f.site_url FROM items i JOIN feeds f ON f.id = i.feed_id WHERE i.id = ?`,
+		`SELECT i.*, f.title AS feed_title, f.site_url, f.image_url AS feed_image FROM items i JOIN feeds f ON f.id = i.feed_id WHERE i.id = ?`,
 	)
 		.bind(id)
 		.first();
@@ -939,7 +939,13 @@ async function addItems(request, env) {
 			AND guid NOT IN (SELECT value FROM json_each(?))`,
 		).bind(feedId, now - PRUNE_AFTER_MS, JSON.stringify([...seen])),
 	);
-	stmts.push(env.DB.prepare("UPDATE feeds SET last_fetched_at = ? WHERE id = ?").bind(now, feedId));
+	// The feed's artwork (a podcast's cover), as the page found it.
+	const image = httpUrl(body.image);
+	stmts.push(
+		image
+			? env.DB.prepare("UPDATE feeds SET last_fetched_at = ?, image_url = ? WHERE id = ?").bind(now, image, feedId)
+			: env.DB.prepare("UPDATE feeds SET last_fetched_at = ? WHERE id = ?").bind(now, feedId),
+	);
 	const results = await env.DB.batch(stmts);
 	const inserted = results.slice(0, clean.length).reduce((n, r) => n + (r.meta?.changes || 0), 0);
 	await groupStories(env, feedId, now);
@@ -5828,7 +5834,7 @@ const PAGE = String.raw`<!doctype html>
 		--serif: ui-serif, "New York", "Iowan Old Style", Charter, Georgia, serif;
 		/* Headings and book titles. Small text (buttons, menus, tags) stays --sans. */
 		--display: "Fraunces", var(--serif);
-		/* What articles and books are set in: --serif, or --display when chosen in Aa. */
+		/* What articles and books are set in: --serif, or --display when chosen in settings. */
 		--read: var(--serif);
 		--sans: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", sans-serif;
 		--reader-size: 19px;
@@ -6262,8 +6268,9 @@ const PAGE = String.raw`<!doctype html>
 	.people .who b { display: block; font: 500 18px/1.25 var(--display); }
 	.people .who span { color: var(--muted); font-size: 14px; }
 	.people .acts { display: flex; gap: 8px; flex: none; }
-	/* Library card requests waiting: a dot on Aa, a count on Family library. */
-	#settingsBtn { position: relative; }
+	/* Library card requests waiting: a dot on the settings gear, a count on Family library. */
+	#settingsBtn { position: relative; padding-inline: 10px; display: flex; align-items: center; }
+	#settingsBtn svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 	.reqdot { position: absolute; top: -3px; right: -3px; width: 12px; height: 12px; border-radius: 50%; background: var(--bad); border: 2px solid var(--bg); }
 	.reqn { display: inline-block; min-width: 20px; margin-left: 6px; padding: 0 6px; border-radius: 999px; background: var(--bad); color: #fff; font-size: 12px; font-weight: 700; line-height: 20px; text-align: center; }
 	.people .req { background: var(--sel); border-radius: 10px; padding: 12px; margin-bottom: 8px; border-bottom: 0; }
@@ -6442,7 +6449,7 @@ const PAGE = String.raw`<!doctype html>
 		<button id="markBtn" class="btn" type="button" aria-label="Bookmark this place" aria-pressed="false" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg></button>
 		<button id="refresh" class="btn" type="button">Refresh</button>
 		<button id="bookMenuBtn" class="btn" type="button" aria-label="Book options" aria-expanded="false" aria-controls="bookMenu" hidden>&#8943;</button>
-		<button id="settingsBtn" class="btn" type="button" aria-label="Display settings" aria-expanded="false" aria-controls="settings">Aa<span class="reqdot" hidden></span></button>
+		<button id="settingsBtn" class="btn" type="button" aria-label="Display settings" aria-expanded="false" aria-controls="settings"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span class="reqdot" hidden></span></button>
 	</div>
 	<nav id="tabs" class="tabs" aria-label="Views">
 		<a href="#/unread" data-view="unread">Unread</a>
@@ -7070,14 +7077,22 @@ function rssLink(node, base) {
 	for (var i = 0; i < links.length; i++) if (links[i].textContent.trim()) return absUrl(links[i].textContent.trim(), base);
 	return atomLink(node, base);
 }
+// A podcast's artwork: <itunes:image href> (both it and RSS's own <image>
+// have the local name image), else <image><url>.
+function rssImage(channel, base) {
+	var imgs = kids(channel, "image"), url = "";
+	imgs.forEach(function (i) { if (!url && i.getAttribute("href")) url = i.getAttribute("href").trim(); });
+	imgs.forEach(function (i) { if (!url && kidText(i, "url")) url = kidText(i, "url"); });
+	return url ? absUrl(url, base) : null;
+}
 function parseRSS(channel, items, base, kind) {
 	return {
-		kind: kind, title: plain(kidText(channel, "title")), siteUrl: rssLink(channel, base) || base,
+		kind: kind, title: plain(kidText(channel, "title")), siteUrl: rssLink(channel, base) || base, image: rssImage(channel, base),
 		items: items.map(function (it) {
 			var link = rssLink(it, base);
 			var g = kid(it, "guid"), guid = g ? g.textContent.trim() : "";
 			if (!link && guid && g.getAttribute("isPermaLink") !== "false") link = absUrl(guid, base);
-			var content = kidText(it, "encoded") || kidText(it, "description");
+			var content = kidText(it, "encoded") || kidText(it, "description") || kidText(it, "summary");
 			var media = pickMedia(kids(it, "enclosure").map(function (e) { return { url: e.getAttribute("url"), type: e.getAttribute("type") }; }), base)
 				|| videoPage(link);
 			return {
@@ -7227,7 +7242,7 @@ async function tryFeed(feedUrl, typed) {
 	}
 }
 function found(feed, feedUrl, typed) {
-	return { mode: "feed", url: typed, feed_url: feedUrl, title: feed.title || hostOf(feed.siteUrl), site_url: feed.siteUrl, kind: feed.kind, items: feed.items };
+	return { mode: "feed", url: typed, feed_url: feedUrl, title: feed.title || hostOf(feed.siteUrl), site_url: feed.siteUrl, kind: feed.kind, image: feed.image || null, items: feed.items };
 }
 
 // Scrape mode: likely article links on a page with no feed.
@@ -8070,7 +8085,7 @@ async function addFeed(e) {
 		} });
 		var what = r.mode === "feed" ? "RSS feed found (" + r.kind + "): " : "No feed, watching the page: ";
 		if (data.existing) { addStatus("Already following " + data.feed.title + "."); return; }
-		var saved = await saveItems(data.feed.id, r.items);
+		var saved = await saveItems(data.feed.id, r.items, r.image);
 		var channel = await tagChannel(data.feed, r.items);
 		addStatus(what + data.feed.title + " — " + saved.inserted + " item" + (saved.inserted === 1 ? "" : "s")
 			+ (channel ? ", tagged “" + channel + "”." : "."));
@@ -8111,7 +8126,7 @@ async function chosenTag(sel) {
 	var t = await promptTag();
 	return t ? t.id : null;
 }
-function saveItems(feedId, items) {
+function saveItems(feedId, items, image) {
 	var clean = items.filter(function (it) { return it.guid; }).slice(0, 200).map(function (it) {
 		return {
 			guid: String(it.guid).slice(0, 2000), title: it.title || "", link: it.link || null, author: it.author || null,
@@ -8119,7 +8134,7 @@ function saveItems(feedId, items) {
 			media_url: it.media_url || null, media_type: it.media_type || null
 		};
 	});
-	return apiJSON("/api/items", { method: "POST", json: { feed_id: feedId, items: clean } });
+	return apiJSON("/api/items", { method: "POST", json: { feed_id: feedId, items: clean, image: image || undefined } });
 }
 
 // Refresh: every feed (or only stale ones on app open), three at a time.
@@ -8163,11 +8178,12 @@ async function refreshFeed(f) {
 			var p = parseFeed(r.text, r.url);
 			if (!p) throw new Error("that address no longer returns a feed");
 			items = p.items;
+			var image = p.image;
 		} else {
 			var pg = await proxyGet(f.site_url || f.url);
 			items = scrape(pg.text, pg.url).items;
 		}
-		await saveItems(f.id, items);
+		await saveItems(f.id, items, image);
 		delete state.errors[f.id];
 	} catch (e) {
 		if (e.message === UNAUTH) throw e;
@@ -8339,19 +8355,37 @@ function rowsMoved(entries) {
 function flushRead(leaving) {
 	clearTimeout(readTimer);
 	readTimer = 0;
-	if (!readQueue.length) return;
-	var batch = readQueue;
-	readQueue = [];
-	renderFeeds();
-	api("/api/items/mark-read", { method: "POST", json: { ids: batch.map(function (it) { return it.id; }) }, keepalive: !!leaving })
-		.then(function (res) { if (!res.ok) throw new Error("HTTP " + res.status); })
-		.catch(function (e) {
-			if (leaving) return;
-			batch.forEach(function (it) { applyFlags(it, { read: 0 }); });
-			renderItems();
-			renderFeeds();
-			fail(e);
-		});
+	if (readQueue.length) {
+		queueReads(readQueue.map(function (it) { return it.id; }));
+		readQueue = [];
+		renderFeeds();
+	}
+	sendPendingReads(!!leaving);
+}
+// Read marks the Worker hasn't confirmed yet (offline, a dropped request, the
+// app put away mid-send) wait in localStorage and go again on the next
+// chance, instead of being lost: a read here that never reached the Worker
+// comes back unread on every other device.
+function pendingReads() { return readJSON("readerPendingReads") || []; }
+function keepPending(ids) { store("readerPendingReads", ids.length ? JSON.stringify(ids.slice(-500)) : null); }
+function queueReads(ids) {
+	var p = pendingReads();
+	ids.forEach(function (id) { if (p.indexOf(id) < 0) p.push(id); });
+	keepPending(p);
+}
+function dropPending(id) { keepPending(pendingReads().filter(function (x) { return x !== id; })); }
+var sendingReads = false;
+async function sendPendingReads(keepalive) {
+	var ids = pendingReads();
+	if (!ids.length || sendingReads || !token()) return;
+	sendingReads = true;
+	try {
+		var res = await api("/api/items/mark-read", { method: "POST", json: { ids: ids }, keepalive: !!keepalive });
+		if (res.ok) keepPending(pendingReads().filter(function (id) { return ids.indexOf(id) < 0; }));
+	} catch (e) {
+	} finally {
+		sendingReads = false;
+	}
 }
 function renderTabs(name) {
 	var sub = listQuery(state.feed, state.tag);
@@ -8583,7 +8617,7 @@ function personStatus(p) {
 	return bits.join(" · ");
 }
 // Library card requests: checked when Reader opens, when it comes back to the
-// front, and every 5 minutes while it's showing. Waiting ones put a dot on Aa,
+// front, and every 5 minutes while it's showing. Waiting ones put a dot on the gear,
 // a count on Family library and (where the browser allows, as a Home Screen
 // app with notifications allowed) on the app icon; one that's new since this
 // device last looked gets a toast.
@@ -9066,9 +9100,12 @@ function renderItemButtons() {
 async function setFlags(it, patch) {
 	var row = storyRow(it), before = { read: row ? row.read : it.read, saved: it.saved };
 	applyFlags(it, patch);
+	if (patch.read === 0) dropPending(it.id);
 	try {
 		await apiJSON("/api/items/" + it.id, { method: "PATCH", json: patch });
 	} catch (e) {
+		// Read stays read here and is sent again later (see pendingReads).
+		if (e.message !== UNAUTH && patch.read === 1 && patch.saved == null) return queueReads([it.id]);
 		applyFlags(it, before);
 		fail(e);
 	}
@@ -9122,7 +9159,7 @@ function inTab(ep) { return state.epKind === "videos" ? !isAudio(ep) : isAudio(e
 function epFields(it) {
 	return { id: it.id, feed_id: it.feed_id, feed_title: it.feed_title || "", title: it.title || "Untitled", media_url: it.media_url,
 		media_type: it.media_type || "audio/mpeg", media_pos: it.media_pos, media_len: it.media_len, published_at: it.published_at, created_at: it.created_at,
-		notes: it.notes || null };
+		notes: it.notes || null, feed_image: it.feed_image || null };
 }
 function saveDownloads() { store("readerDownloads", JSON.stringify(downloads)); }
 // The furthest point reached on this device or saved on the item.
@@ -9609,7 +9646,9 @@ function playFailed(e) {
 function renderPlayer() {
 	var ep = player.ep, audio = $("pAudio");
 	// The player page has the bar's controls, so the bar steps aside there.
-	var bar = !!ep && !(onListen() && ep.book === state.route.id);
+	// It only shows with the things it plays: Podcasts, Videos (and an episode
+	// opened from them or from the bar) and the Library, not the feed lists or articles.
+	var bar = !!ep && barHere() && !(onListen() && ep.book === state.route.id);
 	show($("pbar"), bar);
 	document.body.classList.toggle("has-pbar", bar);
 	renderListen();
@@ -9623,12 +9662,45 @@ function renderPlayer() {
 	$("pPlay").setAttribute("aria-label", audio.paused ? "Play" : "Pause");
 	$("pRate").textContent = player.rate + "×";
 }
+var BAR_ROUTES = { podcasts: 1, videos: 1, library: 1, record: 1, listen: 1 };
+function barHere() {
+	var r = state.route;
+	return !!r && (!!BAR_ROUTES[r.name] || (r.name === "item" && (state.fromPodcasts || (!!player.ep && player.ep.id === r.id))));
+}
 // The played part of a slider (0 to 1000), for browsers that draw only the track.
 function seekFill(el) { el.style.setProperty("--p", el.value / 10 + "%"); }
+// What the lock screen and Control Center show. An audiobook's cover goes
+// with it, so the phone can show it large; as a data: URL, since the phone
+// fetches artwork itself, without the token, and a blob: URL isn't always
+// shown. A podcast's is its feed's artwork, on the podcast's own site.
+var sessionArt = {};
 function setSession(ep) {
 	if (!("mediaSession" in navigator)) return;
+	var meta = { title: ep.title, artist: ep.feed_title || "", album: "Reader" };
+	var art = ep.book ? sessionArt[ep.book] : ep.feed_image ? { src: ep.feed_image } : null;
 	try {
-		navigator.mediaSession.metadata = new MediaMetadata({ title: ep.title, artist: ep.feed_title || "", album: "Reader" });
+		navigator.mediaSession.metadata = new MediaMetadata(art ? Object.assign(meta, { artwork: [art] }) : meta);
+	} catch (e) {}
+	if (ep.book && art === undefined) sessionCover(ep);
+}
+async function sessionCover(ep) {
+	sessionArt[ep.book] = null;
+	try {
+		var res = await api("/api/books/" + ep.book + "/cover");
+		if (!res.ok) return;
+		var blob = await res.blob(), type = blob.type || "image/jpeg";
+		var src = await new Promise(function (ok, no) {
+			var fr = new FileReader();
+			fr.onload = function () { ok(fr.result); };
+			fr.onerror = no;
+			fr.readAsDataURL(blob);
+		});
+		var img = new Image();
+		img.src = src;
+		await img.decode();
+		var size = img.naturalWidth + "x" + img.naturalHeight;
+		sessionArt[ep.book] = { src: src, sizes: size, type: type };
+		if (player.ep === ep) setSession(ep);
 	} catch (e) {}
 }
 function skip(by) {
@@ -13835,6 +13907,27 @@ document.addEventListener("visibilitychange", function () { if (document.visibil
 window.addEventListener("pagehide", function () { if (session) flushPosition(session, true); });
 document.addEventListener("visibilitychange", function () { if (document.visibilityState === "hidden") flushRead(true); });
 window.addEventListener("pagehide", function () { flushRead(true); });
+window.addEventListener("online", function () { sendPendingReads(); });
+// A phone keeps a home-screen app open for days, so coming back to it after a
+// while fetches the list again: what was read on another device meanwhile
+// would otherwise still show here as unread. Waiting read marks go first.
+var hiddenAt = 0;
+document.addEventListener("visibilitychange", function () {
+	if (document.visibilityState === "hidden") { hiddenAt = Date.now(); return; }
+	var away = hiddenAt ? Date.now() - hiddenAt : 0;
+	hiddenAt = 0;
+	if (away < 60 * 1000 || !started || !token()) return;
+	resync().catch(function () {});
+});
+async function resync() {
+	await sendPendingReads();
+	await loadFeeds();
+	if (state.route && LIST_VIEWS[state.route.name]) {
+		await loadItems(false);
+		window.scrollTo(0, 0);
+	} else state.stale = true;
+	refreshAll(false);
+}
 if ("scrollRestoration" in history) history.scrollRestoration = "manual";
 
 async function start() {
@@ -13842,6 +13935,7 @@ async function start() {
 	show($("app"), true);
 	$("feedsBox").open = matchMedia("(min-width: 900px)").matches || read("readerFeedsOpen") === "1";
 	try {
+		await sendPendingReads();
 		await Promise.all([loadTags(), loadFeeds()]);
 	} catch (e) {
 		if (e.message === UNAUTH) return;

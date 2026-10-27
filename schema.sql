@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS feeds (
 	folder_id INTEGER REFERENCES folders (id) ON DELETE SET NULL,
 	created_at INTEGER NOT NULL,
 	last_fetched_at INTEGER,
-	email TEXT
+	email TEXT,
+	image_url TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS feeds_email ON feeds (email) WHERE email IS NOT NULL;
