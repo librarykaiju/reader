@@ -54,7 +54,8 @@
 //                                  (podcasts/videos: each with notes, a short plain-text preview of its show notes)
 //   GET    /api/items/:id          one item, with its content
 //   PATCH  /api/items/:id          {read?, saved?, content?, media_pos?, media_len?} (read covers its whole story)
-//   POST   /api/items/mark-read    {feed?, tag?}
+//   POST   /api/items/mark-read    {feed?, tag?} or {ids: [...]} (ids: those items and their stories,
+//                                  as the list marks rows read on scroll)
 //   GET    /api/items/:id/coverage -> {"sources", "digest", "new_sources", "enabled"}: the article and its best
 //                                  match in each other feed from around the same time, and the newest saved digest
 //                                  covering it (null if none); new_sources counts matches that digest left out
@@ -1142,6 +1143,18 @@ async function updateItem(request, env, id) {
 
 async function markRead(request, env) {
 	const body = await readJSON(request);
+	if (body.ids !== undefined) {
+		if (!Array.isArray(body.ids) || body.ids.length > 500) throw new HttpError(400, "ids must be a list of up to 500 item ids");
+		const ids = JSON.stringify(body.ids.map(toId));
+		// One bound list (D1 allows 100 parameters), and each item's whole story with it.
+		const res = await env.DB.prepare(
+			`UPDATE items SET read = 1 WHERE read = 0 AND (id IN (SELECT value FROM json_each(?1))
+				OR story_id IN (SELECT story_id FROM items WHERE id IN (SELECT value FROM json_each(?1)) AND story_id IS NOT NULL))`,
+		)
+			.bind(ids)
+			.run();
+		return json({ marked: res.meta.changes });
+	}
 	let sql = "UPDATE items SET read = 1 WHERE read = 0";
 	if (body.feed == null) sql += " AND media_url IS NULL";
 	const params = [];
@@ -6457,6 +6470,11 @@ const PAGE = String.raw`<!doctype html>
 		<button type="button" data-font="serif">System serif</button>
 		<button type="button" data-font="fraunces" class="fraunces">Fraunces</button>
 	</div>
+	<h2>Mark read as I scroll</h2>
+	<div class="seg" id="scrollRead">
+		<button type="button" data-on="">Off</button>
+		<button type="button" data-on="1">On</button>
+	</div>
 	<a href="#/family" id="familyLink" class="btn small">Family library<span class="reqn" hidden></span></a>
 	<button id="forget" class="btn ghost small" type="button">Forget token on this device</button>
 </div>
@@ -8242,6 +8260,7 @@ function renderItems() {
 		frag.append(li);
 	});
 	ul.append(frag);
+	watchRows();
 	var empty = !state.items.length;
 	$("empty").textContent = !state.feeds.length ? "Add a website or feed to get started."
 		: state.view === "saved" ? "Nothing saved yet." : state.view === "unread" ? "All caught up." : "No items yet.";
@@ -8270,6 +8289,61 @@ function markButton(it, li) {
 		renderFeeds();
 	});
 	return b;
+}
+// Mark read as I scroll (a setting on each device; Unread only): a row that
+// has been on screen and then scrolls up past the header is read. Rows only
+// dim, so the list doesn't jump, and its checkmark brings one back. Coming
+// back from an article puts the list where it was, so for a moment after a
+// render a row passing the header only stops counting as seen.
+var scrollRead = read("readerScrollRead") === "1", rowIO = null, rowsAt = 0, readQueue = [], readTimer = 0;
+function applyScrollRead(on) {
+	scrollRead = on;
+	document.querySelectorAll("#scrollRead button").forEach(function (b) { b.setAttribute("aria-pressed", String(!!b.dataset.on === on)); });
+	if (state.route && LIST_VIEWS[state.route.name]) watchRows();
+}
+function watchRows() {
+	if (rowIO) { rowIO.disconnect(); rowIO = null; }
+	if (!scrollRead || state.view !== "unread" || !window.IntersectionObserver) return;
+	rowsAt = Date.now();
+	rowIO = new IntersectionObserver(rowsMoved, { rootMargin: -Math.round(headerBottom()) + "px 0px 0px 0px" });
+	$("items").querySelectorAll(":scope > li").forEach(function (li, i) { li.dataset.i = i; rowIO.observe(li); });
+}
+function rowsMoved(entries) {
+	if (!state.route || state.route.name !== "unread") return;
+	entries.forEach(function (e) {
+		var li = e.target, it = state.items[li.dataset.i];
+		// A hidden list (an article open over it) reports every row as gone.
+		if (!it || !e.rootBounds || !e.boundingClientRect.height) return;
+		if (e.isIntersecting) { li.seen = true; return; }
+		var passed = e.boundingClientRect.bottom <= e.rootBounds.top + 1;
+		if (!passed || !li.seen) return;
+		li.seen = false;
+		if (it.read || Date.now() - rowsAt < 700) return;
+		applyFlags(it, { read: 1 });
+		li.classList.add("read");
+		li.querySelectorAll(".rel li").forEach(function (r) { r.classList.add("read"); });
+		var b = li.querySelector(".mark");
+		if (b) { b.setAttribute("aria-label", "Mark unread"); b.title = "Mark unread"; }
+		readQueue.push(it);
+		if (!readTimer) readTimer = setTimeout(flushRead, 2000);
+	});
+}
+function flushRead(leaving) {
+	clearTimeout(readTimer);
+	readTimer = 0;
+	if (!readQueue.length) return;
+	var batch = readQueue;
+	readQueue = [];
+	renderFeeds();
+	api("/api/items/mark-read", { method: "POST", json: { ids: batch.map(function (it) { return it.id; }) }, keepalive: !!leaving })
+		.then(function (res) { if (!res.ok) throw new Error("HTTP " + res.status); })
+		.catch(function (e) {
+			if (leaving) return;
+			batch.forEach(function (it) { applyFlags(it, { read: 0 }); });
+			renderItems();
+			renderFeeds();
+			fail(e);
+		});
 }
 function renderTabs(name) {
 	var sub = listQuery(state.feed, state.tag);
@@ -8324,6 +8398,7 @@ async function route() {
 	openBookMenu(false);
 	if (details) closeDetails();
 	closeBookCtx();
+	flushRead();
 	renderPlayer();
 	state.item = null;
 	try {
@@ -13647,6 +13722,12 @@ $("fonts").addEventListener("click", function (e) {
 	applyFont(b.dataset.font);
 	store("readerFont", readFont === "fraunces" ? "fraunces" : null);
 });
+$("scrollRead").addEventListener("click", function (e) {
+	var b = e.target.closest("button");
+	if (!b) return;
+	store("readerScrollRead", b.dataset.on || null);
+	applyScrollRead(!!b.dataset.on);
+});
 $("forget").addEventListener("click", function () { store("readerToken", null); openSettings(false); askToken(); });
 $("addForm").addEventListener("submit", addFeed);
 $("addTag").addEventListener("change", async function () {
@@ -13738,6 +13819,8 @@ $("bookFile").addEventListener("change", function () {
 });
 document.addEventListener("visibilitychange", function () { if (document.visibilityState === "hidden" && session) flushPosition(session, true); });
 window.addEventListener("pagehide", function () { if (session) flushPosition(session, true); });
+document.addEventListener("visibilitychange", function () { if (document.visibilityState === "hidden") flushRead(true); });
+window.addEventListener("pagehide", function () { flushRead(true); });
 if ("scrollRestoration" in history) history.scrollRestoration = "manual";
 
 async function start() {
@@ -13775,6 +13858,7 @@ if (location.pathname !== "/") {
 applyTheme(read("readerTheme"));
 applySize(fontSize);
 applyFont(readFont);
+applyScrollRead(scrollRead);
 if (token()) start(); else askToken();
 </script>
 </body>
