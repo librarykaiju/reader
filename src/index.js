@@ -9988,6 +9988,9 @@ function findListed(id) { return state.episodes.filter(function (e) { return e.i
 		}
 		saveEpisodePos(true);
 		if (player.ep) repaintEpisode(player.ep.id);
+		// An end-of-chapter timer set on an audiobook ends with a podcast
+		// episode instead: it has no chapters, and the episode is its one.
+		if (sleep.end != null) sleepNow();
 	});
 	audio.addEventListener("ratechange", renderPlayer);
 	$("pPlay").addEventListener("click", function () {
@@ -10589,7 +10592,8 @@ function chapterStep(by) {
 
 // The sleep timer, set on the player page: pause after some minutes of
 // listening (the last 10 seconds fade out where the browser lets a page set
-// the volume), or at the end of the chapter playing. It counts only while
+// the volume), or at the end of the chapter playing (of the episode, for a
+// podcast). It counts only while
 // something plays, and goes with the bar's ×.
 var sleep = { left: null, end: null, last: 0, timer: null };
 // Where the chapter at t ends in the whole book (its end, with no chapters).
@@ -10603,7 +10607,7 @@ function setSleep(v) {
 	clearInterval(sleep.timer);
 	sleep.left = sleep.end = sleep.timer = null;
 	audio.volume = 1;
-	if (v === "chapter" && player.ep && player.ep.book) sleep.end = sleepChapterEnd(abNow());
+	if (v === "chapter" && player.ep) sleep.end = player.ep.book ? sleepChapterEnd(abNow()) : player.ep.duration || 0;
 	else if (v !== "off" && v != null) {
 		sleep.left = Number(v) * 60;
 		sleep.last = Date.now();
