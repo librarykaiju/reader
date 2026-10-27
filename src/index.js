@@ -6197,16 +6197,18 @@ const PAGE = String.raw`<!doctype html>
 	.lpctl { display: flex; align-items: center; justify-content: space-between; gap: 4px; max-width: 360px; margin: 14px 0 0; }
 	.lpctl .btn { min-width: 48px; min-height: 48px; padding-inline: 6px; font-variant-numeric: tabular-nums; }
 	.lpctl svg { width: 22px; height: 22px; fill: currentColor; display: block; margin: auto; }
-	#lpPlay { min-width: 68px; min-height: 68px; border-radius: 50%; font-size: 22px; }
+	#lpPlay { flex: none; width: 68px; height: 68px; min-width: 0; padding: 0; border-radius: 50%; font-size: 22px; }
 	.lpmore { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-top: 14px; font-size: 14px; color: var(--muted); }
-	.lpmore #lpRate { font-variant-numeric: tabular-nums; }
+	.lpmore #lpRate, #lpSleep { font-variant-numeric: tabular-nums; }
+	#lpSleep.on { border-color: var(--accent); color: var(--accent); }
+	.lpsleep { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 	#lpChapters { max-height: 420px; }
 	@media (max-width: 640px) {
 		.lplay { grid-template-columns: minmax(0, 1fr); gap: 20px; margin-top: 8px; }
 		.lpcov { width: 80%; max-width: 340px; margin: 0 auto; }
 		.lpmain { text-align: center; }
 		.lpctl { margin-inline: auto; }
-		.lpmore { justify-content: center; }
+		.lpmore, .lpsleep { justify-content: center; }
 	}
 	@media (max-width: 640px) {
 		.rec { grid-template-columns: minmax(0, 1fr); gap: 18px; }
@@ -6391,7 +6393,15 @@ const PAGE = String.raw`<!doctype html>
 	#pName { font-weight: 600; font-size: 14px; }
 	.ptime { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 	.prow .btn { min-width: 40px; padding-inline: 6px; font-variant-numeric: tabular-nums; }
-	#pPlay { min-width: 48px; border-radius: 50%; min-height: 44px; }
+	#pPlay { flex: none; width: 46px; height: 46px; min-width: 0; min-height: 0; padding: 0; border-radius: 50%; }
+	/* The bar's and the player page's sliders: drawn here, so the thumb is a round dot in every browser and theme. */
+	.seek { -webkit-appearance: none; appearance: none; height: 22px; background: none; cursor: pointer; --p: 0%; --ring: var(--card); }
+	.seek::-webkit-slider-runnable-track { height: 6px; border-radius: 3px; background: linear-gradient(to right, var(--accent) var(--p), var(--line) var(--p)); }
+	.seek::-moz-range-track { height: 6px; border-radius: 3px; background: var(--line); }
+	.seek::-moz-range-progress { height: 6px; border-radius: 3px; background: var(--accent); }
+	.seek::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 18px; height: 18px; margin-top: -6px; border-radius: 50%; background: var(--accent); border: 3px solid var(--ring); box-shadow: 0 0 0 1px var(--accent); }
+	.seek::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: var(--accent); border: 3px solid var(--ring); box-shadow: 0 0 0 1px var(--accent); }
+	#lpSeek { --ring: var(--bg); }
 	@media (max-width: 420px) { #pRate, #pClose { padding-inline: 2px; min-width: 32px; } .tabs a { font-size: 14px; } }
 	/* The bookmark button in a book's top bar: filled once one is set. */
 	#markBtn { padding-inline: 10px; display: flex; align-items: center; }
@@ -6659,7 +6669,7 @@ const PAGE = String.raw`<!doctype html>
 			<h2 id="lpTitle" class="rtitle"></h2>
 			<p id="lpBy" class="rby"></p>
 			<p id="lpChap" class="lpchap"></p>
-			<input id="lpSeek" type="range" min="0" max="1000" value="0" step="1" aria-label="Position in chapter">
+			<input id="lpSeek" class="seek" type="range" min="0" max="1000" value="0" step="1" aria-label="Position in chapter">
 			<div class="lptimes"><span id="lpPos"></span><span id="lpLeft"></span></div>
 			<div class="lpctl">
 				<button id="lpPrev" class="btn ghost" type="button" aria-label="Previous chapter"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h2.2v14H6zM19 5v14L9.5 12z"/></svg></button>
@@ -6670,8 +6680,17 @@ const PAGE = String.raw`<!doctype html>
 			</div>
 			<div class="lpmore">
 				<button id="lpRate" class="btn small" type="button" aria-label="Playback speed">1&times;</button>
+				<button id="lpSleep" class="btn small" type="button" aria-expanded="false" aria-controls="lpSleepOpts">Sleep</button>
 				<span id="lpBook"></span>
 				<a id="lpRecord" href="#/library">Record</a>
+			</div>
+			<div id="lpSleepOpts" class="lpsleep" role="group" aria-label="Sleep timer" hidden>
+				<button class="btn small" type="button" data-sleep="15">15 min</button>
+				<button class="btn small" type="button" data-sleep="30">30 min</button>
+				<button class="btn small" type="button" data-sleep="45">45 min</button>
+				<button class="btn small" type="button" data-sleep="60">1 h</button>
+				<button class="btn small" type="button" data-sleep="chapter">End of chapter</button>
+				<button class="btn small" type="button" data-sleep="off">Off</button>
 			</div>
 		</div>
 	</div>
@@ -6694,7 +6713,7 @@ const PAGE = String.raw`<!doctype html>
 </section>
 </main>
 <div id="pbar" class="pbar" hidden>
-	<input id="pSeek" type="range" min="0" max="1000" value="0" step="1" aria-label="Position in episode">
+	<input id="pSeek" class="seek" type="range" min="0" max="1000" value="0" step="1" aria-label="Position in episode">
 	<div class="prow">
 		<button id="pTitle" class="ptitle" type="button"><span id="pName"></span><span id="pTime" class="ptime"></span></button>
 		<button id="pBack" class="btn ghost" type="button" aria-label="Back 15 seconds">&#8634;15</button>
@@ -9599,10 +9618,13 @@ function renderPlayer() {
 	$("pName").textContent = ep.title;
 	$("pTime").textContent = (ep.feed_title ? ep.feed_title + " · " : "") + clock(pos) + (dur ? " / " + clock(dur) : "");
 	if (!state.seeking) $("pSeek").value = dur ? Math.round(pos / dur * 1000) : 0;
+	seekFill($("pSeek"));
 	$("pPlay").innerHTML = audio.paused ? "&#9654;" : "&#10074;&#10074;";
 	$("pPlay").setAttribute("aria-label", audio.paused ? "Play" : "Pause");
 	$("pRate").textContent = player.rate + "×";
 }
+// The played part of a slider (0 to 1000), for browsers that draw only the track.
+function seekFill(el) { el.style.setProperty("--p", el.value / 10 + "%"); }
 function setSession(ep) {
 	if (!("mediaSession" in navigator)) return;
 	try {
@@ -9699,6 +9721,7 @@ function findListed(id) { return state.episodes.filter(function (e) { return e.i
 	$("pTitle").addEventListener("click", function () { if (player.ep) location.hash = player.ep.book ? "#/listen/" + player.ep.book : "#/item/" + player.ep.id; });
 	$("pSeek").addEventListener("input", function () {
 		state.seeking = true;
+		seekFill(this);
 		var dur = player.ep && player.ep.book ? abTotal(player.ep) : audio.duration || epLen(player.ep || {});
 		if (dur) $("pTime").textContent = clock(this.value / 1000 * dur) + " / " + clock(dur);
 	});
@@ -10075,6 +10098,7 @@ function abSeek(t, play) {
 		if (play) audio.play().catch(playFailed);
 	}
 	player.ep.t = t;
+	if (sleep.end != null) sleep.end = sleepChapterEnd(t);
 	renderPlayer();
 }
 async function abLoad(n, at, play) {
@@ -10187,6 +10211,7 @@ function renderListen() {
 	$("lpChap").textContent = n > 1 && c ? (c.title || "Chapter " + (ch.i + 1)) : "";
 	if (!state.lpSeeking) {
 		$("lpSeek").value = len ? Math.round((t - ch.start) / len * 1000) : 0;
+		seekFill($("lpSeek"));
 		$("lpPos").textContent = clock(Math.max(0, t - ch.start));
 		$("lpLeft").textContent = "−" + clock(Math.max(0, ch.end - t));
 	}
@@ -10195,6 +10220,8 @@ function renderListen() {
 	$("lpPlay").setAttribute("aria-label", playing ? "Pause" : "Play");
 	$("lpNext").disabled = !(n > 1 && ch.i + 1 < n);
 	$("lpRate").textContent = player.rate + "×";
+	$("lpSleep").textContent = sleep.left != null ? "Sleep · " + clock(Math.ceil(sleep.left)) : sleep.end != null ? "Sleep · end of chapter" : "Sleep";
+	$("lpSleep").classList.toggle("on", sleep.left != null || sleep.end != null);
 	$("lpBook").textContent = (n > 1 && ch.i >= 0 ? "Chapter " + (ch.i + 1) + " of " + n + " · " : "") + hours(Math.max(0, total - t)) + " left";
 	if (ch.i !== lp.cur) {
 		lp.cur = ch.i;
@@ -10236,6 +10263,7 @@ function chapterStep(by) {
 	$("lpSeek").addEventListener("input", function () {
 		if (!state.listen) return;
 		state.lpSeeking = true;
+		seekFill(this);
 		var x = at(this.value);
 		$("lpPos").textContent = clock(x.t - x.ch.start);
 		$("lpLeft").textContent = "−" + clock(Math.max(0, x.ch.end - x.t));
@@ -10243,6 +10271,63 @@ function chapterStep(by) {
 	$("lpSeek").addEventListener("change", function () {
 		state.lpSeeking = false;
 		if (state.listen) listenGo(at(this.value).t);
+	});
+})();
+
+// The sleep timer, set on the player page: pause after some minutes of
+// listening (the last 10 seconds fade out where the browser lets a page set
+// the volume), or at the end of the chapter playing. It counts only while
+// something plays, and goes with the bar's ×.
+var sleep = { left: null, end: null, last: 0, timer: null };
+// Where the chapter at t ends in the whole book (its end, with no chapters).
+function sleepChapterEnd(t) {
+	var ab = player.ab, cs = (player.ep && listenCache[player.ep.book] || {}).chapters || [];
+	var next = cs.filter(function (c) { return c.start > t + 0.5; })[0];
+	return next ? next.start : ab ? ab.total : (player.ep && player.ep.duration) || 0;
+}
+function setSleep(v) {
+	var audio = $("pAudio");
+	clearInterval(sleep.timer);
+	sleep.left = sleep.end = sleep.timer = null;
+	audio.volume = 1;
+	if (v === "chapter" && player.ep && player.ep.book) sleep.end = sleepChapterEnd(abNow());
+	else if (v !== "off" && v != null) {
+		sleep.left = Number(v) * 60;
+		sleep.last = Date.now();
+		sleep.timer = setInterval(sleepTick, 1000);
+	}
+	renderListen();
+}
+function sleepTick() {
+	var audio = $("pAudio"), now = Date.now();
+	if (!audio.paused) sleep.left -= (now - sleep.last) / 1000;
+	sleep.last = now;
+	if (sleep.left <= 0) return sleepNow();
+	audio.volume = clamp(sleep.left / 10, 0, 1);
+	renderListen();
+}
+function sleepNow() {
+	$("pAudio").pause();
+	setSleep("off");
+	toast("Sleep timer: paused.");
+}
+(function () {
+	var audio = $("pAudio");
+	audio.addEventListener("timeupdate", function () {
+		if (sleep.end != null && !audio.paused && player.ab && abNow() >= sleep.end - 0.3) sleepNow();
+	});
+	$("pClose").addEventListener("click", function () { setSleep("off"); });
+	$("lpSleep").addEventListener("click", function () {
+		var open = $("lpSleepOpts").hidden;
+		show($("lpSleepOpts"), open);
+		this.setAttribute("aria-expanded", String(open));
+	});
+	$("lpSleepOpts").addEventListener("click", function (e) {
+		var b = e.target.closest("button");
+		if (!b) return;
+		setSleep(b.dataset.sleep);
+		show($("lpSleepOpts"), false);
+		$("lpSleep").setAttribute("aria-expanded", "false");
 	});
 })();
 
