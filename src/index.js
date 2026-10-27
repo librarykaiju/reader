@@ -6186,14 +6186,16 @@ const PAGE = String.raw`<!doctype html>
 	.lpctl svg { width: 22px; height: 22px; fill: currentColor; display: block; margin: auto; }
 	#lpPlay { min-width: 68px; min-height: 68px; border-radius: 50%; font-size: 22px; }
 	.lpmore { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-top: 14px; font-size: 14px; color: var(--muted); }
-	.lpmore #lpRate { font-variant-numeric: tabular-nums; }
+	.lpmore #lpRate, #lpSleep { font-variant-numeric: tabular-nums; }
+	#lpSleep.on { border-color: var(--accent); color: var(--accent); }
+	.lpsleep { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 	#lpChapters { max-height: 420px; }
 	@media (max-width: 640px) {
 		.lplay { grid-template-columns: minmax(0, 1fr); gap: 20px; margin-top: 8px; }
 		.lpcov { width: 80%; max-width: 340px; margin: 0 auto; }
 		.lpmain { text-align: center; }
 		.lpctl { margin-inline: auto; }
-		.lpmore { justify-content: center; }
+		.lpmore, .lpsleep { justify-content: center; }
 	}
 	@media (max-width: 640px) {
 		.rec { grid-template-columns: minmax(0, 1fr); gap: 18px; }
@@ -6652,8 +6654,17 @@ const PAGE = String.raw`<!doctype html>
 			</div>
 			<div class="lpmore">
 				<button id="lpRate" class="btn small" type="button" aria-label="Playback speed">1&times;</button>
+				<button id="lpSleep" class="btn small" type="button" aria-expanded="false" aria-controls="lpSleepOpts">Sleep</button>
 				<span id="lpBook"></span>
 				<a id="lpRecord" href="#/library">Record</a>
+			</div>
+			<div id="lpSleepOpts" class="lpsleep" role="group" aria-label="Sleep timer" hidden>
+				<button class="btn small" type="button" data-sleep="15">15 min</button>
+				<button class="btn small" type="button" data-sleep="30">30 min</button>
+				<button class="btn small" type="button" data-sleep="45">45 min</button>
+				<button class="btn small" type="button" data-sleep="60">1 h</button>
+				<button class="btn small" type="button" data-sleep="chapter">End of chapter</button>
+				<button class="btn small" type="button" data-sleep="off">Off</button>
 			</div>
 		</div>
 	</div>
@@ -10000,6 +10011,7 @@ function abSeek(t, play) {
 		if (play) audio.play().catch(playFailed);
 	}
 	player.ep.t = t;
+	if (sleep.end != null) sleep.end = sleepChapterEnd(t);
 	renderPlayer();
 }
 async function abLoad(n, at, play) {
@@ -10120,6 +10132,8 @@ function renderListen() {
 	$("lpPlay").setAttribute("aria-label", playing ? "Pause" : "Play");
 	$("lpNext").disabled = !(n > 1 && ch.i + 1 < n);
 	$("lpRate").textContent = player.rate + "×";
+	$("lpSleep").textContent = sleep.left != null ? "Sleep · " + clock(Math.ceil(sleep.left)) : sleep.end != null ? "Sleep · end of chapter" : "Sleep";
+	$("lpSleep").classList.toggle("on", sleep.left != null || sleep.end != null);
 	$("lpBook").textContent = (n > 1 && ch.i >= 0 ? "Chapter " + (ch.i + 1) + " of " + n + " · " : "") + hours(Math.max(0, total - t)) + " left";
 	if (ch.i !== lp.cur) {
 		lp.cur = ch.i;
@@ -10168,6 +10182,63 @@ function chapterStep(by) {
 	$("lpSeek").addEventListener("change", function () {
 		state.lpSeeking = false;
 		if (state.listen) listenGo(at(this.value).t);
+	});
+})();
+
+// The sleep timer, set on the player page: pause after some minutes of
+// listening (the last 10 seconds fade out where the browser lets a page set
+// the volume), or at the end of the chapter playing. It counts only while
+// something plays, and goes with the bar's ×.
+var sleep = { left: null, end: null, last: 0, timer: null };
+// Where the chapter at t ends in the whole book (its end, with no chapters).
+function sleepChapterEnd(t) {
+	var ab = player.ab, cs = (player.ep && listenCache[player.ep.book] || {}).chapters || [];
+	var next = cs.filter(function (c) { return c.start > t + 0.5; })[0];
+	return next ? next.start : ab ? ab.total : (player.ep && player.ep.duration) || 0;
+}
+function setSleep(v) {
+	var audio = $("pAudio");
+	clearInterval(sleep.timer);
+	sleep.left = sleep.end = sleep.timer = null;
+	audio.volume = 1;
+	if (v === "chapter" && player.ep && player.ep.book) sleep.end = sleepChapterEnd(abNow());
+	else if (v !== "off" && v != null) {
+		sleep.left = Number(v) * 60;
+		sleep.last = Date.now();
+		sleep.timer = setInterval(sleepTick, 1000);
+	}
+	renderListen();
+}
+function sleepTick() {
+	var audio = $("pAudio"), now = Date.now();
+	if (!audio.paused) sleep.left -= (now - sleep.last) / 1000;
+	sleep.last = now;
+	if (sleep.left <= 0) return sleepNow();
+	audio.volume = clamp(sleep.left / 10, 0, 1);
+	renderListen();
+}
+function sleepNow() {
+	$("pAudio").pause();
+	setSleep("off");
+	toast("Sleep timer: paused.");
+}
+(function () {
+	var audio = $("pAudio");
+	audio.addEventListener("timeupdate", function () {
+		if (sleep.end != null && !audio.paused && player.ab && abNow() >= sleep.end - 0.3) sleepNow();
+	});
+	$("pClose").addEventListener("click", function () { setSleep("off"); });
+	$("lpSleep").addEventListener("click", function () {
+		var open = $("lpSleepOpts").hidden;
+		show($("lpSleepOpts"), open);
+		this.setAttribute("aria-expanded", String(open));
+	});
+	$("lpSleepOpts").addEventListener("click", function (e) {
+		var b = e.target.closest("button");
+		if (!b) return;
+		setSleep(b.dataset.sleep);
+		show($("lpSleepOpts"), false);
+		$("lpSleep").setAttribute("aria-expanded", "false");
 	});
 })();
 
