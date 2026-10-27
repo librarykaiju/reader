@@ -5828,7 +5828,7 @@ const PAGE = String.raw`<!doctype html>
 		--serif: ui-serif, "New York", "Iowan Old Style", Charter, Georgia, serif;
 		/* Headings and book titles. Small text (buttons, menus, tags) stays --sans. */
 		--display: "Fraunces", var(--serif);
-		/* What articles and books are set in: --serif, or --display when chosen in Aa. */
+		/* What articles and books are set in: --serif, or --display when chosen in settings. */
 		--read: var(--serif);
 		--sans: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", sans-serif;
 		--reader-size: 19px;
@@ -6262,8 +6262,9 @@ const PAGE = String.raw`<!doctype html>
 	.people .who b { display: block; font: 500 18px/1.25 var(--display); }
 	.people .who span { color: var(--muted); font-size: 14px; }
 	.people .acts { display: flex; gap: 8px; flex: none; }
-	/* Library card requests waiting: a dot on Aa, a count on Family library. */
-	#settingsBtn { position: relative; }
+	/* Library card requests waiting: a dot on the settings gear, a count on Family library. */
+	#settingsBtn { position: relative; padding-inline: 10px; display: flex; align-items: center; }
+	#settingsBtn svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 	.reqdot { position: absolute; top: -3px; right: -3px; width: 12px; height: 12px; border-radius: 50%; background: var(--bad); border: 2px solid var(--bg); }
 	.reqn { display: inline-block; min-width: 20px; margin-left: 6px; padding: 0 6px; border-radius: 999px; background: var(--bad); color: #fff; font-size: 12px; font-weight: 700; line-height: 20px; text-align: center; }
 	.people .req { background: var(--sel); border-radius: 10px; padding: 12px; margin-bottom: 8px; border-bottom: 0; }
@@ -6442,7 +6443,7 @@ const PAGE = String.raw`<!doctype html>
 		<button id="markBtn" class="btn" type="button" aria-label="Bookmark this place" aria-pressed="false" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg></button>
 		<button id="refresh" class="btn" type="button">Refresh</button>
 		<button id="bookMenuBtn" class="btn" type="button" aria-label="Book options" aria-expanded="false" aria-controls="bookMenu" hidden>&#8943;</button>
-		<button id="settingsBtn" class="btn" type="button" aria-label="Display settings" aria-expanded="false" aria-controls="settings">Aa<span class="reqdot" hidden></span></button>
+		<button id="settingsBtn" class="btn" type="button" aria-label="Display settings" aria-expanded="false" aria-controls="settings"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span class="reqdot" hidden></span></button>
 	</div>
 	<nav id="tabs" class="tabs" aria-label="Views">
 		<a href="#/unread" data-view="unread">Unread</a>
@@ -8339,19 +8340,37 @@ function rowsMoved(entries) {
 function flushRead(leaving) {
 	clearTimeout(readTimer);
 	readTimer = 0;
-	if (!readQueue.length) return;
-	var batch = readQueue;
-	readQueue = [];
-	renderFeeds();
-	api("/api/items/mark-read", { method: "POST", json: { ids: batch.map(function (it) { return it.id; }) }, keepalive: !!leaving })
-		.then(function (res) { if (!res.ok) throw new Error("HTTP " + res.status); })
-		.catch(function (e) {
-			if (leaving) return;
-			batch.forEach(function (it) { applyFlags(it, { read: 0 }); });
-			renderItems();
-			renderFeeds();
-			fail(e);
-		});
+	if (readQueue.length) {
+		queueReads(readQueue.map(function (it) { return it.id; }));
+		readQueue = [];
+		renderFeeds();
+	}
+	sendPendingReads(!!leaving);
+}
+// Read marks the Worker hasn't confirmed yet (offline, a dropped request, the
+// app put away mid-send) wait in localStorage and go again on the next
+// chance, instead of being lost: a read here that never reached the Worker
+// comes back unread on every other device.
+function pendingReads() { return readJSON("readerPendingReads") || []; }
+function keepPending(ids) { store("readerPendingReads", ids.length ? JSON.stringify(ids.slice(-500)) : null); }
+function queueReads(ids) {
+	var p = pendingReads();
+	ids.forEach(function (id) { if (p.indexOf(id) < 0) p.push(id); });
+	keepPending(p);
+}
+function dropPending(id) { keepPending(pendingReads().filter(function (x) { return x !== id; })); }
+var sendingReads = false;
+async function sendPendingReads(keepalive) {
+	var ids = pendingReads();
+	if (!ids.length || sendingReads || !token()) return;
+	sendingReads = true;
+	try {
+		var res = await api("/api/items/mark-read", { method: "POST", json: { ids: ids }, keepalive: !!keepalive });
+		if (res.ok) keepPending(pendingReads().filter(function (id) { return ids.indexOf(id) < 0; }));
+	} catch (e) {
+	} finally {
+		sendingReads = false;
+	}
 }
 function renderTabs(name) {
 	var sub = listQuery(state.feed, state.tag);
@@ -8583,7 +8602,7 @@ function personStatus(p) {
 	return bits.join(" · ");
 }
 // Library card requests: checked when Reader opens, when it comes back to the
-// front, and every 5 minutes while it's showing. Waiting ones put a dot on Aa,
+// front, and every 5 minutes while it's showing. Waiting ones put a dot on the gear,
 // a count on Family library and (where the browser allows, as a Home Screen
 // app with notifications allowed) on the app icon; one that's new since this
 // device last looked gets a toast.
@@ -9066,9 +9085,12 @@ function renderItemButtons() {
 async function setFlags(it, patch) {
 	var row = storyRow(it), before = { read: row ? row.read : it.read, saved: it.saved };
 	applyFlags(it, patch);
+	if (patch.read === 0) dropPending(it.id);
 	try {
 		await apiJSON("/api/items/" + it.id, { method: "PATCH", json: patch });
 	} catch (e) {
+		// Read stays read here and is sent again later (see pendingReads).
+		if (e.message !== UNAUTH && patch.read === 1 && patch.saved == null) return queueReads([it.id]);
 		applyFlags(it, before);
 		fail(e);
 	}
@@ -13835,6 +13857,27 @@ document.addEventListener("visibilitychange", function () { if (document.visibil
 window.addEventListener("pagehide", function () { if (session) flushPosition(session, true); });
 document.addEventListener("visibilitychange", function () { if (document.visibilityState === "hidden") flushRead(true); });
 window.addEventListener("pagehide", function () { flushRead(true); });
+window.addEventListener("online", function () { sendPendingReads(); });
+// A phone keeps a home-screen app open for days, so coming back to it after a
+// while fetches the list again: what was read on another device meanwhile
+// would otherwise still show here as unread. Waiting read marks go first.
+var hiddenAt = 0;
+document.addEventListener("visibilitychange", function () {
+	if (document.visibilityState === "hidden") { hiddenAt = Date.now(); return; }
+	var away = hiddenAt ? Date.now() - hiddenAt : 0;
+	hiddenAt = 0;
+	if (away < 60 * 1000 || !started || !token()) return;
+	resync().catch(function () {});
+});
+async function resync() {
+	await sendPendingReads();
+	await loadFeeds();
+	if (state.route && LIST_VIEWS[state.route.name]) {
+		await loadItems(false);
+		window.scrollTo(0, 0);
+	} else state.stale = true;
+	refreshAll(false);
+}
 if ("scrollRestoration" in history) history.scrollRestoration = "manual";
 
 async function start() {
@@ -13842,6 +13885,7 @@ async function start() {
 	show($("app"), true);
 	$("feedsBox").open = matchMedia("(min-width: 900px)").matches || read("readerFeedsOpen") === "1";
 	try {
+		await sendPendingReads();
 		await Promise.all([loadTags(), loadFeeds()]);
 	} catch (e) {
 		if (e.message === UNAUTH) return;

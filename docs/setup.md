@@ -284,8 +284,8 @@ A migration that already ran stops with an error such as "duplicate column name"
   2. Copy the **Site key** into `wrangler.toml` under `[vars]` as `TURNSTILE_SITE_KEY = "..."`.
   3. Set the **Secret key** with `npx wrangler secret put TURNSTILE_SECRET` and paste it.
   4. `npx wrangler deploy`. The check shows on the form once someone taps **Request your library card**, and usually passes by itself. Until both keys are set, the form works without it.
-- When a request is waiting, **Aa** gets a red dot and **Family library** a count, and a request that's new to this device pops up a message with **See**. Reader checks when it opens, when you come back to it, and every 5 minutes while it's showing. The Home Screen icon shows the count too where the browser supports it; on an iPhone or iPad that needs notifications allowed for Reader, which it doesn't ask for yet.
-- **Aa** → **Family library**. Type a name → **Make link**, then **Copy** or **Share** it to them. The link works once: opening it signs that browser in (a cookie that lasts a year and renews on each visit) and changes the address to the plain `reader.brandonj.ink/library`, which is the one to bookmark. An unused link runs out after 7 days.
+- When a request is waiting, the **settings gear** gets a red dot and **Family library** a count, and a request that's new to this device pops up a message with **See**. Reader checks when it opens, when you come back to it, and every 5 minutes while it's showing. The Home Screen icon shows the count too where the browser supports it; on an iPhone or iPad that needs notifications allowed for Reader, which it doesn't ask for yet.
+- **Settings** (the gear) → **Family library**. Type a name → **Make link**, then **Copy** or **Share** it to them. The link works once: opening it signs that browser in (a cookie that lasts a year and renews on each visit) and changes the address to the plain `reader.brandonj.ink/library`, which is the one to bookmark. An unused link runs out after 7 days.
 - The first time someone opens their link they get a welcome page: the plain address to keep and how to save it on their device (Home Screen or bookmark), then **Go to the library**. It's there again from **How to save this page** at the bottom. Set your name for it with `OWNER_NAME` in `wrangler.toml`.
 - Their page is always in the Sepia colors: covers (a series is one cover that opens to its volumes), search by title, author or series, and filters for format (EPUB, PDF, Comics, Text) and tag. Tapping a book downloads it, saved as `Title - Author.epub`. Nothing else is open to them: no feeds, places, highlights, Edit details, uploads or deletes. Put the tag **Hide from family** on any book to keep it out of their view.
 - Each person can download 10 different books in any 24 hours (taking the same book again doesn't count twice). Their page shows how many they have left, and a tap past the limit says to come back tomorrow. The number is `DOWNLOADS_PER_DAY` in `src/index.js`; you have no limit.
@@ -293,7 +293,7 @@ A migration that already ran stops with an error such as "duplicate column name"
 - On the Family screen, **N downloads ›** under a person lists what they downloaded and when.
 - **New link** makes a fresh link and signs them out everywhere (a lost phone, a forwarded link). **Remove** cuts them off at once. Links are shown only when made, since only a scrambled copy is stored; if one gets lost, make a new one.
 
-**Display:** **Aa** switches the theme and text size, remembered per device. **Auto** follows the phone's light or dark setting. In Dark and Sepia, PDF pages are re-tinted to match.
+**Display:** the **settings gear** switches the theme and text size, remembered per device. **Auto** follows the phone's light or dark setting. In Dark and Sepia, PDF pages are re-tinted to match.
 
 ## Part 6: Newsletters by email
 
@@ -373,4 +373,4 @@ How it behaves:
 | A newsletter never shows up | **Email Routing** → **Activity log** shows whether the mail arrived and what the Worker did. A sender you removed before is ignored until you take it off `email_blocked`. |
 | Other errors | Worker → **Logs** in Cloudflare. |
 
-To change the token, update `READER_TOKEN` in Cloudflare, then **Aa** → **Forget token on this device** and enter the new one.
+To change the token, update `READER_TOKEN` in Cloudflare, then **Settings** (the gear) → **Forget token on this device** and enter the new one.
