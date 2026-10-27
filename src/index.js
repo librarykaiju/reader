@@ -6202,8 +6202,8 @@ const PAGE = String.raw`<!doctype html>
 	.lpctl svg { width: 22px; height: 22px; fill: currentColor; display: block; margin: auto; }
 	#lpPlay { flex: none; width: 68px; height: 68px; min-width: 0; padding: 0; border-radius: 50%; font-size: 22px; }
 	.lpmore { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-top: 14px; font-size: 14px; color: var(--muted); }
-	.lpmore #lpRate, #lpSleep { font-variant-numeric: tabular-nums; }
-	#lpSleep.on { border-color: var(--accent); color: var(--accent); }
+	.lpmore #lpRate, .sleepbtn { font-variant-numeric: tabular-nums; }
+	.sleepbtn.on { border-color: var(--accent); color: var(--accent); }
 	.lpsleep { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 	#lpChapters { max-height: 420px; }
 	@media (max-width: 640px) {
@@ -6416,6 +6416,7 @@ const PAGE = String.raw`<!doctype html>
 	.coverage .kind { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-right: 4px; }
 	.coverage .quote { display: block; margin-top: 2px; color: var(--muted); font-size: 14px; font-style: italic; overflow-wrap: anywhere; }
 	.coverage .fine { color: var(--muted); font-size: 13px; margin: 12px 0 0; }
+	.episode .lpsleep { width: 100%; margin-top: 0; }
 	.episode .when { color: var(--muted); font-size: 14px; font-variant-numeric: tabular-nums; }
 	.btn.on { border-color: var(--accent); color: var(--accent); }
 	body.has-pbar { padding-bottom: calc(96px + env(safe-area-inset-bottom)); }
@@ -6730,7 +6731,7 @@ const PAGE = String.raw`<!doctype html>
 			</div>
 			<div class="lpmore">
 				<button id="lpRate" class="btn small" type="button" aria-label="Playback speed">1&times;</button>
-				<button id="lpSleep" class="btn small" type="button" aria-expanded="false" aria-controls="lpSleepOpts">Sleep</button>
+				<button id="lpSleep" class="btn small sleepbtn" type="button" aria-controls="lpSleepOpts">Sleep</button>
 				<span id="lpBook"></span>
 				<a id="lpRecord" href="#/library">Record</a>
 			</div>
@@ -9613,7 +9614,16 @@ function renderEpisodeBox() {
 	var ep = state.itemEp;
 	show(box, !!ep);
 	if (!ep) return;
-	if (isAudio(ep)) box.append(playButton(ep, false), downloadButton(ep, false), h("span", "when", epStatus(ep)));
+	if (isAudio(ep)) {
+		var sb = h("button", "btn small sleepbtn", "Sleep"), so = sleepOptions("End of episode");
+		sb.type = "button";
+		sb.dataset.ep = ep.id;
+		so.id = "aSleepOpts";
+		sb.setAttribute("aria-controls", so.id);
+		sleepPicker(sb, so);
+		box.append(playButton(ep, false), downloadButton(ep, false), sb, h("span", "when", epStatus(ep)), so);
+		paintSleep();
+	}
 	else if (isHosted(ep)) videoBox.hosted(box, ep);
 	else videoBox.file(box, ep);
 }
@@ -9871,6 +9881,7 @@ function playFailed(e) {
 }
 function renderPlayer() {
 	var ep = player.ep, audio = $("pAudio");
+	paintSleep();
 	// The player page has the bar's controls, so the bar steps aside there.
 	// It only shows with the things it plays: Podcasts, Videos (and an episode
 	// opened from them or from the bar) and the Library, not the feed lists or articles.
@@ -9988,8 +9999,7 @@ function findListed(id) { return state.episodes.filter(function (e) { return e.i
 		}
 		saveEpisodePos(true);
 		if (player.ep) repaintEpisode(player.ep.id);
-		// An end-of-chapter timer set on an audiobook ends with a podcast
-		// episode instead: it has no chapters, and the episode is its one.
+		// A podcast has no chapters: its end-of-chapter timer is the episode's end.
 		if (sleep.end != null) sleepNow();
 	});
 	audio.addEventListener("ratechange", renderPlayer);
@@ -10536,8 +10546,7 @@ function renderListen() {
 	$("lpPlay").setAttribute("aria-label", playing ? "Pause" : "Play");
 	$("lpNext").disabled = !(n > 1 && ch.i + 1 < n);
 	$("lpRate").textContent = player.rate + "×";
-	$("lpSleep").textContent = sleep.left != null ? "Sleep · " + clock(Math.ceil(sleep.left)) : sleep.end != null ? "Sleep · end of chapter" : "Sleep";
-	$("lpSleep").classList.toggle("on", sleep.left != null || sleep.end != null);
+	paintSleep();
 	$("lpBook").textContent = (n > 1 && ch.i >= 0 ? "Chapter " + (ch.i + 1) + " of " + n + " · " : "") + hours(Math.max(0, total - t)) + " left";
 	if (ch.i !== lp.cur) {
 		lp.cur = ch.i;
@@ -10590,10 +10599,10 @@ function chapterStep(by) {
 	});
 })();
 
-// The sleep timer, set on the player page: pause after some minutes of
-// listening (the last 10 seconds fade out where the browser lets a page set
-// the volume), or at the end of the chapter playing (of the episode, for a
-// podcast). It counts only while
+// The sleep timer, set on an audiobook's player page or a podcast episode's
+// page: pause after some minutes of listening (the last 10 seconds fade out
+// where the browser lets a page set the volume), or at the end of the
+// chapter playing (of the episode, for a podcast). It counts only while
 // something plays, and goes with the bar's ×.
 var sleep = { left: null, end: null, last: 0, timer: null };
 // Where the chapter at t ends in the whole book (its end, with no chapters).
@@ -10613,7 +10622,52 @@ function setSleep(v) {
 		sleep.last = Date.now();
 		sleep.timer = setInterval(sleepTick, 1000);
 	}
+	paintSleep();
 	renderListen();
+}
+// Every Sleep button showing (the player page's, an episode's) says what's set.
+// An episode's shows only while that episode is the one in the player.
+function paintSleep() {
+	var end = player.ep && !player.ep.book ? "end of episode" : "end of chapter";
+	document.querySelectorAll(".sleepbtn").forEach(function (b) {
+		if (b.dataset.ep) {
+			var here = !!player.ep && String(player.ep.id) === b.dataset.ep;
+			show(b, here);
+			if (!here) { show($(b.getAttribute("aria-controls")), false); b.setAttribute("aria-expanded", "false"); }
+		}
+		b.textContent = sleep.left != null ? "Sleep · " + clock(Math.ceil(sleep.left)) : sleep.end != null ? "Sleep · " + end : "Sleep";
+		b.classList.toggle("on", sleep.left != null || sleep.end != null);
+	});
+}
+// The choices under a Sleep button, as on the player page.
+function sleepOptions(endLabel) {
+	var box = h("div", "lpsleep");
+	box.setAttribute("role", "group");
+	box.setAttribute("aria-label", "Sleep timer");
+	box.hidden = true;
+	[["15", "15 min"], ["30", "30 min"], ["45", "45 min"], ["60", "1 h"], ["chapter", endLabel], ["off", "Off"]].forEach(function (o) {
+		var b = h("button", "btn small", o[1]);
+		b.type = "button";
+		b.dataset.sleep = o[0];
+		box.append(b);
+	});
+	return box;
+}
+// A Sleep button opens its choices; picking one sets it and closes them.
+function sleepPicker(btn, opts) {
+	btn.setAttribute("aria-expanded", "false");
+	btn.addEventListener("click", function () {
+		var open = opts.hidden;
+		show(opts, open);
+		btn.setAttribute("aria-expanded", String(open));
+	});
+	opts.addEventListener("click", function (e) {
+		var b = e.target.closest("button");
+		if (!b) return;
+		setSleep(b.dataset.sleep);
+		show(opts, false);
+		btn.setAttribute("aria-expanded", "false");
+	});
 }
 function sleepTick() {
 	var audio = $("pAudio"), now = Date.now();
@@ -10621,6 +10675,7 @@ function sleepTick() {
 	sleep.last = now;
 	if (sleep.left <= 0) return sleepNow();
 	audio.volume = clamp(sleep.left / 10, 0, 1);
+	paintSleep();
 	renderListen();
 }
 function sleepNow() {
@@ -10634,18 +10689,7 @@ function sleepNow() {
 		if (sleep.end != null && !audio.paused && player.ab && abNow() >= sleep.end - 0.3) sleepNow();
 	});
 	$("pClose").addEventListener("click", function () { setSleep("off"); });
-	$("lpSleep").addEventListener("click", function () {
-		var open = $("lpSleepOpts").hidden;
-		show($("lpSleepOpts"), open);
-		this.setAttribute("aria-expanded", String(open));
-	});
-	$("lpSleepOpts").addEventListener("click", function (e) {
-		var b = e.target.closest("button");
-		if (!b) return;
-		setSleep(b.dataset.sleep);
-		show($("lpSleepOpts"), false);
-		$("lpSleep").setAttribute("aria-expanded", "false");
-	});
+	sleepPicker($("lpSleep"), $("lpSleepOpts"));
 })();
 
 // ---------- book tags
