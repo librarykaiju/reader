@@ -42,7 +42,8 @@
 //   GET/POST /api/booktags, PATCH/DELETE /api/booktags/:id
 //                                  the same for book tags, a separate set
 //   GET    /api/feeds              -> {"feeds": [...each with an unread count, episodes, videos, articles, and tags: [tag ids]]}
-//                                  (podcast episodes and videos aren't in unread, or in Unread/All unless feed= is given)
+//                                  (podcast episodes and videos aren't in unread, or in Unread/All unless feed= is given;
+//                                  a show's unread episodes are unread_episodes, its newest one's date latest_episode)
 //   POST   /api/feeds              {url, feed_url, mode, title, site_url, tags?}
 //   PATCH  /api/feeds/:id          {title?, feed_url?, mode?, site_url?, tags?}
 //                                  (tags: the feed's whole set of tag ids)
@@ -651,6 +652,8 @@ async function listFeeds(env) {
 	const { results } = await env.DB.prepare(
 		`SELECT f.*, (SELECT COUNT(DISTINCT COALESCE(i.story_id, i.id)) FROM items i WHERE i.feed_id = f.id AND i.read = 0 AND i.media_url IS NULL) AS unread,
 			(SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND ${VIEWS.podcasts}) AS episodes,
+			(SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND ${VIEWS.podcasts} AND i.read = 0) AS unread_episodes,
+			(SELECT MAX(COALESCE(i.published_at, i.created_at)) FROM items i WHERE i.feed_id = f.id AND ${VIEWS.podcasts}) AS latest_episode,
 			(SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND ${VIEWS.videos}) AS videos,
 			(SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND i.media_url IS NULL) AS articles,
 			(SELECT json_group_array(t.tag_id) FROM feed_tags t WHERE t.feed_id = f.id) AS tags
@@ -6337,6 +6340,26 @@ const PAGE = String.raw`<!doctype html>
 	.cbzbar input { flex: 1; min-width: 0; }
 	.loading { color: var(--muted); text-align: center; padding: 40px 16px; font-family: var(--sans); }
 
+	/* Podcasts: the shows' artwork, a drawn tile where a show has none, each
+	   with its unread episodes in the corner. */
+	.shows { list-style: none; margin: 14px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 20px 16px; }
+	.shows a { display: flex; flex-direction: column; gap: 3px; color: inherit; text-decoration: none; min-width: 0; }
+	.showart { position: relative; aspect-ratio: 1; border-radius: 8px; overflow: hidden; background: var(--sel); box-shadow: 0 1px 4px rgba(0,0,0,.22); margin-bottom: 5px; }
+	.showart img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; }
+	.showart .gen { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 12%; text-align: center;
+		color: #fbf7ee; font: 600 17px/1.2 var(--display); overflow-wrap: anywhere; }
+	.showart .gen span { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 5; overflow: hidden; }
+	.showart .gen svg { position: absolute; left: 10px; bottom: 10px; width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; opacity: .6; }
+	.shows a:hover .showart, .shows a:focus-visible .showart { box-shadow: 0 0 0 2px var(--accent); }
+	.unreadn { position: absolute; top: 6px; right: 6px; min-width: 24px; padding: 2px 7px; border-radius: 999px; background: var(--accent); color: var(--on-accent);
+		font: 700 13px/20px var(--sans); text-align: center; font-variant-numeric: tabular-nums; box-shadow: 0 1px 3px rgba(0,0,0,.35); }
+	.shows .ct { font-weight: 600; font-size: 14px; line-height: 1.25; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+	.shows .ca { font-size: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+	@media (max-width: 520px) { .shows { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 12px; } }
+	.ephead-btns { display: flex; gap: 6px; flex: none; }
+	/* A show's name can be long: it wraps instead, and the buttons go under it if need be. */
+	#podcastsView .listhead { flex-wrap: wrap; }
+	#podcastsView .listhead h2 { white-space: normal; overflow-wrap: anywhere; }
 	/* Podcasts: the episode list, the box atop an episode, the player bar. */
 	.eps li { display: flex; flex-wrap: wrap; align-items: center; column-gap: 8px; border-bottom: 1px solid var(--line); }
 	.eps .mark { position: static; width: 40px; height: 40px; }
@@ -6576,12 +6599,17 @@ const PAGE = String.raw`<!doctype html>
 </section>
 
 <section id="podcastsView" class="wrap" hidden>
+	<a id="epUp" class="libup" href="#/podcasts" hidden>‹ Podcasts</a>
 	<div class="listhead">
 		<h2 id="epHead">Podcasts</h2>
-		<button id="epFilter" class="btn ghost small" type="button" aria-pressed="false">Downloaded</button>
+		<div class="ephead-btns">
+			<button id="epAllRead" class="btn ghost small" type="button" hidden>Mark all read</button>
+			<button id="epFilter" class="btn ghost small" type="button" aria-pressed="false">Downloaded</button>
+		</div>
 	</div>
 	<div id="epTags" class="tagbar" hidden></div>
 	<p id="epNote" class="hint" hidden></p>
+	<ul id="shows" class="shows" hidden></ul>
 	<ul id="episodes" class="items eps"></ul>
 	<p id="epEmpty" class="empty" hidden></p>
 	<button id="epMore" class="btn wide" type="button" hidden>Load more</button>
@@ -6846,7 +6874,7 @@ var UNAUTH = "Unauthorized";
 var state = {
 	route: null, prev: null, fromList: false, lastList: "#/unread",
 	view: "unread", feed: null, tag: null,
-	episodes: [], epNext: null, epTag: null, epOffline: false, epDownloadedOnly: false, epKind: "podcasts", itemEp: null, fromPodcasts: false,
+	episodes: [], epNext: null, epTag: null, epOffline: false, epDownloadedOnly: false, epKind: "podcasts", epFeed: null, itemEp: null, fromPodcasts: false,
 	feeds: [], tags: [], books: null, bookTags: readJSON("readerBookTags") || [], libTag: null, libTags: [], libSearch: "", libSort: read("readerBookSort") || "recent", libFormat: read("readerBookFormat") || "", libScroll: 0, record: null, libView: read("readerBookView") === "covers" ? "covers" : "list",
 	items: [], next: null, listKey: "", listScroll: 0, stale: true,
 	refreshing: false, errors: {}, editFeeds: false, editBooks: false, libSel: {}, item: null
@@ -8162,7 +8190,7 @@ async function refreshAll(force) {
 		if (failed) toast(failed + " feed" + (failed > 1 ? "s" : "") + " couldn't refresh. Details are in the feed list.");
 		if (state.route && LIST_VIEWS[state.route.name]) await loadItems(false, true);
 		else state.stale = true;
-		if (state.route && MEDIA_TABS[state.route.name]) await loadEpisodes(false);
+		if (state.route && MEDIA_TABS[state.route.name]) await reloadPodcasts();
 	} catch (e) { fail(e); }
 	finally {
 		state.refreshing = false;
@@ -9182,26 +9210,116 @@ function epStatus(ep) {
 	return "";
 }
 
-// Podcasts tab
+// Podcasts tab: the shows, as a gallery of their artwork (a drawn tile where
+// a show has none yet), each with its unread episodes in the corner; a show
+// opens its own episodes (#/podcasts?feed=<id>). Videos, and what's
+// downloaded, stay one newest-first list.
+function galleryOn() { return state.epKind === "podcasts" && state.epFeed == null && !state.epDownloadedOnly; }
 async function showPodcasts(r) {
-	var changed = !sameId(state.epTag, r.tag) || state.epKind !== r.name;
-	if (state.epKind !== r.name) state.episodes = [];
+	var back = state.prev && state.prev.name === "item";
+	var changed = !sameId(state.epTag, r.tag) || !sameId(state.epFeed, r.feed) || state.epKind !== r.name;
+	if (state.epKind !== r.name || !sameId(state.epFeed, r.feed)) state.episodes = [];
 	state.epKind = r.name;
 	state.epTag = r.tag;
+	state.epFeed = r.feed;
 	showView("podcasts");
 	renderTabs(r.name);
-	$("epHead").textContent = MEDIA_TABS[r.name];
-	document.title = MEDIA_TABS[r.name] + " — Reader";
+	renderEpHead();
 	renderEpisodeTags();
-	if (!changed && state.episodes.length && state.prev && state.prev.name === "item") { renderEpisodes(); return; }
-	window.scrollTo(0, 0);
+	if (!(back && !changed)) window.scrollTo(0, 0);
+	if (galleryOn()) return await loadShows();
+	if (back && !changed && state.episodes.length) { renderEpisodes(); return; }
 	await loadEpisodes(false);
+}
+function reloadPodcasts() { return galleryOn() ? loadShows() : loadEpisodes(false); }
+// The show being viewed, if one is.
+function epShow() {
+	return state.epFeed == null ? null : state.feeds.filter(function (f) { return f.id === state.epFeed; })[0] || null;
+}
+function renderEpHead() {
+	var f = epShow(), name = f ? f.title : MEDIA_TABS[state.epKind];
+	$("epHead").textContent = name;
+	document.title = name + " — Reader";
+	var up = $("epUp");
+	up.textContent = "‹ " + MEDIA_TABS[state.epKind];
+	up.href = "#/" + state.epKind + (state.epTag != null ? "?tag=" + state.epTag : "");
+	show(up, state.epFeed != null);
+	show($("epAllRead"), !!f && f.unread_episodes > 0);
+}
+// Shows the gallery from the feeds already here at once, then again with
+// fresh counts (an episode opened since is read now).
+async function loadShows() {
+	renderShows();
+	try {
+		await loadFeeds();
+		state.epOffline = false;
+	} catch (e) {
+		if (e.message === UNAUTH) return;
+		state.epOffline = true;
+	}
+	if (!state.route || state.route.name !== "podcasts" || !galleryOn()) return;
+	// No connection and no shows to draw: what's downloaded still plays.
+	if (state.epOffline && !podShows().length) return await loadEpisodes(false);
+	renderEpHead();
+	renderEpisodeTags();
+	renderShows();
+}
+// Every feed with an episode in it, newest episode first.
+function podShows() {
+	return state.feeds.filter(function (f) { return f.episodes > 0 && (state.epTag == null || hasTag(f, state.epTag)); })
+		.sort(function (a, b) { return (b.latest_episode || 0) - (a.latest_episode || 0) || a.title.localeCompare(b.title); });
+}
+function renderShows() {
+	var ul = $("shows");
+	ul.textContent = "";
+	podShows().forEach(function (f) {
+		var li = h("li"), a = h("a"), art = h("div", "showart"), n = f.unread_episodes || 0;
+		a.href = "#/podcasts" + listQuery(f.id, state.epTag);
+		a.setAttribute("aria-label", f.title + (n ? ", " + n + " unread" : ""));
+		showArt(art, f);
+		if (n) art.append(h("span", "unreadn", n > 99 ? "99+" : String(n)));
+		a.append(art, h("span", "ct", f.title),
+			h("span", "ca", [f.episodes + (f.episodes === 1 ? " episode" : " episodes"), ago(f.latest_episode)].filter(Boolean).join(" · ")));
+		li.append(a);
+		ul.append(li);
+	});
+	show(ul, true);
+	show($("episodes"), false);
+	show($("epMore"), false);
+	$("epEmpty").textContent = state.epOffline ? "You're offline." : "No podcasts yet. Add a podcast's feed to get started.";
+	show($("epEmpty"), !ul.children.length);
+	$("epNote").textContent = "You're offline. The counts are from when you were last online.";
+	show($("epNote"), state.epOffline && !!ul.children.length);
+	paintEpFilter();
+}
+// A show's artwork; a tile with its name where it has none, or the picture
+// doesn't load.
+var HEADPHONES_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></svg>';
+function showArt(box, f) {
+	var draw = function () {
+		var n = 0, key = f.title || "";
+		for (var i = 0; i < key.length; i++) n = (n * 31 + key.charCodeAt(i)) >>> 0;
+		var g = h("div", "gen");
+		g.style.backgroundColor = COVER_COLORS[n % COVER_COLORS.length];
+		g.setAttribute("aria-hidden", "true");
+		g.append(h("span", null, f.title));
+		g.insertAdjacentHTML("beforeend", HEADPHONES_SVG);
+		box.append(g);
+	};
+	if (!f.image_url) return draw();
+	var img = h("img");
+	img.alt = "";
+	img.loading = "lazy";
+	img.decoding = "async";
+	img.addEventListener("error", function () { img.remove(); draw(); });
+	img.src = f.image_url.replace(/^http:/, "https:");
+	box.append(img);
 }
 async function loadEpisodes(append) {
 	if (state.epDownloadedOnly) { state.episodes = downloadedList(); state.epNext = null; state.epOffline = false; renderEpisodes(); return; }
-	if (!append && !state.episodes.length) { $("epEmpty").textContent = "Loading…"; show($("epEmpty"), true); }
+	if (!append && !state.episodes.length) { $("epEmpty").textContent = "Loading…"; show($("epEmpty"), true); show($("shows"), false); }
 	try {
-		var data = await apiJSON("/api/items?view=" + state.epKind + "&limit=50" + (state.epTag != null ? "&tag=" + state.epTag : "") +
+		var data = await apiJSON("/api/items?view=" + state.epKind + "&limit=50" + (state.epFeed != null ? "&feed=" + state.epFeed : state.epTag != null ? "&tag=" + state.epTag : "") +
 			(append && state.epNext ? "&before=" + encodeURIComponent(state.epNext) : ""));
 		state.episodes = (append ? state.episodes : []).concat(data.items.map(epFields));
 		state.epNext = data.next;
@@ -9219,6 +9337,7 @@ function downloadedList() {
 	return Object.keys(downloads).map(function (id) { return downloads[id]; })
 		.filter(function (ep) {
 			if (!inTab(ep)) return false;
+			if (state.epFeed != null) return ep.feed_id === state.epFeed;
 			if (state.epTag == null) return true;
 			var f = state.feeds.filter(function (x) { return x.id === ep.feed_id; })[0];
 			return f ? hasTag(f, state.epTag) : false;
@@ -9226,11 +9345,12 @@ function downloadedList() {
 		.sort(function (a, b) { return (b.published_at || b.created_at || 0) - (a.published_at || a.created_at || 0); });
 }
 // Tags that have a podcast (or video) on them, as a filter like the feed list's.
+// Not inside one show.
 function renderEpisodeTags() {
 	var kind = state.epKind, box = $("epTags");
 	var pods = state.feeds.filter(function (f) { return (kind === "videos" ? f.videos : f.episodes) > 0; });
 	box.textContent = "";
-	var list = state.tags.filter(function (t) { return pods.some(function (f) { return hasTag(f, t.id); }); })
+	var list = state.epFeed != null ? [] : state.tags.filter(function (t) { return pods.some(function (f) { return hasTag(f, t.id); }); })
 		.map(function (t) { return { id: t.id, name: t.name, cls: tagColor(t.id) }; });
 	if (list.length && pods.some(function (f) { return !f.tags.length; })) list.push({ id: 0, name: "Untagged", cls: "untagged" });
 	show(box, list.length > 0);
@@ -9245,6 +9365,10 @@ function renderEpisodeTags() {
 	});
 	box.append(chips);
 }
+// An episode's line under its title; inside a show, without the show's name.
+function epMeta(ep) {
+	return [state.epFeed != null ? "" : ep.feed_title, ago(ep.published_at || ep.created_at), epStatus(ep)].filter(Boolean).join(" · ");
+}
 function renderEpisodes() {
 	renderEpisodeTags();
 	var ul = $("episodes");
@@ -9255,7 +9379,7 @@ function renderEpisodes() {
 		a.href = "#/item/" + ep.id;
 		var dot = h("span", "dot");
 		a.append(dot, h("span", "t", ep.title));
-		a.append(h("span", "m", [ep.feed_title, ago(ep.published_at || ep.created_at), epStatus(ep)].filter(Boolean).join(" · ")));
+		a.append(h("span", "m", epMeta(ep)));
 		var btns = h("div", "ep-btns");
 		btns.append(playButton(ep, true));
 		if (!isHosted(ep)) btns.append(downloadButton(ep, true));
@@ -9264,14 +9388,20 @@ function renderEpisodes() {
 		if (ep.notes) li.append(notesButton(ep.notes));
 		ul.append(li);
 	});
+	show($("shows"), false);
+	show(ul, true);
 	$("epEmpty").textContent = state.epDownloadedOnly ? "Nothing downloaded on this device."
 		: state.epOffline ? "You're offline, and nothing is downloaded on this device."
+		: state.epFeed != null ? "No episodes from this show yet."
 		: state.epKind === "videos" ? "No videos yet. Add a YouTube channel, or another video feed, to get started."
 		: "No episodes yet. Add a podcast's feed to get started.";
 	show($("epEmpty"), !state.episodes.length);
 	show($("epMore"), !!state.epNext);
 	$("epNote").textContent = state.epOffline ? "You're offline. These are the ones downloaded on this device." : "";
 	show($("epNote"), state.epOffline && !!state.episodes.length);
+	paintEpFilter();
+}
+function paintEpFilter() {
 	$("epFilter").setAttribute("aria-pressed", String(!!state.epDownloadedOnly));
 	$("epFilter").classList.toggle("on", !!state.epDownloadedOnly);
 }
@@ -9309,7 +9439,8 @@ function setPlayed(ep, on) {
 	var pos = on ? real || 1 : 0, patch = { media_pos: pos };
 	if (on && !real) patch.media_len = 1;
 	if (!on && len && !real) patch.media_len = null;
-	if (on) patch.read = 1;
+	// Unplayed is new again: back in its show's unread count.
+	patch.read = on ? 1 : 0;
 	if (mine) { audio.pause(); player.savedAt = Date.now(); }
 	positions[ep.id] = pos;
 	store("readerPositions", JSON.stringify(positions));
@@ -9366,7 +9497,7 @@ function repaintEpisode(id) {
 	document.querySelectorAll("[data-play='" + id + "']").forEach(function (b) { paintPlay(b, ep, b.classList.contains("small")); });
 	document.querySelectorAll("[data-dl='" + id + "']").forEach(function (b) { paintDownload(b, ep, b.classList.contains("small")); });
 	document.querySelectorAll("#episodes li[data-id='" + id + "'] .m").forEach(function (m) {
-		m.textContent = [ep.feed_title, ago(ep.published_at || ep.created_at), epStatus(ep)].filter(Boolean).join(" · ");
+		m.textContent = epMeta(ep);
 	});
 	document.querySelectorAll("#episodes li[data-id='" + id + "']").forEach(function (li) { li.classList.toggle("read", epPlayed(ep)); });
 	document.querySelectorAll("[data-played='" + id + "']").forEach(function (b) { paintPlayed(b, ep); });
@@ -9805,7 +9936,19 @@ function findListed(id) { return state.episodes.filter(function (e) { return e.i
 	$("epMore").addEventListener("click", function () { loadEpisodes(true).catch(fail); });
 	$("epFilter").addEventListener("click", function () {
 		state.epDownloadedOnly = !state.epDownloadedOnly;
-		loadEpisodes(false).catch(fail);
+		state.episodes = [];
+		reloadPodcasts().catch(fail);
+	});
+	// Clears a show's unread count; the episodes stay unplayed.
+	$("epAllRead").addEventListener("click", async function () {
+		var f = epShow();
+		if (!f) return;
+		try {
+			await apiJSON("/api/items/mark-read", { method: "POST", json: { feed: f.id } });
+			f.unread_episodes = 0;
+			renderEpHead();
+			await loadFeeds();
+		} catch (e) { fail(e); }
 	});
 	if ("mediaSession" in navigator) {
 		var on = function (name, fn) { try { navigator.mediaSession.setActionHandler(name, fn); } catch (e) {} };
