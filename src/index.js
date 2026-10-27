@@ -50,7 +50,7 @@
 //   GET    /api/items?view=unread|saved|all|podcasts|videos&feed=&tag=&before=&limit=
 //                                  newest first -> {"items", "next"} (tag=0: untagged feeds);
 //                                  Unread and All list a story once, with its other items in related
-//   POST   /api/items              {feed_id, items: [...]} -- one feed's refresh
+//   POST   /api/items              {feed_id, items: [...], image?} -- one feed's refresh (image: its artwork)
 //                                  (podcasts/videos: each with notes, a short plain-text preview of its show notes)
 //   GET    /api/items/:id          one item, with its content
 //   PATCH  /api/items/:id          {read?, saved?, content?, media_pos?, media_len?} (read covers its whole story)
@@ -749,7 +749,7 @@ async function deleteFeed(env, id) {
 
 const ITEM_LIST_COLUMNS = `i.id, i.feed_id, f.title AS feed_title, i.title, i.link, i.author,
 	i.published_at, i.created_at, i.read, i.saved, i.content IS NOT NULL AS has_content,
-	i.media_url, i.media_type, i.media_pos, i.media_len,
+	i.media_url, i.media_type, i.media_pos, i.media_len, f.image_url AS feed_image,
 	COALESCE(i.published_at, i.created_at) AS sort_at`;
 
 async function listItems(env, url) {
@@ -880,7 +880,7 @@ function itemPage(results, limit) {
 
 async function getItem(env, id) {
 	const item = await env.DB.prepare(
-		`SELECT i.*, f.title AS feed_title, f.site_url FROM items i JOIN feeds f ON f.id = i.feed_id WHERE i.id = ?`,
+		`SELECT i.*, f.title AS feed_title, f.site_url, f.image_url AS feed_image FROM items i JOIN feeds f ON f.id = i.feed_id WHERE i.id = ?`,
 	)
 		.bind(id)
 		.first();
@@ -939,7 +939,13 @@ async function addItems(request, env) {
 			AND guid NOT IN (SELECT value FROM json_each(?))`,
 		).bind(feedId, now - PRUNE_AFTER_MS, JSON.stringify([...seen])),
 	);
-	stmts.push(env.DB.prepare("UPDATE feeds SET last_fetched_at = ? WHERE id = ?").bind(now, feedId));
+	// The feed's artwork (a podcast's cover), as the page found it.
+	const image = httpUrl(body.image);
+	stmts.push(
+		image
+			? env.DB.prepare("UPDATE feeds SET last_fetched_at = ?, image_url = ? WHERE id = ?").bind(now, image, feedId)
+			: env.DB.prepare("UPDATE feeds SET last_fetched_at = ? WHERE id = ?").bind(now, feedId),
+	);
 	const results = await env.DB.batch(stmts);
 	const inserted = results.slice(0, clean.length).reduce((n, r) => n + (r.meta?.changes || 0), 0);
 	await groupStories(env, feedId, now);
@@ -7071,14 +7077,22 @@ function rssLink(node, base) {
 	for (var i = 0; i < links.length; i++) if (links[i].textContent.trim()) return absUrl(links[i].textContent.trim(), base);
 	return atomLink(node, base);
 }
+// A podcast's artwork: <itunes:image href> (both it and RSS's own <image>
+// have the local name image), else <image><url>.
+function rssImage(channel, base) {
+	var imgs = kids(channel, "image"), url = "";
+	imgs.forEach(function (i) { if (!url && i.getAttribute("href")) url = i.getAttribute("href").trim(); });
+	imgs.forEach(function (i) { if (!url && kidText(i, "url")) url = kidText(i, "url"); });
+	return url ? absUrl(url, base) : null;
+}
 function parseRSS(channel, items, base, kind) {
 	return {
-		kind: kind, title: plain(kidText(channel, "title")), siteUrl: rssLink(channel, base) || base,
+		kind: kind, title: plain(kidText(channel, "title")), siteUrl: rssLink(channel, base) || base, image: rssImage(channel, base),
 		items: items.map(function (it) {
 			var link = rssLink(it, base);
 			var g = kid(it, "guid"), guid = g ? g.textContent.trim() : "";
 			if (!link && guid && g.getAttribute("isPermaLink") !== "false") link = absUrl(guid, base);
-			var content = kidText(it, "encoded") || kidText(it, "description");
+			var content = kidText(it, "encoded") || kidText(it, "description") || kidText(it, "summary");
 			var media = pickMedia(kids(it, "enclosure").map(function (e) { return { url: e.getAttribute("url"), type: e.getAttribute("type") }; }), base)
 				|| videoPage(link);
 			return {
@@ -7228,7 +7242,7 @@ async function tryFeed(feedUrl, typed) {
 	}
 }
 function found(feed, feedUrl, typed) {
-	return { mode: "feed", url: typed, feed_url: feedUrl, title: feed.title || hostOf(feed.siteUrl), site_url: feed.siteUrl, kind: feed.kind, items: feed.items };
+	return { mode: "feed", url: typed, feed_url: feedUrl, title: feed.title || hostOf(feed.siteUrl), site_url: feed.siteUrl, kind: feed.kind, image: feed.image || null, items: feed.items };
 }
 
 // Scrape mode: likely article links on a page with no feed.
@@ -8071,7 +8085,7 @@ async function addFeed(e) {
 		} });
 		var what = r.mode === "feed" ? "RSS feed found (" + r.kind + "): " : "No feed, watching the page: ";
 		if (data.existing) { addStatus("Already following " + data.feed.title + "."); return; }
-		var saved = await saveItems(data.feed.id, r.items);
+		var saved = await saveItems(data.feed.id, r.items, r.image);
 		var channel = await tagChannel(data.feed, r.items);
 		addStatus(what + data.feed.title + " — " + saved.inserted + " item" + (saved.inserted === 1 ? "" : "s")
 			+ (channel ? ", tagged “" + channel + "”." : "."));
@@ -8112,7 +8126,7 @@ async function chosenTag(sel) {
 	var t = await promptTag();
 	return t ? t.id : null;
 }
-function saveItems(feedId, items) {
+function saveItems(feedId, items, image) {
 	var clean = items.filter(function (it) { return it.guid; }).slice(0, 200).map(function (it) {
 		return {
 			guid: String(it.guid).slice(0, 2000), title: it.title || "", link: it.link || null, author: it.author || null,
@@ -8120,7 +8134,7 @@ function saveItems(feedId, items) {
 			media_url: it.media_url || null, media_type: it.media_type || null
 		};
 	});
-	return apiJSON("/api/items", { method: "POST", json: { feed_id: feedId, items: clean } });
+	return apiJSON("/api/items", { method: "POST", json: { feed_id: feedId, items: clean, image: image || undefined } });
 }
 
 // Refresh: every feed (or only stale ones on app open), three at a time.
@@ -8164,11 +8178,12 @@ async function refreshFeed(f) {
 			var p = parseFeed(r.text, r.url);
 			if (!p) throw new Error("that address no longer returns a feed");
 			items = p.items;
+			var image = p.image;
 		} else {
 			var pg = await proxyGet(f.site_url || f.url);
 			items = scrape(pg.text, pg.url).items;
 		}
-		await saveItems(f.id, items);
+		await saveItems(f.id, items, image);
 		delete state.errors[f.id];
 	} catch (e) {
 		if (e.message === UNAUTH) throw e;
@@ -9144,7 +9159,7 @@ function inTab(ep) { return state.epKind === "videos" ? !isAudio(ep) : isAudio(e
 function epFields(it) {
 	return { id: it.id, feed_id: it.feed_id, feed_title: it.feed_title || "", title: it.title || "Untitled", media_url: it.media_url,
 		media_type: it.media_type || "audio/mpeg", media_pos: it.media_pos, media_len: it.media_len, published_at: it.published_at, created_at: it.created_at,
-		notes: it.notes || null };
+		notes: it.notes || null, feed_image: it.feed_image || null };
 }
 function saveDownloads() { store("readerDownloads", JSON.stringify(downloads)); }
 // The furthest point reached on this device or saved on the item.
@@ -9632,7 +9647,7 @@ function renderPlayer() {
 	var ep = player.ep, audio = $("pAudio");
 	// The player page has the bar's controls, so the bar steps aside there.
 	// It only shows with the things it plays: Podcasts, Videos (and an episode
-	// opened from them) and the Library, not the feed lists or articles.
+	// opened from them or from the bar) and the Library, not the feed lists or articles.
 	var bar = !!ep && barHere() && !(onListen() && ep.book === state.route.id);
 	show($("pbar"), bar);
 	document.body.classList.toggle("has-pbar", bar);
@@ -9650,19 +9665,19 @@ function renderPlayer() {
 var BAR_ROUTES = { podcasts: 1, videos: 1, library: 1, record: 1, listen: 1 };
 function barHere() {
 	var r = state.route;
-	return !!r && (!!BAR_ROUTES[r.name] || (r.name === "item" && state.fromPodcasts));
+	return !!r && (!!BAR_ROUTES[r.name] || (r.name === "item" && (state.fromPodcasts || (!!player.ep && player.ep.id === r.id))));
 }
 // The played part of a slider (0 to 1000), for browsers that draw only the track.
 function seekFill(el) { el.style.setProperty("--p", el.value / 10 + "%"); }
 // What the lock screen and Control Center show. An audiobook's cover goes
 // with it, so the phone can show it large; as a data: URL, since the phone
 // fetches artwork itself, without the token, and a blob: URL isn't always
-// shown. Podcasts have no artwork stored yet.
+// shown. A podcast's is its feed's artwork, on the podcast's own site.
 var sessionArt = {};
 function setSession(ep) {
 	if (!("mediaSession" in navigator)) return;
 	var meta = { title: ep.title, artist: ep.feed_title || "", album: "Reader" };
-	var art = ep.book && sessionArt[ep.book];
+	var art = ep.book ? sessionArt[ep.book] : ep.feed_image ? { src: ep.feed_image } : null;
 	try {
 		navigator.mediaSession.metadata = new MediaMetadata(art ? Object.assign(meta, { artwork: [art] }) : meta);
 	} catch (e) {}
