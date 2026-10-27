@@ -6053,7 +6053,11 @@ const PAGE = String.raw`<!doctype html>
 	.tools { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 0 8px 40px; }
 	.flat .tools { padding-left: 8px; }
 	.ferr { font-size: 13px; color: var(--bad); padding: 0 8px 6px 40px; overflow-wrap: anywhere; }
-	.editbar { display: flex; justify-content: space-between; gap: 8px; margin-top: 6px; }
+	/* Edit sits up on the Feeds row, so a long list can't push it off the
+	   bottom of a phone screen. It's a sibling of the summary (a button inside
+	   one would also toggle the list), laid over the summary's right end. */
+	.side details { position: relative; }
+	.editbar { position: absolute; top: 9px; right: 0; display: flex; gap: 8px; }
 	.tagbar { padding: 6px 0 8px; }
 	.chips { display: flex; flex-wrap: wrap; gap: 6px; }
 	.chip { appearance: none; -webkit-appearance: none; display: inline-flex; align-items: center; gap: 6px; min-height: 32px; padding: 4px 11px;
@@ -6525,6 +6529,10 @@ const PAGE = String.raw`<!doctype html>
 	<aside class="side">
 		<details id="feedsBox">
 			<summary>Feeds <span id="feedCount" class="muted"></span></summary>
+			<div class="editbar">
+				<button id="newTag" class="btn small" type="button" hidden>New tag</button>
+				<button id="editFeeds" class="btn ghost small" type="button">Edit</button>
+			</div>
 			<form id="addForm" class="add">
 				<label class="vh" for="addUrl">Website or feed URL</label>
 				<input id="addUrl" type="text" inputmode="url" placeholder="Add a website or feed URL" autocapitalize="off" autocorrect="off" spellcheck="false">
@@ -6536,10 +6544,6 @@ const PAGE = String.raw`<!doctype html>
 			</form>
 			<div id="addStatus" class="status" role="status" hidden></div>
 			<ul id="feeds" class="tree flat"></ul>
-			<div class="editbar">
-				<button id="newTag" class="btn small" type="button" hidden>New tag</button>
-				<button id="editFeeds" class="btn ghost small" type="button">Edit</button>
-			</div>
 		</details>
 	</aside>
 	<div>
