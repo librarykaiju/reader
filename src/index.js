@@ -9654,10 +9654,38 @@ function barHere() {
 }
 // The played part of a slider (0 to 1000), for browsers that draw only the track.
 function seekFill(el) { el.style.setProperty("--p", el.value / 10 + "%"); }
+// What the lock screen and Control Center show. An audiobook's cover goes
+// with it, so the phone can show it large; as a data: URL, since the phone
+// fetches artwork itself, without the token, and a blob: URL isn't always
+// shown. Podcasts have no artwork stored yet.
+var sessionArt = {};
 function setSession(ep) {
 	if (!("mediaSession" in navigator)) return;
+	var meta = { title: ep.title, artist: ep.feed_title || "", album: "Reader" };
+	var art = ep.book && sessionArt[ep.book];
 	try {
-		navigator.mediaSession.metadata = new MediaMetadata({ title: ep.title, artist: ep.feed_title || "", album: "Reader" });
+		navigator.mediaSession.metadata = new MediaMetadata(art ? Object.assign(meta, { artwork: [art] }) : meta);
+	} catch (e) {}
+	if (ep.book && art === undefined) sessionCover(ep);
+}
+async function sessionCover(ep) {
+	sessionArt[ep.book] = null;
+	try {
+		var res = await api("/api/books/" + ep.book + "/cover");
+		if (!res.ok) return;
+		var blob = await res.blob(), type = blob.type || "image/jpeg";
+		var src = await new Promise(function (ok, no) {
+			var fr = new FileReader();
+			fr.onload = function () { ok(fr.result); };
+			fr.onerror = no;
+			fr.readAsDataURL(blob);
+		});
+		var img = new Image();
+		img.src = src;
+		await img.decode();
+		var size = img.naturalWidth + "x" + img.naturalHeight;
+		sessionArt[ep.book] = { src: src, sizes: size, type: type };
+		if (player.ep === ep) setSession(ep);
 	} catch (e) {}
 }
 function skip(by) {
