@@ -6197,7 +6197,7 @@ const PAGE = String.raw`<!doctype html>
 	.lpctl { display: flex; align-items: center; justify-content: space-between; gap: 4px; max-width: 360px; margin: 14px 0 0; }
 	.lpctl .btn { min-width: 48px; min-height: 48px; padding-inline: 6px; font-variant-numeric: tabular-nums; }
 	.lpctl svg { width: 22px; height: 22px; fill: currentColor; display: block; margin: auto; }
-	#lpPlay { min-width: 68px; min-height: 68px; border-radius: 50%; font-size: 22px; }
+	#lpPlay { flex: none; width: 68px; height: 68px; min-width: 0; padding: 0; border-radius: 50%; font-size: 22px; }
 	.lpmore { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-top: 14px; font-size: 14px; color: var(--muted); }
 	.lpmore #lpRate, #lpSleep { font-variant-numeric: tabular-nums; }
 	#lpSleep.on { border-color: var(--accent); color: var(--accent); }
@@ -6393,7 +6393,15 @@ const PAGE = String.raw`<!doctype html>
 	#pName { font-weight: 600; font-size: 14px; }
 	.ptime { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 	.prow .btn { min-width: 40px; padding-inline: 6px; font-variant-numeric: tabular-nums; }
-	#pPlay { min-width: 48px; border-radius: 50%; min-height: 44px; }
+	#pPlay { flex: none; width: 46px; height: 46px; min-width: 0; min-height: 0; padding: 0; border-radius: 50%; }
+	/* The bar's and the player page's sliders: drawn here, so the thumb is a round dot in every browser and theme. */
+	.seek { -webkit-appearance: none; appearance: none; height: 22px; background: none; cursor: pointer; --p: 0%; --ring: var(--card); }
+	.seek::-webkit-slider-runnable-track { height: 6px; border-radius: 3px; background: linear-gradient(to right, var(--accent) var(--p), var(--line) var(--p)); }
+	.seek::-moz-range-track { height: 6px; border-radius: 3px; background: var(--line); }
+	.seek::-moz-range-progress { height: 6px; border-radius: 3px; background: var(--accent); }
+	.seek::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 18px; height: 18px; margin-top: -6px; border-radius: 50%; background: var(--accent); border: 3px solid var(--ring); box-shadow: 0 0 0 1px var(--accent); }
+	.seek::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: var(--accent); border: 3px solid var(--ring); box-shadow: 0 0 0 1px var(--accent); }
+	#lpSeek { --ring: var(--bg); }
 	@media (max-width: 420px) { #pRate, #pClose { padding-inline: 2px; min-width: 32px; } .tabs a { font-size: 14px; } }
 	/* The bookmark button in a book's top bar: filled once one is set. */
 	#markBtn { padding-inline: 10px; display: flex; align-items: center; }
@@ -6661,7 +6669,7 @@ const PAGE = String.raw`<!doctype html>
 			<h2 id="lpTitle" class="rtitle"></h2>
 			<p id="lpBy" class="rby"></p>
 			<p id="lpChap" class="lpchap"></p>
-			<input id="lpSeek" type="range" min="0" max="1000" value="0" step="1" aria-label="Position in chapter">
+			<input id="lpSeek" class="seek" type="range" min="0" max="1000" value="0" step="1" aria-label="Position in chapter">
 			<div class="lptimes"><span id="lpPos"></span><span id="lpLeft"></span></div>
 			<div class="lpctl">
 				<button id="lpPrev" class="btn ghost" type="button" aria-label="Previous chapter"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h2.2v14H6zM19 5v14L9.5 12z"/></svg></button>
@@ -6705,7 +6713,7 @@ const PAGE = String.raw`<!doctype html>
 </section>
 </main>
 <div id="pbar" class="pbar" hidden>
-	<input id="pSeek" type="range" min="0" max="1000" value="0" step="1" aria-label="Position in episode">
+	<input id="pSeek" class="seek" type="range" min="0" max="1000" value="0" step="1" aria-label="Position in episode">
 	<div class="prow">
 		<button id="pTitle" class="ptitle" type="button"><span id="pName"></span><span id="pTime" class="ptime"></span></button>
 		<button id="pBack" class="btn ghost" type="button" aria-label="Back 15 seconds">&#8634;15</button>
@@ -9610,10 +9618,13 @@ function renderPlayer() {
 	$("pName").textContent = ep.title;
 	$("pTime").textContent = (ep.feed_title ? ep.feed_title + " · " : "") + clock(pos) + (dur ? " / " + clock(dur) : "");
 	if (!state.seeking) $("pSeek").value = dur ? Math.round(pos / dur * 1000) : 0;
+	seekFill($("pSeek"));
 	$("pPlay").innerHTML = audio.paused ? "&#9654;" : "&#10074;&#10074;";
 	$("pPlay").setAttribute("aria-label", audio.paused ? "Play" : "Pause");
 	$("pRate").textContent = player.rate + "×";
 }
+// The played part of a slider (0 to 1000), for browsers that draw only the track.
+function seekFill(el) { el.style.setProperty("--p", el.value / 10 + "%"); }
 function setSession(ep) {
 	if (!("mediaSession" in navigator)) return;
 	try {
@@ -9710,6 +9721,7 @@ function findListed(id) { return state.episodes.filter(function (e) { return e.i
 	$("pTitle").addEventListener("click", function () { if (player.ep) location.hash = player.ep.book ? "#/listen/" + player.ep.book : "#/item/" + player.ep.id; });
 	$("pSeek").addEventListener("input", function () {
 		state.seeking = true;
+		seekFill(this);
 		var dur = player.ep && player.ep.book ? abTotal(player.ep) : audio.duration || epLen(player.ep || {});
 		if (dur) $("pTime").textContent = clock(this.value / 1000 * dur) + " / " + clock(dur);
 	});
@@ -10199,6 +10211,7 @@ function renderListen() {
 	$("lpChap").textContent = n > 1 && c ? (c.title || "Chapter " + (ch.i + 1)) : "";
 	if (!state.lpSeeking) {
 		$("lpSeek").value = len ? Math.round((t - ch.start) / len * 1000) : 0;
+		seekFill($("lpSeek"));
 		$("lpPos").textContent = clock(Math.max(0, t - ch.start));
 		$("lpLeft").textContent = "−" + clock(Math.max(0, ch.end - t));
 	}
@@ -10250,6 +10263,7 @@ function chapterStep(by) {
 	$("lpSeek").addEventListener("input", function () {
 		if (!state.listen) return;
 		state.lpSeeking = true;
+		seekFill(this);
 		var x = at(this.value);
 		$("lpPos").textContent = clock(x.t - x.ch.start);
 		$("lpLeft").textContent = "−" + clock(Math.max(0, x.ch.end - x.t));
