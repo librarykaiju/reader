@@ -6171,6 +6171,30 @@ const PAGE = String.raw`<!doctype html>
 	.chapters button { display: flex; justify-content: space-between; gap: 12px; width: 100%; padding: 9px 14px; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
 	.chapters button[aria-current] { background: var(--sel); font-weight: 600; }
 	.chapters .chtime { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+	/* The player page: an audiobook's square cover, the chapter playing and a slider across it, the controls, then every chapter. */
+	.lplay { display: grid; grid-template-columns: minmax(0, 320px) minmax(0, 1fr); gap: 36px; align-items: center; margin-top: 18px; }
+	.lpcov .cover { aspect-ratio: 1; margin: 0; border-radius: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.18); }
+	.lpcov .gencover .gt { font-size: 22px; }
+	.lpcov .gencover .ga { font-size: 15px; }
+	.lpmain { min-width: 0; font-family: var(--sans); }
+	.lpchap { margin: 16px 0 0; font-weight: 600; color: var(--accent); overflow-wrap: anywhere; }
+	.lpchap:empty { display: none; }
+	#lpSeek { display: block; width: 100%; margin: 14px 0 2px; accent-color: var(--accent); }
+	.lptimes { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+	.lpctl { display: flex; align-items: center; justify-content: space-between; gap: 4px; max-width: 360px; margin: 14px 0 0; }
+	.lpctl .btn { min-width: 48px; min-height: 48px; padding-inline: 6px; font-variant-numeric: tabular-nums; }
+	.lpctl svg { width: 22px; height: 22px; fill: currentColor; display: block; margin: auto; }
+	#lpPlay { min-width: 68px; min-height: 68px; border-radius: 50%; font-size: 22px; }
+	.lpmore { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-top: 14px; font-size: 14px; color: var(--muted); }
+	.lpmore #lpRate { font-variant-numeric: tabular-nums; }
+	#lpChapters { max-height: 420px; }
+	@media (max-width: 640px) {
+		.lplay { grid-template-columns: minmax(0, 1fr); gap: 20px; margin-top: 8px; }
+		.lpcov { width: 80%; max-width: 340px; margin: 0 auto; }
+		.lpmain { text-align: center; }
+		.lpctl { margin-inline: auto; }
+		.lpmore { justify-content: center; }
+	}
 	@media (max-width: 640px) {
 		.rec { grid-template-columns: minmax(0, 1fr); gap: 18px; }
 		.rcov { width: 52%; max-width: 200px; margin: 0 auto; }
@@ -6606,6 +6630,36 @@ const PAGE = String.raw`<!doctype html>
 	<section id="recAppealSec" class="rsec" hidden>
 		<h3>Appeal</h3>
 		<dl id="recAppeal" class="appeal"></dl>
+	</section>
+</section>
+
+<section id="listenView" class="wrap" hidden>
+	<div class="lplay">
+		<div id="lpCover" class="lpcov"></div>
+		<div class="lpmain">
+			<p class="reye">Listening</p>
+			<h2 id="lpTitle" class="rtitle"></h2>
+			<p id="lpBy" class="rby"></p>
+			<p id="lpChap" class="lpchap"></p>
+			<input id="lpSeek" type="range" min="0" max="1000" value="0" step="1" aria-label="Position in chapter">
+			<div class="lptimes"><span id="lpPos"></span><span id="lpLeft"></span></div>
+			<div class="lpctl">
+				<button id="lpPrev" class="btn ghost" type="button" aria-label="Previous chapter"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h2.2v14H6zM19 5v14L9.5 12z"/></svg></button>
+				<button id="lpBack" class="btn ghost" type="button" aria-label="Back 15 seconds">&#8634;15</button>
+				<button id="lpPlay" class="btn primary" type="button" aria-label="Play">&#9654;</button>
+				<button id="lpFwd" class="btn ghost" type="button" aria-label="Forward 30 seconds">30&#8635;</button>
+				<button id="lpNext" class="btn ghost" type="button" aria-label="Next chapter"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.8 5H18v14h-2.2zM5 5v14l9.5-7z"/></svg></button>
+			</div>
+			<div class="lpmore">
+				<button id="lpRate" class="btn small" type="button" aria-label="Playback speed">1&times;</button>
+				<span id="lpBook"></span>
+				<a id="lpRecord" href="#/library">Record</a>
+			</div>
+		</div>
+	</div>
+	<section id="lpChapSec" class="rsec" hidden>
+		<h3>Chapters</h3>
+		<ol id="lpChapters" class="chapters"></ol>
 	</section>
 </section>
 
@@ -8231,7 +8285,7 @@ function parseHash() {
 	};
 }
 function showView(name) {
-	["list", "article", "podcasts", "library", "book", "record", "family"].forEach(function (v) { show($(v + "View"), v === name); });
+	["list", "article", "podcasts", "library", "book", "record", "listen", "family"].forEach(function (v) { show($(v + "View"), v === name); });
 	var top = name === "list" || name === "podcasts" || name === "library";
 	show($("tabs"), top);
 	show($("back"), !top);
@@ -8259,6 +8313,7 @@ async function route() {
 	openBookMenu(false);
 	if (details) closeDetails();
 	closeBookCtx();
+	renderPlayer();
 	state.item = null;
 	try {
 		if (LIST_VIEWS[r.name]) return await showList(r, prev);
@@ -8267,6 +8322,7 @@ async function route() {
 		if (r.name === "item" && r.id) return await openItem(r.id);
 		if (r.name === "book" && r.id) return await openBook(r.id);
 		if (r.name === "record" && r.id) return await showRecord(r.id);
+		if (r.name === "listen" && r.id) return await showListen(r.id);
 		if (r.name === "family") return await showFamily();
 		location.replace("#/unread");
 	} catch (e) { fail(e); }
@@ -8564,7 +8620,10 @@ $("famForm").addEventListener("submit", function (e) {
 });
 
 function goBack() {
-	if (state.fromList) history.back();
+	// The player page opens from the player bar, over whatever was showing.
+	var listening = state.route && state.route.name === "listen";
+	if (state.fromList || (listening && state.prev)) history.back();
+	else if (listening) location.hash = "#/record/" + state.route.id;
 	else location.hash = state.route && (state.route.name === "book" || state.route.name === "record") ? "#/library" : state.lastList;
 }
 
@@ -9455,8 +9514,11 @@ function playFailed(e) {
 }
 function renderPlayer() {
 	var ep = player.ep, audio = $("pAudio");
-	show($("pbar"), !!ep);
-	document.body.classList.toggle("has-pbar", !!ep);
+	// The player page has the bar's controls, so the bar steps aside there.
+	var bar = !!ep && !(onListen() && ep.book === state.route.id);
+	show($("pbar"), bar);
+	document.body.classList.toggle("has-pbar", bar);
+	renderListen();
 	if (!ep) return;
 	var dur = ep.book ? abTotal(ep) : audio.duration || epLen(ep), pos = ep.book ? abNow() : audio.currentTime || 0;
 	$("pName").textContent = ep.title;
@@ -9559,7 +9621,7 @@ function findListed(id) { return state.episodes.filter(function (e) { return e.i
 		if (id) repaintEpisode(id);
 		repaintRecord();
 	});
-	$("pTitle").addEventListener("click", function () { if (player.ep) location.hash = player.ep.book ? "#/record/" + player.ep.book : "#/item/" + player.ep.id; });
+	$("pTitle").addEventListener("click", function () { if (player.ep) location.hash = player.ep.book ? "#/listen/" + player.ep.book : "#/item/" + player.ep.id; });
 	$("pSeek").addEventListener("input", function () {
 		state.seeking = true;
 		var dur = player.ep && player.ep.book ? abTotal(player.ep) : audio.duration || epLen(player.ep || {});
@@ -9739,6 +9801,7 @@ function renderRecord(b) {
 	var tools = h("div", "rtools");
 	if (!off) tools.append(button("Edit details", "btn small", function () { openDetails(b); }));
 	if (e && window.caches) tools.append(bookDlButton(e));
+	if (au && !off) tools.append(button("Player", "btn small", function () { location.hash = "#/listen/" + au.id; }));
 	if (au && !off) tools.append(button("Download audiobook", "btn small", function () {
 		listenInfo(au.id).then(function (d) { location.href = d.download; }, fail);
 	}));
@@ -9973,6 +10036,140 @@ function keepListening(now, ended) {
 	setPosition(b, JSON.stringify({ t: Math.floor(t), f: ab.total ? Math.min(1, t / ab.total) : 0, at: Date.now() }), true);
 	if (ended) setFinished(b, true).then(repaintRecord, function () {});
 }
+
+// ---------- the player page
+// #/listen/<id>, opened from the player bar's title (or a Record's Player
+// button): the audiobook's square cover, the chapter playing with a slider
+// across just that chapter, the controls, and every chapter to jump to. It
+// drives the same audio as the bar, which steps aside while it shows. Opened
+// for a book that isn't in the bar, it shows that book's saved place, and
+// its controls start it.
+function onListen() { return !!(state.route && state.route.name === "listen" && state.listen); }
+async function showListen(id) {
+	showView("listen");
+	window.scrollTo(0, 0);
+	state.listen = null;
+	if (!state.books) await loadBooks();
+	var au = (state.books || []).filter(function (b) { return b.id === id && isAudiobook(b); })[0];
+	if (!au) {
+		toast("That audiobook isn't in the library any more.");
+		location.replace("#/library");
+		return;
+	}
+	var lp = state.listen = { au: au, chapters: [], cur: -1 };
+	document.title = au.title + " — Reader";
+	$("lpCover").textContent = "";
+	$("lpCover").append(coverBox(au));
+	$("lpTitle").textContent = au.title;
+	$("lpBy").textContent = au.author ? "by " + au.author : "";
+	$("lpRecord").href = "#/record/" + (libEntry(au.id) || au).id;
+	$("lpChapters").textContent = "";
+	$("lpChapSec").hidden = true;
+	// Nothing in the bar, or this book back from last time: ready to play from its place.
+	if (!player.ep || (playingBook(au) && !player.ab)) {
+		var t = listenLabel(au) === "Listen again" ? 0 : audioPos(au);
+		playAudiobook({ book: au.id, title: au.title, feed_title: au.author || "", duration: au.duration, t: t }, false, t).catch(fail);
+	}
+	renderPlayer();
+	var d;
+	try { d = await listenInfo(au.id); } catch (e) { return; }
+	if (state.listen !== lp) return;
+	lp.chapters = d.chapters || [];
+	if (lp.chapters.length > 1) {
+		lp.chapters.forEach(function (c, i) {
+			var li = h("li"), btn = h("button");
+			btn.type = "button";
+			btn.append(h("span", null, c.title || "Chapter " + (i + 1)), h("span", "chtime", clock(c.start)));
+			btn.addEventListener("click", function () { listenGo(c.start, true); });
+			li.append(btn);
+			$("lpChapters").append(li);
+		});
+		$("lpChapSec").hidden = false;
+	}
+	renderListen();
+}
+// Here: the page's book is the one in the bar, loaded.
+function listenHere() { var lp = state.listen; return !!(lp && playingBook(lp.au) && player.ab); }
+function listenGo(t, play) {
+	var lp = state.listen, audio = $("pAudio");
+	if (!lp) return;
+	if (listenHere()) abSeek(t, play != null ? play : !audio.paused);
+	else listenTo(lp.au, clamp(t, 0, Math.max(0, (lp.au.duration || 0) - 1)));
+}
+// The chapter at t: {i, start, end} (the whole book when it has no chapters).
+function listenChapter(t, total) {
+	var cs = state.listen.chapters, i = -1;
+	cs.forEach(function (c, n) { if (c.start <= t + 0.5) i = n; });
+	if (i < 0) return { i: -1, start: 0, end: total };
+	return { i: i, start: cs[i].start, end: cs[i + 1] ? cs[i + 1].start : total };
+}
+function renderListen() {
+	if (!onListen()) return;
+	var lp = state.listen, au = lp.au, audio = $("pAudio"), here = listenHere();
+	var t = audioPos(au), total = here ? player.ab.total : au.duration || 0, playing = here && !audio.paused;
+	var ch = listenChapter(t, total), len = Math.max(0, ch.end - ch.start), n = lp.chapters.length;
+	var c = lp.chapters[ch.i];
+	$("lpChap").textContent = n > 1 && c ? (c.title || "Chapter " + (ch.i + 1)) : "";
+	if (!state.lpSeeking) {
+		$("lpSeek").value = len ? Math.round((t - ch.start) / len * 1000) : 0;
+		$("lpPos").textContent = clock(Math.max(0, t - ch.start));
+		$("lpLeft").textContent = "−" + clock(Math.max(0, ch.end - t));
+	}
+	$("lpSeek").setAttribute("aria-label", n > 1 ? "Position in chapter" : "Position in book");
+	$("lpPlay").innerHTML = playing ? "&#10074;&#10074;" : "&#9654;";
+	$("lpPlay").setAttribute("aria-label", playing ? "Pause" : "Play");
+	$("lpNext").disabled = !(n > 1 && ch.i + 1 < n);
+	$("lpRate").textContent = player.rate + "×";
+	$("lpBook").textContent = (n > 1 && ch.i >= 0 ? "Chapter " + (ch.i + 1) + " of " + n + " · " : "") + hours(Math.max(0, total - t)) + " left";
+	if (ch.i !== lp.cur) {
+		lp.cur = ch.i;
+		var items = $("lpChapters").querySelectorAll("button");
+		items.forEach(function (x, k) { if (k === ch.i) x.setAttribute("aria-current", "true"); else x.removeAttribute("aria-current"); });
+		// Keep the chapter playing in view inside the list, not the page.
+		var on = items[ch.i], ol = $("lpChapters");
+		if (on) ol.scrollTop = on.parentNode.offsetTop - ol.offsetTop - ol.clientHeight / 3;
+	}
+}
+// Previous: back to this chapter's start, or the one before when it's only
+// just begun. Next: the next chapter's start.
+function chapterStep(by) {
+	var lp = state.listen;
+	if (!lp) return;
+	var t = audioPos(lp.au), ch = listenChapter(t, Infinity), cs = lp.chapters;
+	if (by < 0) listenGo(t - ch.start > 3 || ch.i <= 0 ? ch.start : cs[ch.i - 1].start);
+	else if (cs[ch.i + 1]) listenGo(cs[ch.i + 1].start);
+}
+(function () {
+	var audio = $("pAudio");
+	$("lpPlay").addEventListener("click", function () {
+		var lp = state.listen;
+		if (!lp) return;
+		if (!playingBook(lp.au)) return listenTo(lp.au);
+		if (!audio.src) return playEpisode(player.ep, true).catch(fail);
+		if (audio.paused) audio.play().catch(playFailed); else audio.pause();
+	});
+	$("lpBack").addEventListener("click", function () { if (state.listen) listenGo(audioPos(state.listen.au) - 15); });
+	$("lpFwd").addEventListener("click", function () { if (state.listen) listenGo(audioPos(state.listen.au) + 30); });
+	$("lpPrev").addEventListener("click", function () { chapterStep(-1); });
+	$("lpNext").addEventListener("click", function () { chapterStep(1); });
+	$("lpRate").addEventListener("click", function () { $("pRate").click(); });
+	var at = function (v) {
+		var lp = state.listen, here = listenHere();
+		var ch = listenChapter(audioPos(lp.au), here ? player.ab.total : lp.au.duration || 0);
+		return { ch: ch, t: ch.start + v / 1000 * (ch.end - ch.start) };
+	};
+	$("lpSeek").addEventListener("input", function () {
+		if (!state.listen) return;
+		state.lpSeeking = true;
+		var x = at(this.value);
+		$("lpPos").textContent = clock(x.t - x.ch.start);
+		$("lpLeft").textContent = "−" + clock(Math.max(0, x.ch.end - x.t));
+	});
+	$("lpSeek").addEventListener("change", function () {
+		state.lpSeeking = false;
+		if (state.listen) listenGo(at(this.value).t);
+	});
+})();
 
 // ---------- book tags
 // Books have their own tags, apart from the feed tags, with the same colors
