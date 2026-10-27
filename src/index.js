@@ -6364,6 +6364,18 @@ const PAGE = String.raw`<!doctype html>
 	.shows .ca { font-size: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 	@media (max-width: 520px) { .shows { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 12px; } }
 	.ephead-btns { display: flex; gap: 6px; flex: none; }
+	/* + Add on a gallery: search Apple's podcast directory, or paste a link. */
+	.epadd { margin: 10px 0 4px; }
+	.epaddrow { display: flex; gap: 8px; }
+	.epaddrow input { flex: 1; min-width: 0; }
+	.epaddrow .btn { flex: none; }
+	.found { list-style: none; margin: 8px 0 0; padding: 0; }
+	.found li { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+	.found img, .found .noart { flex: none; width: 52px; height: 52px; border-radius: 6px; object-fit: cover; background: var(--sel); }
+	.found .fi { flex: 1; min-width: 0; display: grid; }
+	.found .ft { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+	.found .fa { font-size: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+	.found .btn { flex: none; }
 	/* A show's name can be long: it wraps instead, and the buttons go under it if need be. */
 	#podcastsView .listhead { flex-wrap: wrap; }
 	#podcastsView .listhead h2 { white-space: normal; overflow-wrap: anywhere; }
@@ -6610,9 +6622,19 @@ const PAGE = String.raw`<!doctype html>
 	<div class="listhead">
 		<h2 id="epHead">Podcasts</h2>
 		<div class="ephead-btns">
+			<button id="epAdd" class="btn ghost small" type="button" aria-expanded="false" aria-controls="epAddBox" hidden>+ Add</button>
 			<button id="epAllRead" class="btn ghost small" type="button" hidden>Mark all read</button>
 			<button id="epFilter" class="btn ghost small" type="button" aria-pressed="false">Downloaded</button>
 		</div>
+	</div>
+	<div id="epAddBox" class="epadd" hidden>
+		<form id="epAddForm" class="epaddrow">
+			<label class="vh" for="epAddUrl">Search, or paste a link</label>
+			<input id="epAddUrl" type="search" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go">
+			<button id="epAddGo" class="btn primary" type="submit">Search</button>
+		</form>
+		<div id="epAddStatus" class="status" role="status" hidden></div>
+		<ul id="epFound" class="found"></ul>
 	</div>
 	<p id="epNote" class="hint" hidden></p>
 	<ul id="shows" class="shows" hidden></ul>
@@ -8114,16 +8136,11 @@ async function addFeed(e) {
 	$("addBtn").disabled = true;
 	addStatus("Looking for a feed…");
 	try {
-		var r = await discover(input);
-		var data = await apiJSON("/api/feeds", { method: "POST", json: {
-			url: r.url, feed_url: r.feed_url, mode: r.mode, title: r.title, site_url: r.site_url, tags: tagId ? [tagId] : []
-		} });
+		var x = await follow(input, tagId ? [tagId] : []), r = x.found, data = x.data;
 		var what = r.mode === "feed" ? "RSS feed found (" + r.kind + "): " : "No feed, watching the page: ";
 		if (data.existing) { addStatus("Already following " + data.feed.title + "."); return; }
-		var saved = await saveItems(data.feed.id, r.items, r.image);
-		var channel = await tagChannel(data.feed, r.items);
-		addStatus(what + data.feed.title + " — " + saved.inserted + " item" + (saved.inserted === 1 ? "" : "s")
-			+ (channel ? ", tagged “" + channel + "”." : "."));
+		addStatus(what + data.feed.title + " — " + x.inserted + " item" + (x.inserted === 1 ? "" : "s")
+			+ (x.channel ? ", tagged “" + x.channel + "”." : "."));
 		$("addUrl").value = "";
 		await loadFeeds();
 		fillTagSelect();
@@ -8133,6 +8150,17 @@ async function addFeed(e) {
 	} finally {
 		$("addBtn").disabled = false;
 	}
+}
+// Find the feed at what was typed, save it and its items. Podcasts and
+// Videos sort themselves out by the items' files, so both adds use this.
+async function follow(input, tags) {
+	var r = await discover(input);
+	var data = await apiJSON("/api/feeds", { method: "POST", json: {
+		url: r.url, feed_url: r.feed_url, mode: r.mode, title: r.title, site_url: r.site_url, tags: tags
+	} });
+	if (data.existing) return { found: r, data: data, inserted: 0, channel: null };
+	var saved = await saveItems(data.feed.id, r.items, r.image || await channelImage(data.feed, r.items));
+	return { found: r, data: data, inserted: saved.inserted, channel: await tagChannel(data.feed, r.items) };
 }
 // A new podcast or video channel gets a tag named after it, which keeps it
 // out of the news tabs' tag list. Only when most of what the
@@ -9238,6 +9266,7 @@ async function showPodcasts(r) {
 	var back = state.prev && state.prev.name === "item";
 	var changed = !sameId(state.epFeed, r.feed) || state.epKind !== r.name;
 	if (changed) state.episodes = [];
+	if (state.epKind !== r.name) { openEpAdd(false); $("epFound").textContent = ""; epAddStatus(""); $("epAddUrl").value = ""; }
 	state.epKind = r.name;
 	state.epFeed = r.feed;
 	showView("podcasts");
@@ -9267,6 +9296,8 @@ function renderEpHead() {
 	up.href = "#/" + state.epKind;
 	show(up, state.epFeed != null);
 	show($("epAllRead"), !!f && showStats(f).unread > 0);
+	show($("epAdd"), galleryOn());
+	if (!galleryOn()) openEpAdd(false);
 }
 // Shows the gallery from the feeds already here at once, then again with
 // fresh counts (an episode opened since is read now).
@@ -9315,6 +9346,108 @@ function renderShows() {
 	show($("epNote"), state.epOffline && !!ul.children.length);
 	paintEpFilter();
 }
+// + Add on a gallery. Podcasts: words search Apple's podcast directory (no
+// key needed), a link is followed as is (an Apple Podcasts page is looked up
+// there for its feed). Videos: a channel's link or its @handle; YouTube has
+// no search without an API key.
+var ITUNES = "https://itunes.apple.com/";
+function looksLikeLink(v) { return /^(https?:\/\/|www\.)|^[\w-]+(\.[\w-]+)+(\/|$)/i.test(v) || /^@[\w.-]+$/.test(v); }
+function openEpAdd(on) {
+	show($("epAddBox"), on);
+	$("epAdd").setAttribute("aria-expanded", String(on));
+	$("epAdd").classList.toggle("on", on);
+	if (!on) return;
+	var videos = state.epKind === "videos";
+	$("epAddUrl").placeholder = videos ? "Paste a YouTube channel link or @handle" : "Search podcasts, or paste a feed link";
+	paintEpAddGo();
+	$("epAddUrl").focus();
+}
+function paintEpAddGo() {
+	var v = $("epAddUrl").value.trim();
+	$("epAddGo").textContent = state.epKind === "videos" || looksLikeLink(v) ? "Add" : "Search";
+}
+function epAddStatus(msg, bad) {
+	var s = $("epAddStatus");
+	s.textContent = msg;
+	s.classList.toggle("err", !!bad);
+	show(s, !!msg);
+}
+async function epAddSubmit(e) {
+	e.preventDefault();
+	var v = $("epAddUrl").value.trim();
+	if (!v) return;
+	$("epFound").textContent = "";
+	if (state.epKind === "videos" || looksLikeLink(v)) return epFollow(await epLink(v));
+	$("epAddGo").disabled = true;
+	epAddStatus("Searching…");
+	try {
+		var res = await itunes("search?media=podcast&entity=podcast&limit=12&term=" + encodeURIComponent(v));
+		var list = res.filter(function (x) { return x.feedUrl; });
+		epAddStatus(list.length ? "" : "Nothing found for “" + v + "”. A feed link works too.");
+		list.forEach(function (x) { $("epFound").append(foundRow(x)); });
+	} catch (err) {
+		if (err.message !== UNAUTH) epAddStatus("Couldn't search: " + err.message, true);
+	} finally { $("epAddGo").disabled = false; }
+}
+async function itunes(path) {
+	var r = await proxyGet(ITUNES + path);
+	return JSON.parse(r.text).results || [];
+}
+// What a typed link means: an @handle is a YouTube channel, and an Apple
+// Podcasts page's feed is in Apple's directory.
+async function epLink(v) {
+	if (/^@[\w.-]+$/.test(v)) return "https://www.youtube.com/" + v;
+	var m = /podcasts\.apple\.com\/.*\/id(\d+)/.exec(v);
+	if (m) {
+		try {
+			var hit = (await itunes("lookup?entity=podcast&id=" + m[1]))[0];
+			if (hit && hit.feedUrl) return hit.feedUrl;
+		} catch (e) {}
+	}
+	return v;
+}
+function foundRow(x) {
+	var li = h("li"), info = h("div", "fi"), b = h("button", "btn small", "Add");
+	var f = state.feeds.filter(function (y) { return y.feed_url === x.feedUrl; })[0];
+	if (x.artworkUrl100) {
+		var img = h("img");
+		img.alt = "";
+		img.loading = "lazy";
+		img.src = x.artworkUrl100.replace(/^http:/, "https:");
+		li.append(img);
+	} else li.append(h("span", "noart"));
+	info.append(h("span", "ft", x.collectionName || x.trackName || x.feedUrl), h("span", "fa", x.artistName || ""));
+	b.type = "button";
+	if (f) { b.textContent = "Added"; b.disabled = true; }
+	b.addEventListener("click", function () { epFollow(x.feedUrl, b); });
+	li.append(info, b);
+	return li;
+}
+async function epFollow(link, btn) {
+	if (btn) btn.disabled = true;
+	$("epAddGo").disabled = true;
+	epAddStatus("Looking for a feed…");
+	try {
+		var x = await follow(link, []), feed = x.data.feed;
+		if (x.found.mode !== "feed" && !x.data.existing) {
+			// A page with no feed would be watched as news: not wanted here.
+			await apiJSON("/api/feeds/" + feed.id, { method: "DELETE" });
+			throw new Error("there's no feed at that address");
+		}
+		await loadFeeds();
+		var mine = state.feeds.filter(function (y) { return y.id === feed.id; })[0] || feed;
+		var where = mine.videos > 0 && state.epKind !== "videos" ? " It's under Videos." : mine.episodes > 0 && state.epKind !== "podcasts" ? " It's under Podcasts."
+			: !mine.episodes && !mine.videos ? " It has no episodes or videos, so it's with the news feeds." : "";
+		epAddStatus((x.data.existing ? "Already following " : "Added ") + feed.title + "." + where);
+		if (btn) btn.textContent = "Added";
+		else $("epAddUrl").value = "";
+		renderShows();
+	} catch (err) {
+		if (btn) btn.disabled = false;
+		if (err.message !== UNAUTH) epAddStatus("Couldn't add that: " + err.message, true);
+	} finally { $("epAddGo").disabled = false; }
+}
+
 // A show's artwork; a tile with its name where it has none, or the picture
 // doesn't load.
 var HEADPHONES_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></svg>';
@@ -9328,7 +9461,7 @@ function showArt(box, f, videos) {
 		g.setAttribute("aria-hidden", "true");
 		g.append(h("span", null, f.title));
 		g.insertAdjacentHTML("beforeend", videos ? SCREEN_SVG : HEADPHONES_SVG);
-		box.append(g);
+		box.prepend(g);
 	};
 	if (!f.image_url) return draw();
 	var img = h("img");
@@ -9938,6 +10071,9 @@ function findListed(id) { return state.episodes.filter(function (e) { return e.i
 		state.episodes = [];
 		reloadPodcasts().catch(fail);
 	});
+	$("epAdd").addEventListener("click", function () { openEpAdd($("epAddBox").hidden); });
+	$("epAddForm").addEventListener("submit", function (e) { epAddSubmit(e).catch(fail); });
+	$("epAddUrl").addEventListener("input", paintEpAddGo);
 	// Clears a show's unread count; the episodes stay unplayed.
 	$("epAllRead").addEventListener("click", async function () {
 		var f = epShow();
