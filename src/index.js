@@ -3087,11 +3087,13 @@ async function absSync(env) {
 }
 
 // An audiobook's files and chapters, from ABS the first time:
-// {files: [{ino, size, duration, mime, ext, name}], chapters: [{start, title}]}.
+// {files: [{ino, size, duration, mime, ext, name}], chapters: [{start, title}],
+// looked: "audible" | "none" (one file with no chapters: what audibleChapters found)}.
 async function absMedia(env, book) {
 	try {
 		const kept = JSON.parse(book.abs_media || "null");
-		if (kept) return fileChapters(kept);
+		// One kept from before the Audible lookup, with nothing to pick from, is fetched again.
+		if (kept && (kept.chapters.length > 1 || kept.files.length > 1 || kept.looked)) return fileChapters(kept);
 	} catch {}
 	const item = await absJSON(env, `/api/items/${encodeURIComponent(book.abs_id)}?expanded=1`);
 	const files = (item.media?.audioFiles || [])
@@ -3107,8 +3109,65 @@ async function absMedia(env, book) {
 		.map((c) => ({ start: Math.max(0, Number(c.start) || 0), title: str(String(c.title ?? ""), 200) || "" }))
 		.sort((a, b) => a.start - b.start);
 	const media = { files, chapters };
+	// A single file with no chapters in it (an .m4b without chapter marks): Audible's, when they fit.
+	if (chapters.length < 2 && files.length === 1) {
+		const found = await audibleChapters(item.media?.metadata || {}, files[0].duration);
+		// A failed lookup (Audible unreachable) isn't kept, so the next play tries again.
+		if (found) {
+			media.looked = found.length ? "audible" : "none";
+			if (found.length) media.chapters = found;
+		}
+	}
 	await env.DB.prepare("UPDATE books SET abs_media = ? WHERE id = ?").bind(JSON.stringify(media), book.id).run();
 	return fileChapters(media);
+}
+
+// Chapters from Audible (through Audnexus, as ABS's own "Lookup" does) for a
+// file that has none: by the book's ASIN in ABS, or else the Audible release
+// of its title and author that runs as long as the file. Taken only when the
+// lengths agree, as they are or with Audible's intro and outro cut from the
+// file, since chapters from another recording would land in the wrong places.
+// -> [{start, title}], [] when nothing fits, or null when a lookup failed.
+async function audibleChapters(meta, duration) {
+	const get = async (url) => {
+		const res = await fetch(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(8000) });
+		if (res.status === 404) return null;
+		if (!res.ok) throw new Error(`${res.status} from ${new URL(url).host}`);
+		return res.json();
+	};
+	const fits = (sec) => Math.abs(sec - duration) <= Math.max(30, duration * 0.002);
+	try {
+		const asins = [];
+		if (/^[A-Z0-9]{10}$/i.test(meta.asin || "")) asins.push(meta.asin.toUpperCase());
+		else if (meta.title) {
+			const q = new URLSearchParams({ title: meta.title, num_results: "10", products_sort_by: "Relevance", response_groups: "product_attrs" });
+			const author = String(meta.authorName || "").split(",")[0].trim();
+			if (author) q.set("author", author);
+			const found = await get(`https://api.audible.com/1.0/catalog/products?${q}`);
+			for (const p of found?.products || []) {
+				// The catalog gives whole minutes; Audnexus's exact length is checked below.
+				if (p.asin && Math.abs((p.runtime_length_min || 0) * 60 - duration) <= 180) asins.push(p.asin);
+			}
+		}
+		for (const asin of asins.slice(0, 3)) {
+			const d = await get(`https://api.audnex.us/books/${asin}/chapters?region=us`);
+			const list = (d?.chapters || []).filter((c) => Number.isFinite(c.startOffsetMs));
+			if (list.length < 2) continue;
+			const runtime = (d.runtimeLengthMs || 0) / 1000, intro = (d.brandIntroDurationMs || 0) / 1000, outro = (d.brandOutroDurationMs || 0) / 1000;
+			let shift = 0;
+			if (!fits(runtime)) {
+				if (!(intro + outro) || !fits(runtime - intro - outro)) continue;
+				shift = intro;
+			}
+			return list
+				.map((c) => ({ start: Math.max(0, c.startOffsetMs / 1000 - shift), title: str(String(c.title ?? ""), 200) || "" }))
+				.filter((c) => c.start < duration)
+				.sort((a, b) => a.start - b.start);
+		}
+		return [];
+	} catch {
+		return null;
+	}
 }
 // A book in several files with no chapters of its own: a chapter per file,
 // named for the file ("03 - The Well" -> "The Well"), or Part n.
