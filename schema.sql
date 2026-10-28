@@ -119,10 +119,14 @@ CREATE TABLE IF NOT EXISTS books (
 	duration INTEGER,
 	abs_updated INTEGER,
 	abs_media TEXT,
-	gone_at INTEGER
+	gone_at INTEGER,
+	-- An ebook from Audiobookshelf (migration 0019): its item id. Its r2_key
+	-- starts "absbook/", and its file is read from there, not R2.
+	abs_ebook TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS books_abs_id ON books (abs_id) WHERE abs_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS books_abs_ebook ON books (abs_ebook) WHERE abs_ebook IS NOT NULL;
 
 -- Tags for feeds. A feed can carry any number of them, and the page filters
 -- the feed and item lists by one. Names are unique ignoring case. Removing a
