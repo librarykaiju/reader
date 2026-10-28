@@ -9998,6 +9998,14 @@ async function removeDownload(id) {
 
 // The player bar
 var player = { ep: null, url: null, savedAt: 0, rate: Number(read("readerRate")) || 1 };
+// The sleep timer, set on an audiobook's player page or a podcast episode's
+// page: pause after some minutes of listening (the last 10 seconds fade out
+// where the browser lets a page set the volume), or at the end of the
+// chapter playing (of the episode, for a podcast). It counts only while
+// something plays, and goes with the bar's ×.
+// Up here with the player because the bar paints it, and the bar is
+// restored ("Back where you left off") as the page starts.
+var sleep = { left: null, end: null, last: 0, timer: null };
 var RATES = [0.8, 1, 1.2, 1.5, 1.75, 2];
 async function playEpisode(ep, start) {
 	var audio = $("pAudio");
@@ -10780,12 +10788,6 @@ function chapterStep(by) {
 	});
 })();
 
-// The sleep timer, set on an audiobook's player page or a podcast episode's
-// page: pause after some minutes of listening (the last 10 seconds fade out
-// where the browser lets a page set the volume), or at the end of the
-// chapter playing (of the episode, for a podcast). It counts only while
-// something plays, and goes with the bar's ×.
-var sleep = { left: null, end: null, last: 0, timer: null };
 // Where the chapter at t ends in the whole book (its end, with no chapters).
 function sleepChapterEnd(t) {
 	var ab = player.ab, cs = (player.ep && listenCache[player.ep.book] || {}).chapters || [];
