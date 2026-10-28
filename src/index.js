@@ -5892,10 +5892,6 @@ const PAGE = String.raw`<!doctype html>
 	html { -webkit-text-size-adjust: 100%; overflow-x: hidden; overflow-x: clip; touch-action: pan-x pan-y; }
 	html.zoomable { touch-action: auto; }
 	body { overflow-x: clip; margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.45 var(--sans); }
-	/* --lost: how far the page runs past the bottom of the screen, which iOS 26
-	   does in home-screen apps (fitScreen() measures it; 0 everywhere else).
-	   The end of every page and each bar pinned to the bottom move up by it. */
-	body { padding-bottom: var(--lost, 0px); }
 	a { color: var(--accent); }
 	button, input, select { font: inherit; color: inherit; }
 	[hidden] { display: none !important; }
@@ -5968,9 +5964,9 @@ const PAGE = String.raw`<!doctype html>
 	.menu { display: grid; gap: 8px; }
 	.txt mark.hl { background: var(--hl); color: inherit; border-radius: 2px; cursor: pointer; }
 	.txt mark.hl.noted { text-decoration: underline dotted; text-decoration-thickness: 2px; text-underline-offset: 3px; }
-	.hlbar { position: fixed; z-index: 16; left: 50%; transform: translateX(-50%); bottom: calc(16px + env(safe-area-inset-bottom) + var(--lost, 0px)); display: flex; gap: 8px;
+	.hlbar { position: fixed; z-index: 16; left: 50%; transform: translateX(-50%); bottom: calc(16px + env(safe-area-inset-bottom)); display: flex; gap: 8px;
 		background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 8px; box-shadow: 0 6px 20px rgba(0,0,0,.18); font-family: var(--sans); }
-	body.has-pbar .hlbar { bottom: calc(106px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
+	body.has-pbar .hlbar { bottom: calc(106px + env(safe-area-inset-bottom)); }
 	.hlpop { font-family: var(--sans); width: min(400px, calc(100vw - 32px)); max-height: calc(100vh - 90px - env(safe-area-inset-top)); overflow: auto; }
 	.hlquote { margin: 0 0 10px; padding: 2px 0 2px 10px; border-left: 3px solid var(--hl-edge); font: 15px/1.45 var(--serif); white-space: pre-line; overflow-wrap: anywhere; }
 	.hlpop textarea { width: 100%; box-sizing: border-box; font: 15px/1.4 var(--sans); padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); resize: vertical; }
@@ -6423,9 +6419,9 @@ const PAGE = String.raw`<!doctype html>
 	.episode .lpsleep { width: 100%; margin-top: 0; }
 	.episode .when { color: var(--muted); font-size: 14px; font-variant-numeric: tabular-nums; }
 	.btn.on { border-color: var(--accent); color: var(--accent); }
-	body.has-pbar { padding-bottom: calc(96px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
-	body.has-pbar .toast { bottom: calc(110px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
-	.pbar { position: fixed; left: 0; right: 0; bottom: var(--lost, 0px); z-index: 15; background: var(--card); border-top: 1px solid var(--line);
+	body.has-pbar { padding-bottom: calc(96px + env(safe-area-inset-bottom)); }
+	body.has-pbar .toast { bottom: calc(110px + env(safe-area-inset-bottom)); }
+	.pbar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 15; background: var(--card); border-top: 1px solid var(--line);
 		padding: 4px 12px calc(6px + env(safe-area-inset-bottom)); box-shadow: 0 -4px 16px rgba(0,0,0,.08); }
 	.pbar input[type=range] { display: block; width: 100%; max-width: 1076px; margin: 0 auto; accent-color: var(--accent); }
 	.prow { display: flex; align-items: center; gap: 2px; max-width: 1076px; margin: 0 auto; }
@@ -6457,7 +6453,7 @@ const PAGE = String.raw`<!doctype html>
 	.farpill button { background: none; border: 0; color: inherit; font: inherit; min-height: 40px; cursor: pointer; white-space: nowrap; }
 	#farGo { padding: 8px 6px 8px 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
 	#farX { padding: 8px 14px 8px 8px; opacity: .7; }
-	.toast { position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom) + var(--lost, 0px)); transform: translateX(-50%); z-index: 30;
+	.toast { position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 30;
 		background: var(--fg); color: var(--bg); padding: 10px 14px; border-radius: 10px; font-size: 14px; max-width: calc(100vw - 32px); }
 	.toast.act { display: flex; align-items: center; width: max-content; }
 	.toast button { flex: none; white-space: nowrap; margin-left: 12px; border: 0; border-radius: 8px; padding: 6px 10px; background: var(--bg); color: var(--fg); font-weight: 600; font-size: 14px; cursor: pointer; }
@@ -14166,18 +14162,6 @@ document.addEventListener("keydown", function (e) {
 }, true);
 window.addEventListener("scroll", closeBookCtx, { passive: true });
 window.addEventListener("resize", closeBookCtx);
-// iOS 26 can lay a home-screen app out taller than the screen, so the last
-// part of every page (Previous/Next, the bottom of the feed list) sits below
-// the edge where no scrolling reaches it. Upright, the page should never be
-// taller than the screen; whatever it's over by is lifted back into view.
-function fitScreen() {
-	var app = navigator.standalone || matchMedia("(display-mode: standalone)").matches;
-	var upright = window.innerHeight > window.innerWidth;
-	var lost = app && upright ? Math.max(0, Math.round(window.innerHeight - Math.max(screen.width, screen.height))) : 0;
-	document.documentElement.style.setProperty("--lost", lost + "px");
-}
-fitScreen();
-window.addEventListener("resize", fitScreen);
 $("bookSearch").addEventListener("input", function () { state.libSearch = this.value; if (state.books) renderBooks(); });
 $("bookSort").value = state.libSort;
 $("bookSort").addEventListener("change", function () { state.libSort = this.value; store("readerBookSort", this.value === "recent" ? null : this.value); if (state.books) renderBooks(); });
