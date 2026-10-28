@@ -3086,11 +3086,11 @@ async function absSync(env) {
 }
 
 // An audiobook's files and chapters, from ABS the first time:
-// {files: [{ino, size, duration, mime, ext}], chapters: [{start, title}]}.
+// {files: [{ino, size, duration, mime, ext, name}], chapters: [{start, title}]}.
 async function absMedia(env, book) {
 	try {
 		const kept = JSON.parse(book.abs_media || "null");
-		if (kept) return kept;
+		if (kept) return fileChapters(kept);
 	} catch {}
 	const item = await absJSON(env, `/api/items/${encodeURIComponent(book.abs_id)}?expanded=1`);
 	const files = (item.media?.audioFiles || [])
@@ -3099,6 +3099,7 @@ async function absMedia(env, book) {
 		.map((f) => ({
 			ino: String(f.ino), size: f.metadata?.size || 0, duration: f.duration || 0,
 			mime: MEDIA_TYPE.test(f.mimeType || "") ? f.mimeType : "audio/mpeg", ext: String(f.metadata?.ext || "").replace(/[^\w]/g, "").slice(0, 8),
+			name: str(String(f.metadata?.filename || "").replace(/\.\w{1,8}$/, ""), 200) || "",
 		}));
 	if (!files.length) throw new HttpError(404, "Audiobookshelf has no audio for this book");
 	const chapters = (item.media?.chapters || [])
@@ -3106,7 +3107,19 @@ async function absMedia(env, book) {
 		.sort((a, b) => a.start - b.start);
 	const media = { files, chapters };
 	await env.DB.prepare("UPDATE books SET abs_media = ? WHERE id = ?").bind(JSON.stringify(media), book.id).run();
-	return media;
+	return fileChapters(media);
+}
+// A book in several files with no chapters of its own: a chapter per file,
+// named for the file ("03 - The Well" -> "The Well"), or Part n.
+function fileChapters(media) {
+	if ((media.chapters || []).length > 1 || media.files.length < 2) return media;
+	let start = 0;
+	const chapters = media.files.map((f, n) => {
+		const c = { start, title: String(f.name || "").replace(/^\s*(?:track|part|disc|cd)?\s*\d+\s*[-_.):]*\s*/i, "").trim() || `Part ${n + 1}` };
+		start += f.duration || 0;
+		return c;
+	});
+	return { ...media, chapters };
 }
 
 // An audiobook's cover from Audiobookshelf, 600 px wide (an original can be
@@ -6197,8 +6210,17 @@ const PAGE = String.raw`<!doctype html>
 	.lpcov .gencover .gt { font-size: 22px; }
 	.lpcov .gencover .ga { font-size: 15px; }
 	.lpmain { min-width: 0; font-family: var(--sans); }
-	.lpchap { margin: 16px 0 0; font-weight: 600; color: var(--accent); overflow-wrap: anywhere; }
-	.lpchap:empty { display: none; }
+	.lpchap { display: inline-block; max-width: 100%; margin: 16px 0 0; padding: 4px 0; border: 0; background: none; font: inherit; font-weight: 600; color: var(--accent); text-align: inherit; overflow-wrap: anywhere; cursor: pointer; }
+	.lpchap::after { content: " \25BE"; font-size: .8em; }
+	.lpchap[hidden] { display: none; }
+	/* The chapter picker, from the chapter's name or the Chapters button. */
+	.chapdlg { width: min(480px, calc(100vw - 32px)); max-height: min(560px, calc(100vh - 80px)); padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); color: var(--fg); font-family: var(--sans); box-shadow: 0 10px 30px rgba(0,0,0,.25); }
+	.chapdlg[open] { display: flex; flex-direction: column; }
+	.chapdlg::backdrop { background: rgba(0,0,0,.4); }
+	.chapdlghd { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+	.chapdlghd h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0; }
+	.chapdlghd .btn { min-width: 40px; min-height: 40px; font-size: 20px; }
+	#lpChapPick { flex: 1 1 auto; min-height: 0; max-height: none; background: var(--bg); }
 	#lpSeek { display: block; width: 100%; margin: 14px 0 2px; accent-color: var(--accent); }
 	.lptimes { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
 	.lpctl { display: flex; align-items: center; justify-content: space-between; gap: 4px; max-width: 360px; margin: 14px 0 0; }
@@ -6723,7 +6745,7 @@ const PAGE = String.raw`<!doctype html>
 			<p class="reye">Listening</p>
 			<h2 id="lpTitle" class="rtitle"></h2>
 			<p id="lpBy" class="rby"></p>
-			<p id="lpChap" class="lpchap"></p>
+			<button id="lpChap" class="lpchap" type="button" aria-haspopup="dialog" hidden></button>
 			<input id="lpSeek" class="seek" type="range" min="0" max="1000" value="0" step="1" aria-label="Position in chapter">
 			<div class="lptimes"><span id="lpPos"></span><span id="lpLeft"></span></div>
 			<div class="lpctl">
@@ -6735,6 +6757,7 @@ const PAGE = String.raw`<!doctype html>
 			</div>
 			<div class="lpmore">
 				<button id="lpRate" class="btn small" type="button" aria-label="Playback speed">1&times;</button>
+				<button id="lpChapBtn" class="btn small" type="button" aria-haspopup="dialog" hidden>Chapters</button>
 				<button id="lpSleep" class="btn small sleepbtn" type="button" aria-controls="lpSleepOpts">Sleep</button>
 				<span id="lpBook"></span>
 				<a id="lpRecord" href="#/library">Record</a>
@@ -6753,6 +6776,10 @@ const PAGE = String.raw`<!doctype html>
 		<h3>Chapters</h3>
 		<ol id="lpChapters" class="chapters"></ol>
 	</section>
+	<dialog id="lpChapDlg" class="chapdlg" aria-labelledby="lpChapDlgH">
+		<div class="chapdlghd"><h2 id="lpChapDlgH">Chapters</h2><button id="lpChapClose" class="btn ghost" type="button" aria-label="Close">&times;</button></div>
+		<ol id="lpChapPick" class="chapters"></ol>
+	</dialog>
 </section>
 
 <section id="familyView" class="wrap" hidden>
@@ -8459,6 +8486,7 @@ function parseHash() {
 }
 function showView(name) {
 	["list", "article", "podcasts", "library", "book", "record", "listen", "family"].forEach(function (v) { show($(v + "View"), v === name); });
+	if ($("lpChapDlg").open) $("lpChapDlg").close();
 	var top = name === "list" || name === "podcasts" || name === "library";
 	show($("tabs"), top);
 	show($("back"), !top);
@@ -10492,8 +10520,8 @@ async function showListen(id) {
 	$("lpTitle").textContent = au.title;
 	$("lpBy").textContent = au.author ? "by " + au.author : "";
 	$("lpRecord").href = "#/record/" + (libEntry(au.id) || au).id;
-	$("lpChapters").textContent = "";
-	$("lpChapSec").hidden = true;
+	$("lpChapters").textContent = $("lpChapPick").textContent = "";
+	$("lpChapSec").hidden = $("lpChapBtn").hidden = true;
 	// Nothing in the bar, or this book back from last time: ready to play from its place.
 	if (!player.ep || (playingBook(au) && !player.ab)) {
 		var t = listenLabel(au) === "Listen again" ? 0 : audioPos(au);
@@ -10505,17 +10533,28 @@ async function showListen(id) {
 	if (state.listen !== lp) return;
 	lp.chapters = d.chapters || [];
 	if (lp.chapters.length > 1) {
-		lp.chapters.forEach(function (c, i) {
-			var li = h("li"), btn = h("button");
-			btn.type = "button";
-			btn.append(h("span", null, c.title || "Chapter " + (i + 1)), h("span", "chtime", clock(c.start)));
-			btn.addEventListener("click", function () { listenGo(c.start, true); });
-			li.append(btn);
-			$("lpChapters").append(li);
+		// The same list twice: under the controls, and in the picker.
+		[$("lpChapters"), $("lpChapPick")].forEach(function (ol) {
+			lp.chapters.forEach(function (c, i) {
+				var li = h("li"), btn = h("button");
+				btn.type = "button";
+				btn.append(h("span", null, c.title || "Chapter " + (i + 1)), h("span", "chtime", clock(c.start)));
+				btn.addEventListener("click", function () {
+					if ($("lpChapDlg").open) $("lpChapDlg").close();
+					listenGo(c.start, true);
+				});
+				li.append(btn);
+				ol.append(li);
+			});
 		});
-		$("lpChapSec").hidden = false;
+		$("lpChapSec").hidden = $("lpChapBtn").hidden = false;
 	}
 	renderListen();
+}
+// Keep a chapter list's current one in view inside the list, not the page.
+function chapterInView(ol) {
+	var on = ol.querySelector("[aria-current]");
+	if (on) ol.scrollTop = on.parentNode.offsetTop - ol.offsetTop - ol.clientHeight / 3;
 }
 // Here: the page's book is the one in the bar, loaded.
 function listenHere() { var lp = state.listen; return !!(lp && playingBook(lp.au) && player.ab); }
@@ -10539,6 +10578,8 @@ function renderListen() {
 	var ch = listenChapter(t, total), len = Math.max(0, ch.end - ch.start), n = lp.chapters.length;
 	var c = lp.chapters[ch.i];
 	$("lpChap").textContent = n > 1 && c ? (c.title || "Chapter " + (ch.i + 1)) : "";
+	$("lpChap").hidden = !(n > 1 && c);
+	$("lpChap").setAttribute("aria-label", n > 1 && c ? "Chapter: " + $("lpChap").textContent + ". Choose a chapter" : "");
 	if (!state.lpSeeking) {
 		$("lpSeek").value = len ? Math.round((t - ch.start) / len * 1000) : 0;
 		seekFill($("lpSeek"));
@@ -10554,11 +10595,10 @@ function renderListen() {
 	$("lpBook").textContent = (n > 1 && ch.i >= 0 ? "Chapter " + (ch.i + 1) + " of " + n + " · " : "") + hours(Math.max(0, total - t)) + " left";
 	if (ch.i !== lp.cur) {
 		lp.cur = ch.i;
-		var items = $("lpChapters").querySelectorAll("button");
-		items.forEach(function (x, k) { if (k === ch.i) x.setAttribute("aria-current", "true"); else x.removeAttribute("aria-current"); });
-		// Keep the chapter playing in view inside the list, not the page.
-		var on = items[ch.i], ol = $("lpChapters");
-		if (on) ol.scrollTop = on.parentNode.offsetTop - ol.offsetTop - ol.clientHeight / 3;
+		[$("lpChapters"), $("lpChapPick")].forEach(function (ol) {
+			ol.querySelectorAll("button").forEach(function (x, k) { if (k === ch.i) x.setAttribute("aria-current", "true"); else x.removeAttribute("aria-current"); });
+			chapterInView(ol);
+		});
 	}
 }
 // Previous: back to this chapter's start, or the one before when it's only
@@ -10584,6 +10624,20 @@ function chapterStep(by) {
 	$("lpPrev").addEventListener("click", function () { chapterStep(-1); });
 	$("lpNext").addEventListener("click", function () { chapterStep(1); });
 	$("lpRate").addEventListener("click", function () { $("pRate").click(); });
+	// The chapter's name and the Chapters button open the picker.
+	var dlg = $("lpChapDlg"), pick = function () {
+		if (!state.listen || state.listen.chapters.length < 2) return;
+		dlg.showModal();
+		chapterInView($("lpChapPick"));
+	};
+	$("lpChap").addEventListener("click", pick);
+	$("lpChapBtn").addEventListener("click", pick);
+	$("lpChapClose").addEventListener("click", function () { dlg.close(); });
+	// A tap on the dimmed page around it closes it.
+	dlg.addEventListener("click", function (e) {
+		var r = dlg.getBoundingClientRect();
+		if (e.target === dlg && (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom)) dlg.close();
+	});
 	var at = function (v) {
 		var lp = state.listen, here = listenHere();
 		var ch = listenChapter(audioPos(lp.au), here ? player.ab.total : lp.au.duration || 0);
