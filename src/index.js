@@ -4945,7 +4945,12 @@ function renderFormats() {
 		var btn = h("button", null, k ? FORMATS[k] : "All");
 		btn.type = "button";
 		btn.setAttribute("aria-pressed", String(k === format));
-		btn.addEventListener("click", function () { format = k; renderFormats(); render(); });
+		btn.addEventListener("click", function () {
+			format = k;
+			if (k && pick) { pick = null; renderRecs(); }
+			renderFormats();
+			render();
+		});
 		box.append(btn);
 	});
 }
@@ -5085,7 +5090,9 @@ function genreButton(g) {
 	btn.append(art, h("span", "gl", g.label), h("span", "gn", g.n + (g.n === 1 ? " book" : " books")));
 	btn.addEventListener("click", function () {
 		pick = pick && pick.id === g.id ? null : g;
-		if (pick) { tag = ""; $("tag").value = ""; }
+		// A pick starts from the whole library: a format or tag left on would
+		// narrow it, often to nothing.
+		if (pick) { tag = ""; $("tag").value = ""; if (format) { format = ""; renderFormats(); } }
 		renderRecs();
 		render();
 	});
