@@ -4636,6 +4636,27 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.chapdlghd h2 { font: 600 13px/1.3 var(--sans); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0; }
 	.chapdlghd .x { appearance: none; min-width: 40px; min-height: 40px; border: 0; background: none; color: var(--accent); font-size: 24px; cursor: pointer; }
 	.chapdlg .chapters { flex: 1 1 auto; min-height: 0; max-height: none; background: var(--bg); }
+	/* The player bar: the book playing, pinned to the bottom while the library is browsed. */
+	.lbar { position: fixed; left: 0; right: 0; bottom: var(--lost, 0px); z-index: 15; background: var(--card); border-top: 1px solid var(--line);
+		padding: 8px 12px calc(8px + env(safe-area-inset-bottom)); box-shadow: 0 -4px 18px rgba(0,0,0,.08); font-family: var(--sans); }
+	.lbar[hidden] { display: none; }
+	.lbprog { position: absolute; left: 0; right: 0; top: -1px; height: 3px; }
+	.lbprog span { display: block; height: 100%; width: 0; background: var(--accent); }
+	.lbrow { display: flex; align-items: center; gap: 4px; max-width: 760px; margin: 0 auto; }
+	.lbtitle { flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px; color: inherit; text-decoration: none; }
+	.lbcov { flex: none; width: 44px; }
+	.lbcov .cover { aspect-ratio: 1; margin: 0; border-radius: 4px; }
+	.lbcov .gencover > * { display: none; }
+	.lbtext { min-width: 0; display: flex; flex-direction: column; }
+	#lbName { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+	#lbTime { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+	.lbar button { appearance: none; flex: none; min-width: 44px; min-height: 44px; padding: 0 4px; border: 0; background: none; color: var(--accent); font: inherit; font-size: 15px; font-variant-numeric: tabular-nums; cursor: pointer; }
+	.lbar .pplay { width: 46px; height: 46px; min-width: 0; padding: 0; border-radius: 50%; background: var(--accent); color: var(--on-accent); display: grid; place-items: center; }
+	.lbar .pplay svg { width: 20px; height: 20px; fill: currentColor; }
+	.lbar button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+	body.has-lbar { padding-bottom: calc(72px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
+	#lbClose { min-width: 36px; font-size: 20px; }
+	@media (max-width: 380px) { #lbBack, #lbFwd { display: none; } }
 	@media (max-width: 600px) {
 		.lplay { grid-template-columns: minmax(0, 1fr); gap: 18px; padding: 18px 14px; }
 		.lpcov { width: 78%; max-width: 320px; margin: 0 auto; }
@@ -4773,6 +4794,17 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 		<footer><a id="howLink" href="#">How to save this page</a></footer>
 	</div>
 </main>
+<div id="lbAudio" hidden></div>
+<div id="lbar" class="lbar" hidden>
+	<div class="lbprog"><span id="lbProg"></span></div>
+	<div class="lbrow">
+		<a id="lbTitle" class="lbtitle" href="#"><span id="lbCov" class="lbcov"></span><span class="lbtext"><span id="lbName"></span><span id="lbTime"></span></span></a>
+		<button id="lbBack" type="button" aria-label="Back 15 seconds">&#8634;15</button>
+		<button id="lbPlay" class="pplay" type="button" aria-label="Play"></button>
+		<button id="lbFwd" type="button" aria-label="Forward 30 seconds">30&#8635;</button>
+		<button id="lbClose" type="button" aria-label="Stop and close the player">&times;</button>
+	</div>
+</div>
 <script nonce="__NONCE__">
 var $ = function (id) { return document.getElementById(id); };
 function h(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
@@ -5338,6 +5370,8 @@ function showPreview(b) {
 	$("pvNote").textContent = listen ? "Loading…" : "Loading the preview…";
 	$("pvEnd").hidden = true;
 	$("pvBody").textContent = "";
+	// The book playing in the bar: its player, as it was left.
+	if (nowPlaying && nowPlaying.id === b.id) return nowPlaying.attach(sess);
 	fetch("/api/family/books/" + b.id + "/preview").then(function (res) {
 		return res.json().catch(function () { return {}; }).then(function (d) {
 			if (!res.ok) throw new Error(d.error || "Couldn't load the preview.");
@@ -5369,6 +5403,10 @@ function previewEnd(b, text) {
 // Chapters button, or the list below). A book in several files plays them
 // in turn. The place and the speed are kept on this device, and the lock
 // screen shows the cover and takes play, pause and skips.
+// Once it has played, it keeps playing after the page is left, in the bar
+// at the bottom (nowPlaying), until the bar's × or another book plays. Its
+// audio element lives outside the page (in #lbAudio), since one taken out
+// of the document stops.
 var SPEEDS = [1, 1.25, 1.5, 1.75, 2];
 var SVG_PREV = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h2.2v14H6zM19 5v14L9.5 12z"/></svg>';
 var SVG_NEXT = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.8 5H18v14h-2.2zM5 5v14l9.5-7z"/></svg>';
@@ -5380,6 +5418,9 @@ function previewAudio(sess, b, d) {
 	files.forEach(function (f) { starts.push(total); total += f.duration || 0; });
 	var audio = h("audio"), cur = -1, pending = null, saved = 0;
 	var rate = parseFloat(read("listenRate")) || 1, part = h("p", "pfile muted");
+	var eng = { id: b.id, b: b, audio: audio, alive: true, note: $("pvNote").textContent, total: total };
+	var onPage = function () { return !!pv && pv.id === b.id && eng.alive; };
+	$("lbAudio").append(audio);
 	if (SPEEDS.indexOf(rate) < 0) rate = 1;
 	audio.preload = "metadata";
 	var chapters = (d.chapters || []).length > 1 ? d.chapters : [];
@@ -5428,12 +5469,13 @@ function previewAudio(sess, b, d) {
 		if (Math.abs(t - saved) >= 5) { saved = t; keep(); position(t); }
 		if (sl.end != null && !audio.paused && t >= sl.end - 0.3) sleepNow();
 		render(t);
+		if (nowPlaying === eng) paintBar();
 	});
-	audio.addEventListener("play", function () { showPlaying(); position(now()); });
-	audio.addEventListener("pause", function () { showPlaying(); position(now()); });
+	audio.addEventListener("play", function () { playing(); showPlaying(); position(now()); paintBar(); });
+	audio.addEventListener("pause", function () { showPlaying(); position(now()); paintBar(); });
 	audio.addEventListener("pause", keep);
 	audio.addEventListener("error", function () {
-		if (sess.alive && audio.error) $("pvNote").textContent = "This audiobook couldn't play just now. The home server may be offline, so try again later.";
+		if (onPage() && audio.error) $("pvNote").textContent = "This audiobook couldn't play just now. The home server may be offline, so try again later.";
 	});
 
 	var btn = function (cls, html, label, fn) {
@@ -5525,7 +5567,7 @@ function previewAudio(sess, b, d) {
 	var cov = h("div", "lpcov"), main = h("div", "lpmain"), box = h("div", "lplay");
 	cov.append(fillCover(h("div", "cover"), b));
 	main.append(chap, seekBar, times, ctl, more, sleepOpts, part);
-	box.append(audio, cov, main);
+	box.append(cov, main);
 	$("pvBody").append(box);
 
 	// Every chapter: a list under the player, and the same list in a picker
@@ -5638,14 +5680,21 @@ function previewAudio(sess, b, d) {
 		if (!ms || !ms.setPositionState || !total) return;
 		try { ms.setPositionState({ duration: total, position: Math.min(total, Math.max(0, t)), playbackRate: rate }); } catch (e) {}
 	};
-	var handlers = {
+	var handlers = eng.handlers = {
 		play: function () { audio.play().catch(function () {}); },
 		pause: function () { audio.pause(); },
 		seekbackward: function (e) { skip(-((e && e.seekOffset) || 15)); },
 		seekforward: function (e) { skip((e && e.seekOffset) || 30); },
 		seekto: function (e) { if (e && e.seekTime != null) seek(e.seekTime, !audio.paused); },
 	};
-	if (ms) {
+	// The first play makes it the book in the bar, and stops the one there before.
+	var playing = function () {
+		if (nowPlaying === eng) return;
+		if (nowPlaying) nowPlaying.teardown();
+		nowPlaying = eng;
+		if (ms) lockScreen();
+	};
+	var lockScreen = function () {
 		var meta = { title: b.title, artist: b.author || "", album: "The Back Alley Library" };
 		var setMeta = function (art) { try { ms.metadata = new MediaMetadata(art ? Object.assign({}, meta, { artwork: [art] }) : meta); } catch (e) {} };
 		setMeta(null);
@@ -5653,32 +5702,101 @@ function previewAudio(sess, b, d) {
 		// The cover as a data: URL: the phone fetches artwork by itself, and a blob: URL isn't always shown.
 		var src = b.cover === "none" ? null : "/api/family/books/" + b.id + "/cover";
 		if (src) fetch(src).then(function (res) { return res.ok ? res.blob() : null; }).then(function (blob) {
-			if (!blob || !sess.alive) return;
+			if (!blob || nowPlaying !== eng) return;
 			var fr = new FileReader();
-			fr.onload = function () { if (sess.alive) setMeta({ src: fr.result, sizes: "600x600", type: blob.type || "image/jpeg" }); };
+			fr.onload = function () { if (nowPlaying === eng) setMeta({ src: fr.result, sizes: "600x600", type: blob.type || "image/jpeg" }); };
 			fr.readAsDataURL(blob);
 		}).catch(function () {});
-	}
+	};
 
 	var from = parseFloat(read("listen:" + b.id)) || 0;
 	seek(from, false);
 	showPlaying();
 	paintSleep();
 	if (from > 5) $("pvNote").textContent += " · Picks up at " + clock(from);
-	sess.cleanup.push(function () {
+	// Leaving the page: the book in the bar plays on; one never played stops here.
+	var detach = function () {
+		if (dlg && dlg.open) dlg.close();
+		if (nowPlaying !== eng) return eng.teardown();
+		keep();
+		paintBar();
+	};
+	eng.attach = function (s) {
+		$("pvNote").textContent = eng.note;
+		$("pvBody").append(box);
+		if (sec) $("pvBody").append(sec, dlg);
+		render(now());
+		previewEnd(b, "");
+		s.cleanup.push(detach);
+		paintBar();
+	};
+	eng.teardown = function () {
+		if (!eng.alive) return;
 		keep();
 		setSleep("off");
+		eng.alive = false;
 		if (dlg && dlg.open) dlg.close();
 		audio.pause();
 		audio.removeAttribute("src");
 		audio.load();
-		if (ms) {
-			try { ms.metadata = null; } catch (e) {}
-			Object.keys(handlers).forEach(function (k) { try { ms.setActionHandler(k, null); } catch (e) {} });
+		audio.remove();
+		if (nowPlaying === eng) {
+			nowPlaying = null;
+			if (ms) {
+				try { ms.metadata = null; } catch (e) {}
+				Object.keys(handlers).forEach(function (k) { try { ms.setActionHandler(k, null); } catch (e) {} });
+			}
 		}
-	});
+		paintBar();
+	};
+	eng.now = now;
+	eng.paused = function () { return audio.paused; };
+	eng.toggle = function () { if (audio.paused) audio.play().catch(function () {}); else audio.pause(); };
+	eng.skip = skip;
+	eng.label = function (t) { var c = chapters[chapterAt(t).i]; return c ? c.title || "Chapter " + (chapterAt(t).i + 1) : ""; };
+	sess.cleanup.push(detach);
 	previewEnd(b, "");
 }
+
+// The player bar: the book playing, once its Listen page is left, so it
+// keeps going while the library is browsed. The title opens its player.
+var nowPlaying = null;
+function paintBar() {
+	var e = nowPlaying, on = !!e && openPreview() !== e.id;
+	$("lbar").hidden = !on;
+	document.body.classList.toggle("has-lbar", on);
+	if (!on) return;
+	var t = e.now(), label = e.label(t);
+	if ($("lbar").dataset.id !== String(e.id)) {
+		$("lbar").dataset.id = String(e.id);
+		$("lbTitle").href = "#preview=" + e.id;
+		$("lbName").textContent = e.b.title;
+		$("lbCov").textContent = "";
+		$("lbCov").append(fillCover(h("div", "cover"), e.b));
+	}
+	$("lbTime").textContent = label ? label + " · " + clock(t) : clock(t) + " / " + clock(e.total);
+	$("lbProg").style.width = (e.total ? Math.min(100, t / e.total * 100) : 0) + "%";
+	var paused = e.paused();
+	$("lbPlay").innerHTML = paused ? SVG_PLAY : SVG_PAUSE;
+	$("lbPlay").setAttribute("aria-label", paused ? "Play" : "Pause");
+}
+$("lbPlay").addEventListener("click", function () { if (nowPlaying) nowPlaying.toggle(); });
+$("lbBack").addEventListener("click", function () { if (nowPlaying) nowPlaying.skip(-15); });
+$("lbFwd").addEventListener("click", function () { if (nowPlaying) nowPlaying.skip(30); });
+$("lbClose").addEventListener("click", function () { if (nowPlaying) nowPlaying.teardown(); });
+$("lbTitle").addEventListener("click", function () { viaRecord = false; });
+// iOS 26 can lay a home-screen app out taller than the screen, leaving the
+// bottom of the page (and the bar) below the edge. Upright, the page should
+// never be taller than the screen; whatever it's over by is lifted back into
+// view (--lost), as in the app.
+function fitScreen() {
+	var app = navigator.standalone || matchMedia("(display-mode: standalone)").matches;
+	var upright = window.innerHeight > window.innerWidth;
+	var lost = app && upright ? Math.max(0, Math.round(window.innerHeight - Math.max(screen.width, screen.height))) : 0;
+	document.documentElement.style.setProperty("--lost", lost + "px");
+}
+fitScreen();
+window.addEventListener("resize", fitScreen);
 function previewText(sess, b, d) {
 	var box = h("div", "pvtext");
 	(d.blocks || []).forEach(function (bl) {
