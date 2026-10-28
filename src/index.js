@@ -4594,32 +4594,55 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.pvpdf { position: relative; }
 	.pvpdf canvas { display: block; width: 100%; height: 100%; }
 	.pvpdf .pn { position: absolute; right: 8px; bottom: 6px; font-size: 12px; color: #999; }
-	/* Listening to an audiobook: the player, speed, and its chapters. */
-	.player { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
-	/* The bar: play, the place in the whole book, and a slider across it (the browser's own player can't take the theme). */
-	.pbar { display: flex; align-items: center; gap: 12px; }
-	.pplay { appearance: none; flex: none; width: 52px; height: 52px; border: 0; border-radius: 50%; background: var(--accent); color: var(--on-accent); display: grid; place-items: center; cursor: pointer; padding: 0; }
-	.pplay svg { width: 22px; height: 22px; fill: currentColor; }
-	.pplay:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
-	.ptime { font-size: 13px; font-variant-numeric: tabular-nums; color: var(--muted); white-space: nowrap; min-width: 3.4em; }
-	.ptime.end { text-align: right; }
-	.pseek { flex: 1; min-width: 0; height: 28px; margin: 0; background: transparent; cursor: pointer; -webkit-appearance: none; appearance: none; --p: 0%; }
+	/* Listening to an audiobook, laid out like the app's player page: a square cover, the chapter playing and a slider across it, the controls, then every chapter. */
+	.lplay { display: grid; grid-template-columns: minmax(0, 260px) minmax(0, 1fr); gap: 32px; align-items: center; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 22px; font-family: var(--sans); }
+	.lpcov .cover { aspect-ratio: 1; margin: 0; border-radius: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.18); }
+	.lpmain { min-width: 0; }
+	.lpchap { appearance: none; display: inline-block; max-width: 100%; margin: 0; padding: 4px 0; border: 0; background: none; font: inherit; font-weight: 600; color: var(--accent); text-align: inherit; overflow-wrap: anywhere; cursor: pointer; }
+	.lpchap::after { content: " \25BE"; font-size: .8em; }
+	.lpmain [hidden] { display: none; }
+	/* The slider: a round dot on a filled track (the browser's own is a pill in Safari and can't take the theme). */
+	.pseek { display: block; width: 100%; height: 28px; margin: 8px 0 0; background: transparent; cursor: pointer; -webkit-appearance: none; appearance: none; --p: 0%; }
 	.pseek::-webkit-slider-runnable-track { height: 6px; border-radius: 3px; background: linear-gradient(to right, var(--accent) var(--p), var(--line) var(--p)); }
 	.pseek::-moz-range-track { height: 6px; border-radius: 3px; background: var(--line); }
 	.pseek::-moz-range-progress { height: 6px; border-radius: 3px; background: var(--accent); }
 	.pseek::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; margin-top: -6px; border-radius: 50%; background: var(--accent); border: 3px solid var(--card); box-shadow: 0 0 0 1px var(--accent); }
 	.pseek::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: var(--accent); border: 3px solid var(--card); box-shadow: 0 0 0 1px var(--accent); }
 	.pseek:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
-	.pctl { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
-	.pctl button, .chapters button { appearance: none; border: 1px solid var(--line); background: var(--bg); color: inherit; border-radius: 999px; padding: 5px 12px; min-height: 36px; font: inherit; font-size: 14px; cursor: pointer; }
-	.pctl button[aria-pressed=true] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
-	.pctl .lbl { font-size: 13px; margin-right: 2px; }
+	.lptimes { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+	.lpctl { display: flex; align-items: center; justify-content: space-between; gap: 4px; max-width: 360px; margin: 14px 0 0; }
+	.lpctl button { appearance: none; min-width: 48px; min-height: 48px; padding: 0 6px; border: 0; border-radius: 10px; background: none; color: var(--accent); font: inherit; font-size: 17px; font-variant-numeric: tabular-nums; cursor: pointer; }
+	.lpctl button:disabled { opacity: .35; cursor: default; }
+	.lpctl svg { width: 22px; height: 22px; fill: currentColor; display: block; margin: auto; }
+	.lpctl .pplay { flex: none; width: 68px; height: 68px; min-width: 0; padding: 0; border-radius: 50%; background: var(--accent); color: var(--on-accent); display: grid; place-items: center; }
+	.lpctl .pplay svg { width: 26px; height: 26px; }
+	.lpctl button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+	.lpmore { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 14px; font-size: 14px; color: var(--muted); }
+	.lpmore button, .lpsleep button { appearance: none; border: 1px solid var(--line); background: var(--bg); color: var(--fg); border-radius: 999px; padding: 5px 13px; min-height: 36px; font: inherit; font-size: 14px; font-variant-numeric: tabular-nums; cursor: pointer; }
+	.lpmore .sleepbtn.on { border-color: var(--accent); color: var(--accent); }
+	.lpsleep { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 	.pfile { font-size: 13px; margin: 10px 0 0; }
-	.chapters { list-style: none; margin: 18px 0 0; padding: 0; }
-	.chapters li { border-top: 1px solid var(--line); }
-	.chapters button { display: flex; width: 100%; justify-content: space-between; gap: 12px; border: 0; border-radius: 0; background: transparent; padding: 10px 4px; text-align: left; font-size: 15px; }
-	.chapters button[aria-current=true] { color: var(--accent); font-weight: 600; }
+	.lpchaps h2 { font: 600 13px/1.3 var(--sans); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 26px 0 0; }
+	.chapters { list-style: none; margin: 10px 0 0; padding: 0; max-height: 420px; overflow-y: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--card); font-family: var(--sans); }
+	.chapters li + li { border-top: 1px solid var(--line); }
+	.chapters button { appearance: none; display: flex; width: 100%; justify-content: space-between; gap: 12px; border: 0; background: transparent; color: inherit; padding: 10px 14px; text-align: left; font: inherit; font-size: 15px; cursor: pointer; }
+	.chapters button[aria-current=true] { background: var(--sel); color: var(--accent); font-weight: 600; }
 	.chapters .chtime { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+	/* The chapter picker over the page. */
+	.chapdlg { width: min(480px, calc(100vw - 32px)); max-height: min(560px, calc(100vh - 80px)); padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); color: var(--fg); box-shadow: 0 10px 30px rgba(0,0,0,.25); }
+	.chapdlg[open] { display: flex; flex-direction: column; }
+	.chapdlg::backdrop { background: rgba(0,0,0,.4); }
+	.chapdlghd { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+	.chapdlghd h2 { font: 600 13px/1.3 var(--sans); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0; }
+	.chapdlghd .x { appearance: none; min-width: 40px; min-height: 40px; border: 0; background: none; color: var(--accent); font-size: 24px; cursor: pointer; }
+	.chapdlg .chapters { flex: 1 1 auto; min-height: 0; max-height: none; background: var(--bg); }
+	@media (max-width: 600px) {
+		.lplay { grid-template-columns: minmax(0, 1fr); gap: 18px; padding: 18px 14px; }
+		.lpcov { width: 78%; max-width: 320px; margin: 0 auto; }
+		.lpmain { text-align: center; }
+		.lpctl { margin-inline: auto; }
+		.lpmore, .lpsleep { justify-content: center; }
+	}
 	.pvend { text-align: center; border-top: 1px solid var(--line); margin-top: 30px; padding-top: 22px; }
 	.pvend p { margin: 0 0 6px; font: 400 18px/1.5 var(--display); }
 	.pvend .rbtns { margin: 6px auto 0; justify-content: center; }
@@ -5339,17 +5362,34 @@ function previewEnd(b, text) {
 	$("pvEnd").hidden = false;
 }
 // Listening: the whole audiobook, streamed from the home server a piece at a
-// time, so it isn't a download and isn't counted. A book in several files
-// plays them in turn; the chapters list jumps across them. The place and
-// the speed are kept on this device.
-var SPEEDS = [1, 1.25, 1.5, 2];
+// time, so it isn't a download and isn't counted. Laid out like the app's
+// player page: a square cover, the chapter playing with a slider across just
+// that chapter, previous/next chapter, back 15 and forward 30, speed, a
+// sleep timer, and every chapter to jump to (from the chapter's name, the
+// Chapters button, or the list below). A book in several files plays them
+// in turn. The place and the speed are kept on this device, and the lock
+// screen shows the cover and takes play, pause and skips.
+var SPEEDS = [1, 1.25, 1.5, 1.75, 2];
+var SVG_PREV = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h2.2v14H6zM19 5v14L9.5 12z"/></svg>';
+var SVG_NEXT = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.8 5H18v14h-2.2zM5 5v14l9.5-7z"/></svg>';
+var SVG_PLAY = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>';
+var SVG_PAUSE = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>';
 function previewAudio(sess, b, d) {
 	$("pvNote").textContent = [b.narrator ? "Read by " + b.narrator : "", hours(d.duration || b.duration)].filter(Boolean).join(" · ");
 	var files = d.files || [], starts = [], total = 0;
 	files.forEach(function (f) { starts.push(total); total += f.duration || 0; });
-	var box = h("div", "player"), audio = h("audio"), cur = -1, pending = null, saved = 0;
+	var audio = h("audio"), cur = -1, pending = null, saved = 0;
 	var rate = parseFloat(read("listenRate")) || 1, part = h("p", "pfile muted");
+	if (SPEEDS.indexOf(rate) < 0) rate = 1;
 	audio.preload = "metadata";
+	var chapters = (d.chapters || []).length > 1 ? d.chapters : [];
+	// The chapter at t: {i, start, end} (the whole book when it has no chapters).
+	var chapterAt = function (t) {
+		var i = -1;
+		chapters.forEach(function (c, n) { if (c.start <= t + 0.5) i = n; });
+		if (i < 0) return { i: -1, start: 0, end: total };
+		return { i: i, start: chapters[i].start, end: chapters[i + 1] ? chapters[i + 1].start : total };
+	};
 	var now = function () { return cur < 0 ? 0 : starts[cur] + (audio.currentTime || 0); };
 	var load = function (n, at, play) {
 		cur = n;
@@ -5363,11 +5403,16 @@ function previewAudio(sess, b, d) {
 	// A place in the whole book -> the file it's in, and the time in it.
 	var seek = function (t, play) {
 		t = Math.max(0, Math.min(t, Math.max(0, total - 1)));
+		// An end-of-chapter sleep timer follows to the chapter landed in.
+		if (sl.end != null) sl.end = chapterAt(t).end;
 		var n = 0;
 		while (n + 1 < files.length && starts[n + 1] <= t) n++;
-		if (n !== cur) return load(n, t - starts[n], play);
-		audio.currentTime = t - starts[n];
-		if (play) audio.play().catch(function () {});
+		if (n !== cur) load(n, t - starts[n], play);
+		else {
+			audio.currentTime = t - starts[n];
+			if (play) audio.play().catch(function () {});
+		}
+		render(t);
 	};
 	var keep = function () { if (cur >= 0) store("listen:" + b.id, String(Math.floor(now()))); };
 	audio.addEventListener("loadedmetadata", function () {
@@ -5376,116 +5421,261 @@ function previewAudio(sess, b, d) {
 	});
 	audio.addEventListener("ended", function () {
 		if (cur + 1 < files.length) load(cur + 1, 0, true);
-		else store("listen:" + b.id, "0");
+		else { store("listen:" + b.id, "0"); setSleep("off"); }
 	});
 	audio.addEventListener("timeupdate", function () {
 		var t = now();
-		if (Math.abs(t - saved) >= 5) { saved = t; keep(); }
-		markChapter(t);
-		showTime(t);
+		if (Math.abs(t - saved) >= 5) { saved = t; keep(); position(t); }
+		if (sl.end != null && !audio.paused && t >= sl.end - 0.3) sleepNow();
+		render(t);
 	});
-	audio.addEventListener("play", function () { showPlaying(); });
-	audio.addEventListener("pause", function () { showPlaying(); });
+	audio.addEventListener("play", function () { showPlaying(); position(now()); });
+	audio.addEventListener("pause", function () { showPlaying(); position(now()); });
 	audio.addEventListener("pause", keep);
 	audio.addEventListener("error", function () {
 		if (sess.alive && audio.error) $("pvNote").textContent = "This audiobook couldn't play just now. The home server may be offline, so try again later.";
 	});
 
-	var ctl = h("div", "pctl"), sp = h("div", "pctl"), speeds = [];
-	var jump = function (label, by) {
-		var btn = h("button", null, label);
-		btn.type = "button";
-		btn.addEventListener("click", function () { seek(now() + by, !audio.paused); });
-		return btn;
+	var btn = function (cls, html, label, fn) {
+		var x = h("button", cls);
+		x.type = "button";
+		x.innerHTML = html;
+		if (label) x.setAttribute("aria-label", label);
+		x.addEventListener("click", fn);
+		return x;
 	};
-	ctl.append(jump("‹ 30 s", -30), jump("30 s ›", 30));
-	sp.append(h("span", "lbl muted", "Speed"));
-	SPEEDS.forEach(function (r) {
-		var btn = h("button", null, r + "×");
-		btn.type = "button";
-		btn.setAttribute("aria-label", "Speed " + r);
-		btn.setAttribute("aria-pressed", String(r === rate));
-		btn.addEventListener("click", function () {
-			rate = audio.defaultPlaybackRate = audio.playbackRate = r;
-			store("listenRate", String(r));
-			speeds.forEach(function (x) { x[1].setAttribute("aria-pressed", String(x[0] === r)); });
-		});
-		speeds.push([r, btn]);
-		sp.append(btn);
+	// Previous: back to this chapter's start, or the one before when it's only
+	// just begun. Next: the next chapter's start.
+	var step = function (by) {
+		var t = now(), ch = chapterAt(t);
+		if (by < 0) seek(t - ch.start > 3 || ch.i <= 0 ? ch.start : chapters[ch.i - 1].start, !audio.paused);
+		else if (chapters[ch.i + 1]) seek(chapters[ch.i + 1].start, !audio.paused);
+	};
+	var skip = function (by) { seek(now() + by, !audio.paused); };
+	var playBtn = btn("pplay", SVG_PLAY, "Play", function () {
+		if (audio.paused) audio.play().catch(function () {}); else audio.pause();
 	});
-	// The bar runs across the whole book, whichever of its files is playing.
-	var bar = h("div", "pbar"), play = h("button", "pplay"), at = h("span", "ptime"), seekBar = h("input", "pseek"), end = h("span", "ptime end", clock(total));
-	var dragging = false;
-	play.type = "button";
-	seekBar.type = "range";
-	seekBar.min = 0;
-	seekBar.max = Math.max(1, Math.floor(total));
-	seekBar.step = 1;
-	seekBar.setAttribute("aria-label", "Place in the book");
+	var prev = btn(null, SVG_PREV, "Previous chapter", function () { step(-1); });
+	var next = btn(null, SVG_NEXT, "Next chapter", function () { step(1); });
+	var ctl = h("div", "lpctl");
+	ctl.append(prev, btn(null, "&#8634;15", "Back 15 seconds", function () { skip(-15); }), playBtn,
+		btn(null, "30&#8635;", "Forward 30 seconds", function () { skip(30); }), next);
 	var showPlaying = function () {
 		var on = !audio.paused;
-		play.innerHTML = on ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>'
-			: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>';
-		play.setAttribute("aria-label", on ? "Pause" : "Play");
+		playBtn.innerHTML = on ? SVG_PAUSE : SVG_PLAY;
+		playBtn.setAttribute("aria-label", on ? "Pause" : "Play");
 	};
-	var showTime = function (t) {
-		at.textContent = clock(t);
-		if (dragging) return;
-		seekBar.value = Math.floor(t);
-		seekBar.style.setProperty("--p", (total ? Math.min(100, t / total * 100) : 0) + "%");
-		seekBar.setAttribute("aria-valuetext", clock(t) + " of " + clock(total));
-	};
-	play.addEventListener("click", function () {
-		if (audio.paused) audio.play().catch(function () {});
-		else audio.pause();
-	});
+
+	// The slider runs across the chapter playing (the whole book with no chapters).
+	var chap = btn("lpchap", "", null, function () { pick(); });
+	chap.setAttribute("aria-haspopup", "dialog");
+	chap.hidden = true;
+	var seekBar = h("input", "pseek"), times = h("div", "lptimes"), at = h("span"), left = h("span"), drag = null;
+	seekBar.type = "range";
+	seekBar.min = 0;
+	seekBar.max = 1000;
+	seekBar.step = 1;
+	seekBar.value = 0;
+	times.append(at, left);
+	var dragAt = function () { return drag.start + seekBar.value / 1000 * (drag.end - drag.start); };
 	seekBar.addEventListener("input", function () {
-		dragging = true;
-		at.textContent = clock(+seekBar.value);
-		seekBar.style.setProperty("--p", (+seekBar.value / seekBar.max * 100) + "%");
+		if (!drag) drag = chapterAt(now());
+		var t = dragAt();
+		seekBar.style.setProperty("--p", seekBar.value / 10 + "%");
+		at.textContent = clock(t - drag.start);
+		left.textContent = "−" + clock(Math.max(0, drag.end - t));
 	});
 	seekBar.addEventListener("change", function () {
-		dragging = false;
-		seek(+seekBar.value, !audio.paused);
-		showTime(+seekBar.value);
+		if (!drag) return;
+		var t = dragAt();
+		drag = null;
+		seek(t, !audio.paused);
 	});
-	showPlaying();
-	bar.append(play, at, seekBar, end);
-	box.append(audio, bar, ctl, sp, part);
 
-	var chapters = d.chapters || [], items = [], marked = -1;
-	var markChapter = function (t) {
-		var i = -1;
-		while (i + 1 < chapters.length && chapters[i + 1].start <= t + 0.5) i++;
-		if (i === marked) return;
-		if (items[marked]) items[marked].removeAttribute("aria-current");
-		if (items[i]) items[i].setAttribute("aria-current", "true");
-		marked = i;
-	};
-	if (chapters.length > 1) {
-		var ol = h("ol", "chapters");
-		chapters.forEach(function (c, i) {
-			var li = h("li"), btn = h("button");
-			btn.type = "button";
-			btn.append(h("span", null, c.title || "Chapter " + (i + 1)), h("span", "chtime", clock(c.start)));
-			btn.addEventListener("click", function () { seek(c.start, true); });
-			items.push(btn);
-			li.append(btn);
-			ol.append(li);
-		});
-		box.append(ol);
-	}
+	var rateBtn = btn("small", rate + "×", "Playback speed", function () {
+		rate = SPEEDS[(SPEEDS.indexOf(rate) + 1) % SPEEDS.length] || 1;
+		audio.defaultPlaybackRate = audio.playbackRate = rate;
+		store("listenRate", String(rate));
+		rateBtn.textContent = rate + "×";
+		position(now());
+	});
+	var chapsBtn = btn("small", "Chapters", null, function () { pick(); });
+	chapsBtn.setAttribute("aria-haspopup", "dialog");
+	chapsBtn.hidden = !chapters.length;
+	var sleepBtn = btn("small sleepbtn", "Sleep", null, function () {
+		var open = sleepOpts.hidden;
+		sleepOpts.hidden = !open;
+		sleepBtn.setAttribute("aria-expanded", String(open));
+	});
+	sleepBtn.setAttribute("aria-expanded", "false");
+	var info = h("span", "lpinfo"), more = h("div", "lpmore");
+	more.append(rateBtn, chapsBtn, sleepBtn, info);
+	var sleepOpts = h("div", "lpsleep");
+	sleepOpts.setAttribute("role", "group");
+	sleepOpts.setAttribute("aria-label", "Sleep timer");
+	sleepOpts.hidden = true;
+	[["15", "15 min"], ["30", "30 min"], ["45", "45 min"], ["60", "1 h"], ["chapter", chapters.length ? "End of chapter" : "End of book"], ["off", "Off"]].forEach(function (o) {
+		sleepOpts.append(btn("small", o[1], null, function () {
+			setSleep(o[0]);
+			sleepOpts.hidden = true;
+			sleepBtn.setAttribute("aria-expanded", "false");
+		}));
+	});
+
+	var cov = h("div", "lpcov"), main = h("div", "lpmain"), box = h("div", "lplay");
+	cov.append(fillCover(h("div", "cover"), b));
+	main.append(chap, seekBar, times, ctl, more, sleepOpts, part);
+	box.append(audio, cov, main);
 	$("pvBody").append(box);
+
+	// Every chapter: a list under the player, and the same list in a picker
+	// over the page, opened from the chapter's name or the Chapters button.
+	var lists = [], dlg = null;
+	var pick = function () {
+		if (!dlg) return;
+		dlg.showModal();
+		inView(lists[1]);
+	};
+	var inView = function (ol) {
+		var on = ol.querySelector("[aria-current]");
+		if (on) ol.scrollTop = on.parentNode.offsetTop - ol.offsetTop - ol.clientHeight / 3;
+	};
+	if (chapters.length) {
+		var sec = h("section", "lpchaps");
+		sec.append(h("h2", null, "Chapters"));
+		dlg = h("dialog", "chapdlg");
+		dlg.setAttribute("aria-label", "Chapters");
+		var hd = h("div", "chapdlghd");
+		hd.append(h("h2", null, "Chapters"), btn("x", "&times;", "Close", function () { dlg.close(); }));
+		dlg.append(hd);
+		[sec, dlg].forEach(function (parent) {
+			var ol = h("ol", "chapters");
+			chapters.forEach(function (c, i) {
+				var li = h("li"), x = h("button");
+				x.type = "button";
+				x.append(h("span", null, c.title || "Chapter " + (i + 1)), h("span", "chtime", clock(c.start)));
+				x.addEventListener("click", function () {
+					if (dlg.open) dlg.close();
+					seek(c.start, true);
+				});
+				li.append(x);
+				ol.append(li);
+			});
+			lists.push(ol);
+			parent.append(ol);
+		});
+		// A tap on the dimmed page around it closes it.
+		dlg.addEventListener("click", function (e) {
+			var r = dlg.getBoundingClientRect();
+			if (e.target === dlg && (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom)) dlg.close();
+		});
+		$("pvBody").append(sec, dlg);
+	}
+
+	var marked = null;
+	var render = function (t) {
+		var ch = chapterAt(t), len = Math.max(0, ch.end - ch.start), n = chapters.length, c = chapters[ch.i];
+		chap.textContent = c ? c.title || "Chapter " + (ch.i + 1) : "";
+		chap.hidden = !c;
+		if (c) chap.setAttribute("aria-label", "Chapter: " + chap.textContent + ". Choose a chapter");
+		if (!drag) {
+			seekBar.value = len ? Math.round((t - ch.start) / len * 1000) : 0;
+			seekBar.style.setProperty("--p", seekBar.value / 10 + "%");
+			at.textContent = clock(Math.max(0, t - ch.start));
+			left.textContent = "−" + clock(Math.max(0, ch.end - t));
+		}
+		seekBar.setAttribute("aria-label", n ? "Place in the chapter" : "Place in the book");
+		seekBar.setAttribute("aria-valuetext", clock(t - ch.start) + " of " + clock(len));
+		next.disabled = !(n && ch.i + 1 < n);
+		info.textContent = (c ? "Chapter " + (ch.i + 1) + " of " + n + " · " : "") + hours(Math.max(0, total - t)) + " left";
+		if (ch.i !== marked) {
+			marked = ch.i;
+			lists.forEach(function (ol) {
+				ol.querySelectorAll("button").forEach(function (x, k) { if (k === ch.i) x.setAttribute("aria-current", "true"); else x.removeAttribute("aria-current"); });
+				inView(ol);
+			});
+		}
+	};
+
+	// The sleep timer: pause after some minutes of listening (the last 10
+	// seconds fade out where the browser lets a page set the volume), or at
+	// the end of the chapter playing. Minutes count only while it plays.
+	var sl = { left: null, end: null, last: 0, timer: null };
+	var setSleep = function (v) {
+		clearInterval(sl.timer);
+		sl.left = sl.end = sl.timer = null;
+		audio.volume = 1;
+		if (v === "chapter") sl.end = chapterAt(now()).end;
+		else if (v !== "off" && v != null) {
+			sl.left = Number(v) * 60;
+			sl.last = Date.now();
+			sl.timer = setInterval(tick, 1000);
+		}
+		paintSleep();
+	};
+	var tick = function () {
+		var t = Date.now();
+		if (!audio.paused) sl.left -= (t - sl.last) / 1000;
+		sl.last = t;
+		if (sl.left <= 0) return sleepNow();
+		audio.volume = Math.max(0, Math.min(1, sl.left / 10));
+		paintSleep();
+	};
+	var sleepNow = function () {
+		audio.pause();
+		setSleep("off");
+		sleepBtn.textContent = "Sleep · paused";
+	};
+	var paintSleep = function () {
+		sleepBtn.textContent = sl.left != null ? "Sleep · " + clock(Math.ceil(sl.left)) : sl.end != null ? "Sleep · end of " + (chapters.length ? "chapter" : "book") : "Sleep";
+		sleepBtn.classList.toggle("on", sl.left != null || sl.end != null);
+	};
+
+	// The lock screen and Control Center: the title, the cover, and the
+	// place in the whole book (not in the file playing).
+	var ms = "mediaSession" in navigator ? navigator.mediaSession : null;
+	var position = function (t) {
+		if (!ms || !ms.setPositionState || !total) return;
+		try { ms.setPositionState({ duration: total, position: Math.min(total, Math.max(0, t)), playbackRate: rate }); } catch (e) {}
+	};
+	var handlers = {
+		play: function () { audio.play().catch(function () {}); },
+		pause: function () { audio.pause(); },
+		seekbackward: function (e) { skip(-((e && e.seekOffset) || 15)); },
+		seekforward: function (e) { skip((e && e.seekOffset) || 30); },
+		seekto: function (e) { if (e && e.seekTime != null) seek(e.seekTime, !audio.paused); },
+	};
+	if (ms) {
+		var meta = { title: b.title, artist: b.author || "", album: "The Back Alley Library" };
+		var setMeta = function (art) { try { ms.metadata = new MediaMetadata(art ? Object.assign({}, meta, { artwork: [art] }) : meta); } catch (e) {} };
+		setMeta(null);
+		Object.keys(handlers).forEach(function (k) { try { ms.setActionHandler(k, handlers[k]); } catch (e) {} });
+		// The cover as a data: URL: the phone fetches artwork by itself, and a blob: URL isn't always shown.
+		var src = b.cover === "none" ? null : "/api/family/books/" + b.id + "/cover";
+		if (src) fetch(src).then(function (res) { return res.ok ? res.blob() : null; }).then(function (blob) {
+			if (!blob || !sess.alive) return;
+			var fr = new FileReader();
+			fr.onload = function () { if (sess.alive) setMeta({ src: fr.result, sizes: "600x600", type: blob.type || "image/jpeg" }); };
+			fr.readAsDataURL(blob);
+		}).catch(function () {});
+	}
+
 	var from = parseFloat(read("listen:" + b.id)) || 0;
 	seek(from, false);
-	markChapter(from);
-	showTime(from);
+	showPlaying();
+	paintSleep();
 	if (from > 5) $("pvNote").textContent += " · Picks up at " + clock(from);
 	sess.cleanup.push(function () {
 		keep();
+		setSleep("off");
+		if (dlg && dlg.open) dlg.close();
 		audio.pause();
 		audio.removeAttribute("src");
 		audio.load();
+		if (ms) {
+			try { ms.metadata = null; } catch (e) {}
+			Object.keys(handlers).forEach(function (k) { try { ms.setActionHandler(k, null); } catch (e) {} });
+		}
 	});
 	previewEnd(b, "");
 }
