@@ -68,6 +68,9 @@
 //                                  and how many library card requests are waiting
 //   GET    /api/media?url=         a podcast episode's file, streamed through for
 //                                  downloading (podcast hosts rarely allow CORS)
+//   GET    /api/media/listen?url=  -> {"url", "expires"}: a signed /media address for the episode, good for LISTEN_HOURS
+//   GET    /media?u=&e=&s=         the episode streamed through with ranged reads, for the player bar with
+//                                  voice boost on (Web Audio only hears files from this site)
 //   GET    /api/books              -> {"books": [...each with tags: [book tag ids]]} (audiobooks too: type "audiobook",
 //                                  with narrator and duration; the page joins each to its ebook, see "Formats")
 //   GET    /api/books/:id/listen   an audiobook's parts to play -> {"duration", "chapters", "files": [{duration, url}], "download"};
@@ -215,6 +218,7 @@ export default {
 		if (FONTS[url.pathname] && request.method === "GET") return font(FONTS[url.pathname]);
 		const listen = url.pathname.match(/^\/listen\/(\d+)\/(\d+|file)$/);
 		if (listen && request.method === "GET") return listenFile(request, env, url, Number(listen[1]), listen[2]).catch(errorJSON);
+		if (url.pathname === "/media" && request.method === "GET") return mediaFile(request, env, url).catch(errorJSON);
 		if (!url.pathname.startsWith("/api/")) return json({ error: "Not found" }, 404);
 
 		try {
@@ -279,6 +283,7 @@ async function api(request, env, url) {
 
 	if (p === "/api/fetch" && m === "GET") return proxyFetch(url.searchParams.get("url"), env);
 	if (p === "/api/media" && m === "GET") return proxyMedia(url.searchParams.get("url"), env);
+	if (p === "/api/media/listen" && m === "GET") return mediaListen(env, url.searchParams.get("url"));
 
 	for (const [path, t] of [["/api/tags", TAGS.feeds], ["/api/booktags", TAGS.books]]) {
 		if (p === path) {
@@ -427,13 +432,16 @@ async function proxyFetch(raw, env) {
 // save for offline listening. Same address checks as above, more redirects
 // (podcast links bounce through a stats service or two), no time limit once
 // the file starts, and only audio/video (or a generic binary type).
-async function proxyMedia(raw, env) {
+// range: the player's Range header (/media), passed on so it can seek.
+async function proxyMedia(raw, env, range) {
 	const allowPrivate = env.ALLOW_PRIVATE_FETCH === "1";
 	let target = checkTarget(raw, allowPrivate);
+	const ask = { "User-Agent": FETCH_HEADERS["User-Agent"], Accept: "audio/*, video/*, */*" };
+	if (range) ask.Range = range;
 	let res;
 	try {
 		for (let hop = 0; ; hop++) {
-			res = await fetch(target.href, { headers: { "User-Agent": FETCH_HEADERS["User-Agent"], Accept: "audio/*, video/*, */*" }, redirect: "manual" });
+			res = await fetch(target.href, { headers: ask, redirect: "manual" });
 			const location = res.status >= 300 && res.status < 400 ? res.headers.get("Location") : null;
 			if (!location) break;
 			await res.body?.cancel();
@@ -446,7 +454,7 @@ async function proxyMedia(raw, env) {
 	}
 	if (!res.ok) {
 		await res.body?.cancel();
-		throw new HttpError(502, `The site answered ${res.status}`);
+		throw new HttpError(range && res.status === 416 ? 416 : 502, `The site answered ${res.status}`);
 	}
 	const type = (res.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
 	if (!MEDIA_TYPE.test(type) && !/^(application\/octet-stream|binary\/octet-stream|application\/x-download)$/.test(type)) {
@@ -465,7 +473,8 @@ async function proxyMedia(raw, env) {
 		"Content-Security-Policy": "default-src 'none'; sandbox",
 	};
 	if (length > 0) headers["Content-Length"] = String(length);
-	return new Response(res.body, { headers });
+	if (range) for (const k of ["Content-Range", "Accept-Ranges"]) if (res.headers.get(k)) headers[k] = res.headers.get(k);
+	return new Response(res.body, { status: range && res.status === 206 ? 206 : 200, headers });
 }
 
 async function readCapped(stream, max) {
@@ -3334,11 +3343,25 @@ async function audioStream(request, env, book, n) {
 // and the token itself never goes in an address. One lasts LISTEN_HOURS, and
 // the page asks for fresh ones when they're about to run out.
 const LISTEN_HOURS = 12;
-async function listenSig(env, id, exp) {
+function listenSig(env, id, exp) {
+	return sign(env, `listen:${id}:${exp}`);
+}
+async function sign(env, text) {
 	const enc = new TextEncoder();
 	const key = await crypto.subtle.importKey("raw", enc.encode(env.READER_TOKEN.trim()), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-	const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(`listen:${id}:${exp}`)));
+	const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(text)));
 	return Array.from(mac, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+// Whether an address's s= is the signature it should have, and it hasn't run out.
+async function signedOk(env, url, text) {
+	const exp = Number(url.searchParams.get("e")), given = url.searchParams.get("s") || "";
+	if (!env.READER_TOKEN || !(exp > Date.now())) return false;
+	const enc = new TextEncoder();
+	const [a, b] = await Promise.all([
+		crypto.subtle.digest("SHA-256", enc.encode(given)),
+		crypto.subtle.digest("SHA-256", enc.encode(await sign(env, text(exp)))),
+	]);
+	return crypto.subtle.timingSafeEqual(a, b);
 }
 async function listenParts(env, id) {
 	const book = await getBook(env, id);
@@ -3351,17 +3374,23 @@ async function listenParts(env, id) {
 	});
 }
 async function listenFile(request, env, url, id, n) {
-	const exp = Number(url.searchParams.get("e")), given = url.searchParams.get("s") || "";
-	if (!env.READER_TOKEN || !(exp > Date.now())) throw new HttpError(403, "This address has run out");
-	const enc = new TextEncoder();
-	const [a, b] = await Promise.all([
-		crypto.subtle.digest("SHA-256", enc.encode(given)),
-		crypto.subtle.digest("SHA-256", enc.encode(await listenSig(env, id, exp))),
-	]);
-	if (!crypto.subtle.timingSafeEqual(a, b)) throw new HttpError(403, "This address has run out");
+	if (!(await signedOk(env, url, (exp) => `listen:${id}:${exp}`))) throw new HttpError(403, "This address has run out");
 	const book = await getBook(env, id);
 	if (book.gone_at) throw new HttpError(404, "Audiobookshelf no longer has this audiobook");
 	return n === "file" ? audiobookDownload(env, book, null) : audioStream(request, env, book, Number(n));
+}
+// A podcast episode for the player bar with voice boost on: Web Audio only
+// hears files from this site, so it streams through here, from an address
+// signed as /listen/'s are (an <audio> can't send the token).
+async function mediaListen(env, raw) {
+	if (!raw) throw new HttpError(400, "No url");
+	const exp = Date.now() + LISTEN_HOURS * 3600 * 1000, s = await sign(env, `media:${raw}:${exp}`);
+	return json({ url: `/media?u=${encodeURIComponent(raw)}&e=${exp}&s=${s}`, expires: exp });
+}
+async function mediaFile(request, env, url) {
+	const raw = url.searchParams.get("u") || "";
+	if (!(await signedOk(env, url, (exp) => `media:${raw}:${exp}`))) throw new HttpError(403, "This address has run out");
+	return proxyMedia(raw, env, request.headers.get("Range"));
 }
 function errorJSON(err) {
 	return json({ error: String(err?.message || err) }, err instanceof HttpError ? err.status : 500);
@@ -4491,7 +4520,7 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.lpctl button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 	.lpmore { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 14px; font-size: 14px; color: var(--muted); }
 	.lpmore button, .lpsleep button { appearance: none; border: 1px solid var(--line); background: var(--bg); color: var(--fg); border-radius: 999px; padding: 5px 13px; min-height: 36px; font: inherit; font-size: 14px; font-variant-numeric: tabular-nums; cursor: pointer; }
-	.lpmore .sleepbtn.on { border-color: var(--accent); color: var(--accent); }
+	.lpmore .sleepbtn.on, .lpmore .voicebtn.on { border-color: var(--accent); color: var(--accent); }
 	.lpsleep { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 	.pfile { font-size: 13px; margin: 10px 0 0; }
 	.lpchaps h2 { font: 600 13px/1.3 var(--sans); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 26px 0 0; }
@@ -5311,6 +5340,94 @@ var SVG_PREV = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h2.2v14
 var SVG_NEXT = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.8 5H18v14h-2.2zM5 5v14l9.5-7z"/></svg>';
 var SVG_PLAY = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>';
 var SVG_PAUSE = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>';
+// Voice boost (the Voice button under the player): voices brought forward
+// and quiet speech lifted, through the Web Audio API. A cut below 90 Hz,
+// a lift around 3 kHz where speech is clearest, a compressor that evens out
+// loud and soft, the level made up again, and a limiter so it can't clip.
+// "Voice +" is a little, "Voice ++" more. Kept on this device. A book only
+// goes through Web Audio once it plays with boost on; turned off, it's
+// passed straight through. An audio context starts only from a tap, so it
+// starts with the first tap on a player (not anywhere on the page, since a
+// running one can stop music playing in another app).
+var VOICE_LEVELS = [null, { eq: 4, thr: -24, ratio: 3, gain: 1.25 }, { eq: 6, thr: -30, ratio: 4, gain: 1.6 }];
+var voice = { level: Number(read("voiceBoost")) || 0, ctx: null, chain: null, wired: [] };
+if (!VOICE_LEVELS[voice.level]) voice.level = 0;
+function voiceCtx() {
+	var AC = window.AudioContext || window.webkitAudioContext;
+	if (!voice.ctx && AC) {
+		try { voice.ctx = new AC(); } catch (e) { return null; }
+		// iOS: play as media, past the silent switch, as the audio element would.
+		try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch (e) {}
+		var c = voice.ctx, n = voice.chain = {
+			hp: c.createBiquadFilter(), eq: c.createBiquadFilter(), comp: c.createDynamicsCompressor(),
+			gain: c.createGain(), lim: c.createDynamicsCompressor(),
+		};
+		n.hp.type = "highpass";
+		n.hp.frequency.value = 90;
+		n.eq.type = "peaking";
+		n.eq.frequency.value = 3000;
+		n.eq.Q.value = 0.9;
+		n.comp.knee.value = 10;
+		n.comp.attack.value = 0.005;
+		n.comp.release.value = 0.25;
+		n.lim.threshold.value = -2;
+		n.lim.knee.value = 0;
+		n.lim.ratio.value = 20;
+		n.lim.attack.value = 0.001;
+		n.lim.release.value = 0.1;
+		n.hp.connect(n.eq);
+		n.eq.connect(n.comp);
+		n.comp.connect(n.gain);
+		n.gain.connect(n.lim);
+		n.lim.connect(c.destination);
+	}
+	if (voice.ctx && voice.ctx.state !== "running") voice.ctx.resume().catch(function () {});
+	return voice.ctx;
+}
+// Every book wired so far, through the chain at this level or straight out.
+function voiceRoute() {
+	if (!voice.ctx) return;
+	var v = VOICE_LEVELS[voice.level], n = voice.chain;
+	if (v) {
+		n.eq.gain.value = v.eq;
+		n.comp.threshold.value = v.thr;
+		n.comp.ratio.value = v.ratio;
+		n.gain.gain.value = v.gain;
+	}
+	voice.wired.forEach(function (s) {
+		s.disconnect();
+		s.connect(v ? n.hp : voice.ctx.destination);
+	});
+}
+// On play: a book not wired yet goes through, if boost is on and the context
+// is running (it isn't before a tap, and then the book plays as it is).
+function voiceWire(audio) {
+	if (voice.ctx && voice.ctx.state !== "running") voice.ctx.resume().catch(function () {});
+	if (!voice.level || audio.voiceSrc || !voice.ctx || voice.ctx.state !== "running") return;
+	try { audio.voiceSrc = voice.ctx.createMediaElementSource(audio); } catch (e) { return; }
+	voice.wired.push(audio.voiceSrc);
+	voiceRoute();
+}
+function voiceUnwire(audio) {
+	if (!audio.voiceSrc) return;
+	audio.voiceSrc.disconnect();
+	voice.wired = voice.wired.filter(function (s) { return s !== audio.voiceSrc; });
+}
+// The Voice button: off, a little, more, and round again.
+function voiceNext(audio) {
+	voice.level = (voice.level + 1) % VOICE_LEVELS.length;
+	store("voiceBoost", String(voice.level));
+	var c = voice.level ? voiceCtx() : voice.ctx;
+	if (!c) return;
+	c.resume().then(function () {
+		if (!audio.paused) voiceWire(audio);
+		voiceRoute();
+	}, function () {});
+}
+function voiceLabel() { return ["Voice", "Voice +", "Voice ++"][voice.level]; }
+document.addEventListener("click", function (e) {
+	if (voice.level && e.target.closest && e.target.closest(".lplay, #lbar")) voiceCtx();
+}, true);
 function previewAudio(sess, b, d) {
 	$("pvNote").textContent = [b.narrator ? "Read by " + b.narrator : "", hours(d.duration || b.duration)].filter(Boolean).join(" · ");
 	var files = d.files || [], starts = [], total = 0;
@@ -5370,7 +5487,7 @@ function previewAudio(sess, b, d) {
 		render(t);
 		if (nowPlaying === eng) paintBar();
 	});
-	audio.addEventListener("play", function () { playing(); showPlaying(); position(now()); paintBar(); });
+	audio.addEventListener("play", function () { voiceWire(audio); playing(); showPlaying(); position(now()); paintBar(); });
 	audio.addEventListener("pause", function () { showPlaying(); position(now()); paintBar(); });
 	audio.addEventListener("pause", keep);
 	audio.addEventListener("error", function () {
@@ -5449,8 +5566,15 @@ function previewAudio(sess, b, d) {
 		sleepBtn.setAttribute("aria-expanded", String(open));
 	});
 	sleepBtn.setAttribute("aria-expanded", "false");
+	var voiceBtn = btn("small voicebtn", "", null, function () { voiceNext(audio); paintVoice(); });
+	var paintVoice = function () {
+		voiceBtn.textContent = voiceLabel();
+		voiceBtn.setAttribute("aria-label", "Voice boost: " + ["off", "a little", "more"][voice.level]);
+		voiceBtn.classList.toggle("on", voice.level > 0);
+	};
+	paintVoice();
 	var info = h("span", "lpinfo"), more = h("div", "lpmore");
-	more.append(rateBtn, chapsBtn, sleepBtn, info);
+	more.append(rateBtn, chapsBtn, sleepBtn, voiceBtn, info);
 	var sleepOpts = h("div", "lpsleep");
 	sleepOpts.setAttribute("role", "group");
 	sleepOpts.setAttribute("aria-label", "Sleep timer");
@@ -5625,6 +5749,7 @@ function previewAudio(sess, b, d) {
 		$("pvBody").append(box);
 		if (sec) $("pvBody").append(sec, dlg);
 		render(now());
+		paintVoice();
 		previewEnd(b, "");
 		s.cleanup.push(detach);
 		paintBar();
@@ -5636,6 +5761,7 @@ function previewAudio(sess, b, d) {
 		eng.alive = false;
 		if (dlg && dlg.open) dlg.close();
 		audio.pause();
+		voiceUnwire(audio);
 		audio.removeAttribute("src");
 		audio.load();
 		audio.remove();
@@ -6503,7 +6629,7 @@ const PAGE = String.raw`<!doctype html>
 	#lpPlay { flex: none; width: 68px; height: 68px; min-width: 0; padding: 0; border-radius: 50%; font-size: 22px; }
 	.lpmore { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-top: 14px; font-size: 14px; color: var(--muted); }
 	.lpmore #lpRate, .sleepbtn { font-variant-numeric: tabular-nums; }
-	.sleepbtn.on { border-color: var(--accent); color: var(--accent); }
+	.sleepbtn.on, .voicebtn.on { border-color: var(--accent); color: var(--accent); }
 	.lpsleep { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 	#lpChapters { max-height: 420px; }
 	@media (max-width: 640px) {
@@ -7033,6 +7159,7 @@ const PAGE = String.raw`<!doctype html>
 				<button id="lpRate" class="btn small" type="button" aria-label="Playback speed">1&times;</button>
 				<button id="lpChapBtn" class="btn small" type="button" aria-haspopup="dialog" hidden>Chapters</button>
 				<button id="lpSleep" class="btn small sleepbtn" type="button" aria-controls="lpSleepOpts">Sleep</button>
+				<button id="lpVoice" class="btn small voicebtn" type="button" aria-label="Voice boost: off">Voice</button>
 				<span id="lpBook"></span>
 				<a id="lpRecord" href="#/library">Record</a>
 			</div>
@@ -9927,8 +10054,12 @@ function renderEpisodeBox() {
 		so.id = "aSleepOpts";
 		sb.setAttribute("aria-controls", so.id);
 		sleepPicker(sb, so);
-		box.append(playButton(ep, false), downloadButton(ep, false), sb, h("span", "when", epStatus(ep)), so);
+		var vb = h("button", "btn small voicebtn", "Voice");
+		vb.type = "button";
+		vb.addEventListener("click", voiceNext);
+		box.append(playButton(ep, false), downloadButton(ep, false), sb, vb, h("span", "when", epStatus(ep)), so);
 		paintSleep();
+		paintVoice();
 	}
 	else if (isHosted(ep)) videoBox.hosted(box, ep);
 	else videoBox.file(box, ep);
@@ -10074,7 +10205,7 @@ function hostedSrc(ep, at) {
 }
 
 // Downloads
-async function episodeSrc(ep) {
+async function episodeSrc(ep, bar) {
 	if (downloads[ep.id] && window.caches) {
 		try {
 			var res = await (await caches.open(EP_CACHE)).match(epKey(ep.id));
@@ -10084,6 +10215,10 @@ async function episodeSrc(ep) {
 		delete downloads[ep.id];
 		saveDownloads();
 		repaintEpisode(ep.id);
+	}
+	// The player bar's through /media once it goes through Web Audio, or will (voice boost).
+	if (bar && (voice.level || voice.src)) {
+		try { return await voiceMedia(ep.media_url); } catch (e) {}
 	}
 	// An https page can't play from http (the browser would upgrade it anyway).
 	return ep.media_url.replace(/^http:/, "https:");
@@ -10147,6 +10282,135 @@ async function removeDownload(id) {
 	if (state.epDownloadedOnly && state.route && MEDIA_TABS[state.route.name]) loadEpisodes(false);
 }
 
+// Voice boost (the Voice button on the player page and an episode's page):
+// voices brought forward and quiet speech lifted, through the Web Audio
+// API. A cut below 90 Hz, a lift around 3 kHz where speech is clearest, a
+// compressor that evens out loud and soft, the level made up again, and a
+// limiter so it can't clip. "Voice +" is a little, "Voice ++" more. Kept on
+// this device, as the speed is. The player only goes through Web Audio once
+// something plays with boost on; turned off, it's passed straight through.
+// An audio context starts only from a tap, so it starts with the first tap
+// on a player or a Play button (not anywhere in the app, since a running
+// one can stop music playing in another app).
+// Web Audio hears only files from this site, so once the player goes
+// through it, a podcast streamed from its own site comes through /media
+// instead (signed like /listen/), or it would play silent.
+var VOICE_LEVELS = [null, { eq: 4, thr: -24, ratio: 3, gain: 1.25 }, { eq: 6, thr: -30, ratio: 4, gain: 1.6 }];
+var voice = { level: Number(read("readerVoice")) || 0, ctx: null, chain: null, src: null, media: {} };
+if (!VOICE_LEVELS[voice.level]) voice.level = 0;
+function voiceCtx() {
+	var AC = window.AudioContext || window.webkitAudioContext;
+	if (!voice.ctx && AC) {
+		try { voice.ctx = new AC(); } catch (e) { return null; }
+		// iOS: play as media, past the silent switch, as the audio element would.
+		try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch (e) {}
+		var c = voice.ctx, n = voice.chain = {
+			hp: c.createBiquadFilter(), eq: c.createBiquadFilter(), comp: c.createDynamicsCompressor(),
+			gain: c.createGain(), lim: c.createDynamicsCompressor(),
+		};
+		n.hp.type = "highpass";
+		n.hp.frequency.value = 90;
+		n.eq.type = "peaking";
+		n.eq.frequency.value = 3000;
+		n.eq.Q.value = 0.9;
+		n.comp.knee.value = 10;
+		n.comp.attack.value = 0.005;
+		n.comp.release.value = 0.25;
+		n.lim.threshold.value = -2;
+		n.lim.knee.value = 0;
+		n.lim.ratio.value = 20;
+		n.lim.attack.value = 0.001;
+		n.lim.release.value = 0.1;
+		n.hp.connect(n.eq);
+		n.eq.connect(n.comp);
+		n.comp.connect(n.gain);
+		n.gain.connect(n.lim);
+		n.lim.connect(c.destination);
+	}
+	if (voice.ctx && voice.ctx.state !== "running") voice.ctx.resume().catch(function () {});
+	return voice.ctx;
+}
+// The player, through the chain at this level or straight out.
+function voiceRoute() {
+	if (!voice.src) return;
+	var v = VOICE_LEVELS[voice.level], n = voice.chain;
+	if (v) {
+		n.eq.gain.value = v.eq;
+		n.comp.threshold.value = v.thr;
+		n.comp.ratio.value = v.ratio;
+		n.gain.gain.value = v.gain;
+	}
+	voice.src.disconnect();
+	voice.src.connect(v ? n.hp : voice.ctx.destination);
+}
+// Playing a file from another site (a podcast streamed from its own).
+function voiceForeign(audio) {
+	var src = audio.currentSrc || audio.src;
+	try { return !!src && new URL(src, location.href).origin !== location.origin; } catch (e) { return true; }
+}
+// On play: the player goes through, if boost is on, the context is running
+// (it isn't before a tap, and then it plays as it is) and the file is this site's.
+function voiceWire(audio) {
+	if (voice.ctx && voice.ctx.state !== "running") voice.ctx.resume().catch(function () {});
+	if (!voice.level || voice.src || !voice.ctx || voice.ctx.state !== "running" || voiceForeign(audio)) return;
+	try { voice.src = voice.ctx.createMediaElementSource(audio); } catch (e) { return; }
+	voiceRoute();
+}
+// A podcast episode's /media address (fresh ones near the end of theirs).
+async function voiceMedia(url) {
+	var c = voice.media[url];
+	if (c && c.expires - Date.now() > 10 * 60 * 1000) return c.url;
+	c = voice.media[url] = await apiJSON("/api/media/listen?url=" + encodeURIComponent(url));
+	return c.url;
+}
+// Boost turned on while a podcast streams from its own site: the same
+// place, through /media, so the boost reaches it.
+async function voiceSwap() {
+	var audio = $("pAudio"), ep = player.ep;
+	if (!ep || ep.book || !audio.src || !voiceForeign(audio)) return;
+	var src = await voiceMedia(ep.media_url).catch(function () { return null; });
+	if (!src || player.ep !== ep || !voiceForeign(audio)) return;
+	var at = audio.currentTime, play = !audio.paused;
+	player.url = src;
+	audio.src = src;
+	audio.playbackRate = player.rate;
+	audio.addEventListener("loadedmetadata", function once() {
+		audio.removeEventListener("loadedmetadata", once);
+		if (at > 0) audio.currentTime = at;
+	});
+	audio.load();
+	if (play) audio.play().catch(playFailed);
+}
+// The Voice buttons: off, a little, more, and round again.
+function voiceNext() {
+	var audio = $("pAudio");
+	voice.level = (voice.level + 1) % VOICE_LEVELS.length;
+	store("readerVoice", String(voice.level));
+	paintVoice();
+	var c = voice.level ? voiceCtx() : voice.ctx;
+	if (!c) return;
+	c.resume().then(function () {
+		if (voice.level) voiceSwap().catch(function () {});
+		if (!audio.paused) voiceWire(audio);
+		voiceRoute();
+	}, function () {});
+}
+function paintVoice() {
+	document.querySelectorAll(".voicebtn").forEach(function (b) {
+		b.textContent = ["Voice", "Voice +", "Voice ++"][voice.level];
+		b.setAttribute("aria-label", "Voice boost: " + ["off", "a little", "more"][voice.level]);
+		b.classList.toggle("on", voice.level > 0);
+	});
+}
+(function () {
+	$("pAudio").addEventListener("play", function () { voiceWire(this); });
+	$("lpVoice").addEventListener("click", voiceNext);
+	paintVoice();
+	document.addEventListener("click", function (e) {
+		if (voice.level && e.target.closest && e.target.closest("#listenView, #pbar, #aEpisode, [data-play]")) voiceCtx();
+	}, true);
+})();
+
 // The player bar
 var player = { ep: null, url: null, savedAt: 0, rate: Number(read("readerRate")) || 1 };
 // The sleep timer, set on an audiobook's player page or a podcast episode's
@@ -10160,6 +10424,7 @@ var sleep = { left: null, end: null, last: 0, timer: null };
 var RATES = [0.8, 1, 1.2, 1.5, 1.75, 2];
 async function playEpisode(ep, start) {
 	var audio = $("pAudio");
+	if (voice.level) voiceCtx();
 	if (ep.book) return playAudiobook(ep, start);
 	if (!isAudio(ep)) { location.hash = "#/item/" + ep.id; return; }
 	if (player.ep && player.ep.id === ep.id && audio.src) {
@@ -10170,7 +10435,7 @@ async function playEpisode(ep, start) {
 	player.ep = ep;
 	player.ab = null;
 	store("readerNowPlaying", JSON.stringify(ep));
-	var src = await episodeSrc(ep);
+	var src = await episodeSrc(ep, true);
 	if (player.ep !== ep) return;
 	if (player.url && player.url.indexOf("blob:") === 0) URL.revokeObjectURL(player.url);
 	player.url = src;
@@ -10682,6 +10947,7 @@ function listenLabel(au) {
 }
 function listenTo(au, at) {
 	var audio = $("pAudio");
+	if (voice.level) voiceCtx();
 	if (at == null && playingBook(au) && player.ab && audio.src && !audio.ended) {
 		if (audio.paused) audio.play().catch(playFailed); else audio.pause();
 		return;
