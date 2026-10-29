@@ -75,7 +75,7 @@
 //                                  send the token)
 //   GET    /listen/:id/:n?e=&s=    audiobook file n (from 0), streamed from Audiobookshelf with ranged reads
 //                                  (/listen/:id/file: the whole audiobook as a download, as the family library's)
-//   POST   /api/audiobooks/sync    -> {"added", "updated", "gone", "total", "covers"}: reads Audiobookshelf now (a cron
+//   POST   /api/audiobooks/sync    -> {"added", "updated", "gone", "total", "ebooks", "covers"}: reads Audiobookshelf now (a cron
 //                                  also does every 30 minutes), and fetches up to 40 covers not kept yet; 503 when
 //                                  it isn't set up
 //   PUT    /api/books?name=&tag=  body = a .txt, .pdf, .cbz or .epub file -> {"book"} (tag: a book tag id to put on it)
@@ -167,13 +167,15 @@ const BOOK_TYPES = { txt: "text/plain; charset=utf-8", pdf: "application/pdf", c
 // means rebuilding the table. Its .cbz or .epub file name is what marks it,
 // so the type read back from the database comes from that.
 // An audiobook from Audiobookshelf is the same: 'pdf', with a name ending
-// .audiobook (see "Audiobooks").
+// .audiobook (see "Audiobooks"). An ebook from Audiobookshelf keeps its
+// .epub, .pdf or .cbz name; its r2_key starting "absbook/" is what sends its
+// reads there (bookObject).
 const BOOK_TYPE = "CASE WHEN filename LIKE '%.cbz' THEN 'cbz' WHEN filename LIKE '%.epub' THEN 'epub' WHEN filename LIKE '%.audiobook' THEN 'audiobook' ELSE type END";
 function storedType(ext) { return ext === "cbz" || ext === "epub" ? "pdf" : ext; }
 function bookType(book) { const m = /\.(cbz|epub|audiobook)$/i.exec(book.filename); return m ? m[1].toLowerCase() : book.type; }
 const NOT_AUDIOBOOK = "filename NOT LIKE '%.audiobook'";
 // Every book column but r2_key, which never leaves the Worker.
-const BOOK_COLUMNS = `id, title, filename, ${BOOK_TYPE} AS type, size, position, finished_at, created_at, last_opened_at, author, series, volume, layout, pages, narrator, duration`;
+const BOOK_COLUMNS = `id, title, filename, ${BOOK_TYPE} AS type, size, position, finished_at, created_at, last_opened_at, author, series, volume, layout, pages, narrator, duration, abs_ebook IS NOT NULL AS home`;
 // An item with a media file is a podcast episode, or a video if the file is
 // video; YouTube, Twitch and Vimeo videos are stored as video/x-youtube etc.
 const VIEWS = {
@@ -239,7 +241,7 @@ export default {
 		await receiveEmail(message, env);
 	},
 
-	// Every 30 minutes (wrangler.toml): new and changed audiobooks from Audiobookshelf.
+	// Every 30 minutes (wrangler.toml): new and changed audiobooks and ebooks from Audiobookshelf.
 	async scheduled(event, env, ctx) {
 		if (absOn(env)) ctx.waitUntil(absSync(env).then(() => absWarmCovers(env)).catch((err) => console.warn("audiobooks", err)));
 	},
@@ -1961,7 +1963,8 @@ function madeTitle(filename) {
 async function addBookFile(env, filename, ext, key, size, uploadTags) {
 	// Same file name as a book already here: that book gets the new file.
 	// Its place, Finished and tags stay; a YAML header updates the details.
-	const old = await env.DB.prepare("SELECT id, r2_key FROM books WHERE filename = ? COLLATE NOCASE ORDER BY id DESC LIMIT 1")
+	// (Not one from Audiobookshelf: the sync would only put its file back.)
+	const old = await env.DB.prepare("SELECT id, r2_key FROM books WHERE filename = ? COLLATE NOCASE AND abs_ebook IS NULL ORDER BY id DESC LIMIT 1")
 		.bind(filename)
 		.first();
 	if (old) {
@@ -2014,9 +2017,41 @@ async function getBook(env, id) {
 	return book;
 }
 
+// A book's file, or a piece of it ({offset, length}): from R2, or from
+// Audiobookshelf for an ebook kept there (r2_key "absbook/<item id>/<file
+// ino>/<mtime>", so a changed file gets a new key and its cover and preview
+// are made again). -> {body, size, arrayBuffer()} like an R2 object, or null
+// when the file is missing.
+const HOME_OFFLINE = "The home server is offline just now, so this book can't open. Try again later.";
+async function bookObject(env, key, range) {
+	if (!key.startsWith("absbook/")) return env.BOOKS.get(key, range ? { range } : undefined);
+	const [, item, ino] = key.split("/");
+	let res;
+	try {
+		res = await absFetch(env, `/api/items/${encodeURIComponent(item)}/ebook/${encodeURIComponent(ino)}`,
+			{ headers: range ? { Range: `bytes=${range.offset}-${range.offset + range.length - 1}` } : {} });
+	} catch (err) {
+		throw err.message === ABS_OFFLINE ? new HttpError(502, HOME_OFFLINE) : err;
+	}
+	if (res.status === 404) {
+		await res.body?.cancel();
+		return null;
+	}
+	if (!res.ok) {
+		await res.body?.cancel();
+		throw new HttpError(502, `Audiobookshelf answered ${res.status}`);
+	}
+	// A server that ignores Range sends the whole file: keep just the piece.
+	if (range && res.status !== 206) {
+		const piece = new Uint8Array(await res.arrayBuffer()).slice(range.offset, range.offset + range.length);
+		return { body: piece, size: piece.length, arrayBuffer: async () => piece.buffer };
+	}
+	return { body: res.body, size: Number(res.headers.get("Content-Length")) || 0, arrayBuffer: () => res.arrayBuffer() };
+}
+
 async function bookFile(env, id, download) {
 	const book = await getBook(env, id);
-	const obj = await env.BOOKS.get(book.r2_key);
+	const obj = await bookObject(env, book.r2_key);
 	if (!obj) throw new HttpError(404, "The file is missing from storage");
 	if (!download) await env.DB.prepare("UPDATE books SET last_opened_at = ? WHERE id = ?").bind(Date.now(), id).run();
 	return new Response(obj.body, {
@@ -2113,7 +2148,7 @@ async function bookPart(env, id, url) {
 	const book = await getBook(env, id);
 	const at = Number(url.searchParams.get("at")), len = Number(url.searchParams.get("len"));
 	if (!Number.isInteger(at) || !Number.isInteger(len) || at < 0 || len < 1 || len > 4 * 1024 * 1024) throw new HttpError(400, "at and len must be whole numbers, len up to 4 MB");
-	const obj = await env.BOOKS.get(book.r2_key, { range: { offset: at, length: len } });
+	const obj = await bookObject(env, book.r2_key, { offset: at, length: len });
 	if (!obj) throw new HttpError(404, "The file is missing from storage");
 	return new Response(obj.body, {
 		headers: { "Content-Type": "application/octet-stream", "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" },
@@ -2505,6 +2540,7 @@ async function deleteBook(env, id) {
 	const book = await getBook(env, id);
 	// The next sync would only bring it back.
 	if (book.abs_id) throw new HttpError(409, "Audiobooks come from Audiobookshelf. Remove it there and it leaves Reader at the next sync.");
+	if (book.abs_ebook) throw new HttpError(409, "This book comes from Audiobookshelf. Remove it there and it leaves Reader at the next sync.");
 	await env.BOOKS.delete([book.r2_key, coverKey(id), previewKey(id)]);
 	await env.DB.prepare("DELETE FROM books WHERE id = ?").bind(id).run();
 	return json({ ok: true });
@@ -2561,8 +2597,8 @@ async function bookCover(env, id) {
 	}
 	if (stored) await stored.arrayBuffer().catch(() => {});
 	const type = bookType(book);
-	if (type !== "epub" && type !== "cbz" && type !== "audiobook") throw new HttpError(404, "No cover");
-	if (type === "audiobook") {
+	if (type !== "epub" && type !== "cbz" && type !== "audiobook" && !book.abs_ebook) throw new HttpError(404, "No cover");
+	if (type === "audiobook" || book.abs_ebook) {
 		const got = await absCover(env, book);
 		if (!got) throw new HttpError(404, "No cover");
 		return coverResponse(got.img, got.kind);
@@ -2597,7 +2633,7 @@ async function deleteBookCover(env, id) {
 // Reading a zip in R2 a piece at a time: its table of contents from the
 // end of the file, then just the entries wanted.
 async function r2Bytes(env, key, offset, length) {
-	const obj = await env.BOOKS.get(key, { range: { offset, length } });
+	const obj = await bookObject(env, key, { offset, length });
 	return obj ? new Uint8Array(await obj.arrayBuffer()) : null;
 }
 async function r2Zip(env, key, size) {
@@ -2946,14 +2982,14 @@ async function familyDownload(env, id, person) {
 		if (!taken.includes(id) && taken.length >= (audio ? AUDIOBOOKS_PER_DAY : DOWNLOADS_PER_DAY)) return limitPage(audio);
 	}
 	if (audio) return audiobookDownload(env, book, person);
-	const obj = await env.BOOKS.get(book.r2_key);
+	const obj = await bookObject(env, book.r2_key);
 	if (!obj) throw new HttpError(404, "The file is missing from storage");
 	if (person) await env.DB.prepare("INSERT INTO downloads (person_id, book_id, at) VALUES (?, ?, ?)").bind(person.id, id, Date.now()).run();
 	const name = downloadName(book);
 	return new Response(obj.body, {
 		headers: {
 			"Content-Type": BOOK_TYPES[bookType(book)],
-			"Content-Length": String(obj.size),
+			"Content-Length": String(obj.size || book.size),
 			"Content-Disposition": `attachment; filename="${name.replace(/[^\x20-\x7e]/g, "_").replace(/"/g, "'")}"; filename*=UTF-8''${encodeURIComponent(name)}`,
 			"Cache-Control": "private, no-store",
 			"X-Content-Type-Options": "nosniff",
@@ -2984,6 +3020,12 @@ async function familyDownload(env, id, person) {
 //     several files goes out as the zip ABS makes. 2 a day per person.
 //   * When the server, the tunnel or the home internet is down, the library
 //     still browses (it's all in D1) and playing says the server is offline.
+//   * Ebooks: an ABS item's ebook (EPUB, PDF or CBZ) is a books row of its
+//     own (abs_ebook = the item id, migration 0019), read through bookObject
+//     like a book in R2, so the app's library and the family library open,
+//     preview and download it as they do the others. An item with an
+//     audiobook and an ebook is two rows, which both libraries show as one
+//     book in both formats. MOBI, AZW3 and CBR are left out.
 function absOn(env) { return !!(env.ABS_URL && env.ABS_TOKEN); }
 const ABS_OFFLINE = "The home server is offline just now, so audiobooks can't play. Try again later.";
 const ABS_PAGE = 200;
@@ -3038,7 +3080,7 @@ function absSeries(name) {
 // -> {added, updated, gone, total}
 async function absSync(env) {
 	const { libraries = [] } = await absJSON(env, "/api/libraries");
-	const items = [];
+	const items = [], ebooks = [];
 	for (const lib of libraries) {
 		if (lib.mediaType && lib.mediaType !== "book") continue;
 		for (let page = 0; ; page++) {
@@ -3054,6 +3096,7 @@ async function absSync(env) {
 	let added = 0, updated = 0;
 	for (const it of items) {
 		const media = it.media || {}, md = media.metadata || {};
+		if (it.id && !it.isMissing && !it.isInvalid && ABS_EBOOKS.includes(String(media.ebookFormat || "").toLowerCase())) ebooks.push(it);
 		// Ebook-only items, and ones ABS can't find on disk, aren't audiobooks here.
 		if (!it.id || it.isMissing || it.isInvalid || !(media.duration > 0)) continue;
 		seen.add(it.id);
@@ -3083,7 +3126,56 @@ async function absSync(env) {
 		gone++;
 	}
 	for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
-	return { added, updated, gone, total: seen.size };
+	return { added, updated, gone, total: seen.size, ebooks: await absSyncEbooks(env, ebooks) };
+}
+
+// The ebooks among ABS's items -> {added, updated, gone, total, waiting}. The
+// listing doesn't give the ebook file's size, which reading a zip needs, so
+// each new or changed one is looked up, up to ABS_EBOOK_LOOKUPS a sync; the
+// rest wait for the next (waiting).
+const ABS_EBOOKS = ["epub", "pdf", "cbz"], ABS_EBOOK_LOOKUPS = 100;
+async function absSyncEbooks(env, items) {
+	const { results } = await env.DB.prepare("SELECT id, abs_ebook, abs_updated, gone_at FROM books WHERE abs_ebook IS NOT NULL").all();
+	const have = new Map(results.map((r) => [r.abs_ebook, r]));
+	const seen = new Set(), stmts = [], now = Date.now();
+	let added = 0, updated = 0, waiting = 0, lookups = 0;
+	for (const it of items) {
+		seen.add(it.id);
+		const row = have.get(it.id), changed = it.updatedAt || now;
+		if (row && row.abs_updated === changed && !row.gone_at) continue;
+		if (lookups >= ABS_EBOOK_LOOKUPS) { waiting++; continue; }
+		lookups++;
+		const full = await absJSON(env, `/api/items/${encodeURIComponent(it.id)}`).catch((err) => { console.warn("abs ebook", it.id, err); return null; });
+		const file = full?.media?.ebookFile, ext = String(file?.ebookFormat || "").toLowerCase();
+		if (!file?.ino || !(file.metadata?.size > 0) || !ABS_EBOOKS.includes(ext)) continue;
+		// The listing's details: a looked-up item lists its authors and series another way.
+		const md = it.media?.metadata || {};
+		const title = str(md.title, 300) || "Untitled";
+		const [series, volume] = absSeries(md.seriesName);
+		const key = `absbook/${it.id}/${file.ino}/${Math.round(file.metadata.mtimeMs || 0)}`;
+		const vals = [title, `${title.replace(/[\\/]/g, " ")}.${ext}`, file.metadata.size, str(md.authorName, 300), str(series, 300), str(volume, 20), key, changed];
+		if (!row) {
+			stmts.push(env.DB.prepare(
+				`INSERT INTO books (title, filename, type, size, author, series, volume, r2_key, abs_updated, created_at, abs_ebook)
+				VALUES (?1, ?2, 'pdf', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
+			).bind(...vals, it.addedAt || now, it.id));
+			added++;
+		} else {
+			stmts.push(env.DB.prepare(
+				`UPDATE books SET title = ?1, filename = ?2, size = ?3, author = ?4, series = ?5, volume = ?6, r2_key = ?7,
+				abs_updated = ?8, gone_at = NULL WHERE id = ?9`,
+			).bind(...vals, row.id));
+			updated++;
+		}
+	}
+	let gone = 0;
+	for (const r of results) {
+		if (seen.has(r.abs_ebook) || r.gone_at) continue;
+		stmts.push(env.DB.prepare("UPDATE books SET gone_at = ? WHERE id = ?").bind(now, r.id));
+		gone++;
+	}
+	for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
+	return { added, updated, gone, total: seen.size, waiting };
 }
 
 // An audiobook's files and chapters, from ABS the first time:
@@ -3186,7 +3278,7 @@ function fileChapters(media) {
 // a few MB), kept in R2 like the others so the home server is asked once.
 // -> {img, kind}, or null when it has none.
 async function absCover(env, book) {
-	const res = await absFetch(env, `/api/items/${encodeURIComponent(book.abs_id)}/cover?format=jpeg&width=600`);
+	const res = await absFetch(env, `/api/items/${encodeURIComponent(book.abs_id || book.abs_ebook)}/cover?format=jpeg&width=600`);
 	let img = null;
 	if (res.ok && Number(res.headers.get("Content-Length") || 0) <= MAX_COVER_BYTES) img = new Uint8Array(await res.arrayBuffer());
 	else await res.body?.cancel();
@@ -3202,7 +3294,7 @@ async function absCover(env, book) {
 const ABS_COVERS_PER_RUN = 40;
 async function absWarmCovers(env) {
 	const { results } = await env.DB.prepare(
-		"SELECT id, r2_key, abs_id FROM books WHERE abs_id IS NOT NULL AND gone_at IS NULL ORDER BY created_at DESC, id DESC",
+		"SELECT id, r2_key, abs_id, abs_ebook FROM books WHERE (abs_id IS NOT NULL OR abs_ebook IS NOT NULL) AND gone_at IS NULL ORDER BY created_at DESC, id DESC",
 	).all();
 	const have = await coverStates(env, new Map(results.map((b) => [b.id, b.r2_key])));
 	let n = 0;
@@ -3476,7 +3568,7 @@ async function previewPart(env, id, url) {
 	if (!Number.isInteger(at) || !Number.isInteger(want) || at < 0 || want < 1 || want > 4 * 1024 * 1024 || at >= book.size) {
 		throw new HttpError(400, "at and len must be whole numbers inside the file, len up to 4 MB");
 	}
-	const obj = await env.BOOKS.get(book.r2_key, { range: { offset: at, length: Math.min(want, book.size - at) } });
+	const obj = await bookObject(env, book.r2_key, { offset: at, length: Math.min(want, book.size - at) });
 	if (!obj) throw new HttpError(404, "The file is missing from storage");
 	return new Response(obj.body, {
 		headers: { "Content-Type": "application/octet-stream", "Cache-Control": "private, max-age=86400", "X-Content-Type-Options": "nosniff" },
@@ -10349,6 +10441,8 @@ async function showLibrary(r) {
 // opens its Record (#/record/<id>): both formats, with Read and Listen, then
 // the jacket copy and appeal terms. Audiobooks play in the player bar.
 function isAudiobook(b) { return b.type === "audiobook"; }
+// From Audiobookshelf (an audiobook, or an ebook kept there): removed there, not here.
+function fromHome(b) { return isAudiobook(b) || !!b.home; }
 function audioOf(b) { return isAudiobook(b) ? b : b.audio || null; }
 function titleKey(b) { return fold(b.title).split(/[:(\[]/)[0].replace(/[^a-z0-9]+/g, " ").trim(); }
 function authorWords(b) { return fold(b.author).replace(/[^a-z]+/g, " ").trim().split(" ").filter(function (w) { return w.length > 1; }); }
@@ -11399,7 +11493,7 @@ function bookRow(b) {
 				try { await resetPosition(b); } catch (e) { fail(e); }
 				renderBooks();
 			}),
-			isAudiobook(b) ? "" : button("Delete", "btn small", function () { deleteBook(b); })
+			fromHome(b) ? "" : button("Delete", "btn small", function () { deleteBook(b); })
 		);
 		li.append(t, bookTagToggles(b));
 	}
@@ -11930,9 +12024,9 @@ function renderLibSel() {
 	$("libSelDel").textContent = n ? "Delete " + n : "Delete";
 }
 async function deleteSelected() {
-	// Audiobooks stay: they come from Audiobookshelf, and the next sync would bring them back.
-	var books = selectedBooks().filter(function (b) { return !isAudiobook(b); }), btn = $("libSelDel");
-	if (!books.length) { if (selectedBooks().length) toast("Audiobooks come from Audiobookshelf. Remove them there."); return; }
+	// Books from Audiobookshelf stay: the next sync would bring them back.
+	var books = selectedBooks().filter(function (b) { return !fromHome(b); }), btn = $("libSelDel");
+	if (!books.length) { if (selectedBooks().length) toast("These come from Audiobookshelf. Remove them there."); return; }
 	var names = books.slice(0, 5).map(function (b) { return "• " + b.title; }).join("\n") + (books.length > 5 ? "\n…and " + (books.length - 5) + " more" : "");
 	if (!confirm("Delete " + books.length + (books.length === 1 ? " book" : " books") + "? The files are removed for good, from every device.\n\n" + names)) return;
 	btn.disabled = true;
@@ -12092,7 +12186,7 @@ function openBookCtx(b, x, y) {
 			if (!state.editBooks) { state.editBooks = true; state.libSel = {}; state.libSel[b.id] = true; }
 			renderBooks();
 		});
-		if (!isAudiobook(b)) {
+		if (!fromHome(b)) {
 			menu.append(h("div", "sep"));
 			item("Delete", function () { deleteBook(b); }, "danger");
 		}

@@ -184,6 +184,8 @@ npx wrangler d1 execute reader --remote --file migrations/0014_book_records.sql
 npx wrangler d1 execute reader --remote --file migrations/0015_previews.sql
 npx wrangler d1 execute reader --remote --file migrations/0016_book_catalog.sql
 npx wrangler d1 execute reader --remote --file migrations/0017_audiobooks.sql
+npx wrangler d1 execute reader --remote --file migrations/0018_feed_images.sql
+npx wrangler d1 execute reader --remote --file migrations/0019_abs_ebooks.sql
 npx wrangler deploy
 ```
 
@@ -353,12 +355,29 @@ This puts the audiobooks from your Audiobookshelf (ABS) server into the family l
    It answers with how many were added, updated and gone.
 
 How it behaves:
-- Every ABS book library is included, except items with no audio (ebook-only) and ones ABS marks missing. One removed from ABS disappears from the library at the next sync, and comes back if it returns.
+- Every ABS book library is included, except ones ABS marks missing. Items with no audio come in as ebooks (below). One removed from ABS disappears from the library at the next sync, and comes back if it returns.
 - Covers come from ABS once and are kept in R2. Records use ABS's description, then the usual lookups; Length is the running time, and the narrator gets a line.
 - **Listen** on a Record plays the whole book on the page, laid out like your own player page: the square cover, a slider across the chapter playing, back 15 / forward 30, previous and next chapter, speed, a sleep timer (15, 30, 45 minutes, an hour, or the end of the chapter), and every chapter to jump to, from the chapter's name, **Chapters**, or the list below. The lock screen shows the cover and takes play, pause and skips. Once it has played, it keeps going after leaving the page, in a bar at the bottom of the library (tap the title to go back to the player, **×** to stop), until another audiobook plays. It remembers the place on that device, and it isn't counted. **Download** sends the .m4b as it is, or a zip when the book is several files.
 - **Chapters** come from ABS. A book in several files with none gets a chapter per file. A single file with none (an .m4b without chapter marks) gets Audible's chapters, looked up by the ASIN in ABS or by its title and author, but only when Audible's release runs as long as the file, since another recording's chapters would land in the wrong places. To fix one by hand, set its chapters in ABS (the book's Chapters tab, where **Lookup** does the same thing); Reader picks them up the next time ABS changes it.
 - While the server, the tunnel or the home internet is down, the library still browses; playing and downloading say the server is offline.
 - In your own Library in the app, an audiobook with the same title and author as an ebook is one entry, as in the family library, with an open book and headphones beside it. **All formats** above the list narrows it to ebooks or audiobooks. Every entry opens its **Record**: **Read** opens the ebook, and **Listen** plays the audiobook in the player bar, so it keeps going while you read feeds. The place syncs between devices like a reading place, and the Record lists the chapters to start from. Tap the title in the player bar (or **Player** on the Record) for the player page: the square cover, a slider across the chapter playing, back 15 / forward 30, previous and next chapter, speed, a sleep timer (15, 30, 45 minutes, an hour, or the end of the chapter; a timer still set when a podcast starts keeps going, and the end of the chapter becomes the end of the episode), and every chapter to jump to. Audiobooks can't be deleted in the app (remove them in ABS), and their title and author come back from ABS whenever ABS changes them.
+
+### Ebooks from Audiobookshelf
+
+The same sync brings in ABS's ebooks, so books can live on the server instead of in R2. Run migration `0019` first (Updating). They show up in your Library and in the family library like uploaded books: they open, preview, download (counted in the 10 a day) and get records as usual.
+
+1. **Give ABS the folder.** On Unraid: Docker → Audiobookshelf → Edit → **Add another Path**. Container path `/ebooks`, host path where the ebooks are (say `/mnt/user/media/ebooks`), access mode Read Only → Apply.
+2. **One folder per book**, as for audiobooks: `ebooks/Author/Title/Title.epub`, with a series folder in between if you like. EPUB, PDF and CBZ come into Reader. ABS also takes MOBI, AZW3 and CBR, but Reader leaves those out (convert CBR to CBZ).
+3. **Add it to a library.** ABS → Settings → **Libraries**: add `/ebooks` as a folder of your Books library, or make a new library with media type **Book** on `/ebooks`. Either works for Reader.
+4. **Let `reader` see it.** Settings → **Users** → `reader`: **Access all libraries** (or tick the new one).
+5. **Scan** the library in ABS, then sync Reader (step 7 above) or wait for the cron. A sync looks up at most 100 new or changed ebooks; the answer's `ebooks.waiting` says how many are left for the next one.
+
+How they behave:
+- An ebook sitting in the same folder as an audiobook's files is one ABS item, and one entry with both formats in either library. An ebook in a folder of its own pairs with its audiobook the usual way, by title and author.
+- Covers come from ABS, once, and are kept in R2.
+- The file is read from ABS each time it's opened, a piece at a time for comics, PDFs and previews, so it's a little slower than R2. **Download for offline** in the app works as before.
+- While the server is down, these books say the home server is offline; books in R2 still open.
+- They can't be deleted in the app (remove them in ABS), uploading a file with the same name adds a separate book instead of replacing it, and their title, author and series come back from ABS whenever ABS changes the item. A changed file gets its cover and preview made again.
 
 ## If something goes wrong
 
