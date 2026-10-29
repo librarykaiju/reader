@@ -28,7 +28,7 @@ OWNER_NAME = "Brandon"
 # "Family library"): the widget's site key here, and its secret key with
 #   npx wrangler secret put TURNSTILE_SECRET
 # Leave it out and the form works without the check.
-# TURNSTILE_SITE_KEY = ""
+TURNSTILE_SITE_KEY = "0x4AAAAAAFrq7rE_nOxB_Qvu"
 
 # Audiobooks from Audiobookshelf (docs/setup.md, "Audiobooks"): new and
 # changed ones every 30 minutes. Does nothing until ABS_URL and ABS_TOKEN are set.
