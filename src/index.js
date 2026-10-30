@@ -2660,14 +2660,26 @@ async function deleteBookCover(env, id) {
 }
 
 // Reading a zip in R2 a piece at a time: its table of contents from the
-// end of the file, then just the entries wanted.
+// end of the file, then just the entries wanted. A zip on Audiobookshelf up
+// to ABS_ZIP_WHOLE comes over whole, once: every ranged read there is a
+// subrequest, and an EPUB split into many small chapters ran past the free
+// plan's 50 before its first piece was read.
+const ABS_ZIP_WHOLE = 32 * 1024 * 1024;
 async function r2Bytes(env, key, offset, length) {
 	const obj = await bookObject(env, key, { offset, length });
 	return obj ? new Uint8Array(await obj.arrayBuffer()) : null;
 }
 async function r2Zip(env, key, size) {
+	let whole = null;
+	if (key.startsWith("absbook/") && size <= ABS_ZIP_WHOLE) {
+		const obj = await bookObject(env, key);
+		if (!obj) return null;
+		whole = new Uint8Array(await obj.arrayBuffer());
+		size = whole.length;
+	}
+	const bytes = async (offset, length) => whole ? whole.subarray(offset, offset + length) : r2Bytes(env, key, offset, length);
 	const tailLen = Math.min(size, 22 + 65535 + 20);
-	const tail = await r2Bytes(env, key, size - tailLen, tailLen);
+	const tail = await bytes(size - tailLen, tailLen);
 	if (!tail) return null;
 	const dv = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
 	let end = -1;
@@ -2675,14 +2687,14 @@ async function r2Zip(env, key, size) {
 	if (end < 0) return null;
 	let count = dv.getUint16(end + 10, true), cdSize = dv.getUint32(end + 12, true), cdAt = dv.getUint32(end + 16, true);
 	if ((count === 0xffff || cdAt === 0xffffffff) && end >= 20 && dv.getUint32(end - 20, true) === 0x07064b50) {
-		const z = await r2Bytes(env, key, Number(dv.getBigUint64(end - 12, true)), 56);
+		const z = await bytes(Number(dv.getBigUint64(end - 12, true)), 56);
 		const zv = new DataView(z.buffer, z.byteOffset, z.byteLength);
 		count = Number(zv.getBigUint64(32, true));
 		cdSize = Number(zv.getBigUint64(40, true));
 		cdAt = Number(zv.getBigUint64(48, true));
 	}
 	if (cdSize > 8 * 1024 * 1024) return null;
-	const cd = await r2Bytes(env, key, cdAt, cdSize);
+	const cd = await bytes(cdAt, cdSize);
 	const cv = new DataView(cd.buffer, cd.byteOffset, cd.byteLength), names = new TextDecoder(), files = [];
 	for (let at = 0, n = 0; n < count && at + 46 <= cd.length && cv.getUint32(at, true) === 0x02014b50; n++) {
 		const flags = cv.getUint16(at + 8, true), method = cv.getUint16(at + 10, true);
@@ -2702,14 +2714,15 @@ async function r2Zip(env, key, size) {
 		at += 46 + nl + xl + cl;
 		if (!/\/$/.test(name)) files.push({ name, flags, method, csize, usize, local });
 	}
-	return { key, files };
+	return { key, files, whole };
 }
 async function r2ZipRead(env, zip, e) {
 	if (!e || e.flags & 1 || e.usize > MAX_COVER_BYTES || (e.method !== 0 && e.method !== 8)) return null;
-	const head = await r2Bytes(env, zip.key, e.local, 30);
-	if (!head || new DataView(head.buffer).getUint32(0, true) !== 0x04034b50) return null;
+	const read = async (offset, length) => zip.whole ? zip.whole.subarray(offset, offset + length) : r2Bytes(env, zip.key, offset, length);
+	const head = await read(e.local, 30);
+	if (!head || new DataView(head.buffer, head.byteOffset, head.byteLength).getUint32(0, true) !== 0x04034b50) return null;
 	const skip = 30 + (head[26] | (head[27] << 8)) + (head[28] | (head[29] << 8));
-	const data = await r2Bytes(env, zip.key, e.local + skip, e.csize);
+	const data = await read(e.local + skip, e.csize);
 	if (e.method === 0) return data;
 	return new Uint8Array(await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"))).arrayBuffer());
 }
