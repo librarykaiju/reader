@@ -2618,8 +2618,10 @@ async function bookCover(env, id) {
 	}
 	if (stored) await stored.arrayBuffer().catch(() => {});
 	const type = bookType(book);
-	if (type !== "epub" && type !== "cbz" && type !== "audiobook" && !book.abs_ebook) throw new HttpError(404, "No cover");
-	if (type === "audiobook" || book.abs_ebook) {
+	// An issue from a folder of them has its own first page, not the folder's cover.
+	const fromAbs = type === "audiobook" || (book.abs_ebook && !absIssue(book));
+	if (type !== "epub" && type !== "cbz" && !fromAbs) throw new HttpError(404, "No cover");
+	if (fromAbs) {
 		const got = await absCover(env, book);
 		if (!got) throw new HttpError(404, "No cover");
 		return coverResponse(got.img, got.kind);
@@ -3154,39 +3156,80 @@ async function absSync(env) {
 // listing doesn't give the ebook file's size, which reading a zip needs, so
 // each new or changed one is looked up, up to ABS_EBOOK_LOOKUPS a sync; the
 // rest wait for the next (waiting).
+//
+// ABS makes one item of a folder, so a comic series kept as a folder of
+// issues is one item with one ebook and the rest "supplementary". An item
+// with no audio and more than one EPUB, PDF or CBZ is taken as issues: each
+// file is a books row of its own, abs_ebook "<item id>:<file ino>", titled
+// from its file name, with the item's title as the series and its cover from
+// its own first page (absIssue). An item with one keeps abs_ebook = the item id.
 const ABS_EBOOKS = ["epub", "pdf", "cbz"], ABS_EBOOK_LOOKUPS = 100;
+function absIssue(book) { return String(book.abs_ebook || "").includes(":"); }
+// "Invincible 012 (2004) (Digital).cbz" -> ["Invincible 012", "12"]: the
+// number is the last one left once the (year) and [tag] groups are dropped.
+function issueName(filename) {
+	const name = String(filename || "").replace(/\.[^.]+$/, "").replace(/_/g, " ").trim();
+	const bare = name.replace(/\([^)]*\)|\[[^\]]*\]/g, " ").replace(/\s+/g, " ").trim();
+	const n = /(?:^|[\s#])(\d+(?:\.\d+)?)(?!.*\d)/.exec(bare);
+	return [bare || name || "Untitled", n ? String(Number(n[1])) : null];
+}
 async function absSyncEbooks(env, items) {
 	const { results } = await env.DB.prepare("SELECT id, abs_ebook, abs_updated, gone_at FROM books WHERE abs_ebook IS NOT NULL").all();
 	const have = new Map(results.map((r) => [r.abs_ebook, r]));
+	const byItem = new Map();
+	for (const r of results) {
+		const item = r.abs_ebook.split(":")[0];
+		byItem.set(item, [...(byItem.get(item) || []), r]);
+	}
 	const seen = new Set(), stmts = [], now = Date.now();
 	let added = 0, updated = 0, waiting = 0, lookups = 0;
 	for (const it of items) {
-		seen.add(it.id);
-		const row = have.get(it.id), changed = it.updatedAt || now;
-		if (row && row.abs_updated === changed && !row.gone_at) continue;
-		if (lookups >= ABS_EBOOK_LOOKUPS) { waiting++; continue; }
+		const rows = byItem.get(it.id) || [], changed = it.updatedAt || now;
+		if (rows.length && rows.every((r) => r.abs_updated === changed && !r.gone_at)) {
+			for (const r of rows) seen.add(r.abs_ebook);
+			continue;
+		}
+		// Not looked at this time: its rows stay as they are until it is.
+		if (lookups >= ABS_EBOOK_LOOKUPS) { waiting++; for (const r of rows) seen.add(r.abs_ebook); continue; }
 		lookups++;
 		const full = await absJSON(env, `/api/items/${encodeURIComponent(it.id)}`).catch((err) => { console.warn("abs ebook", it.id, err); return null; });
-		const file = full?.media?.ebookFile, ext = String(file?.ebookFormat || "").toLowerCase();
-		if (!file?.ino || !(file.metadata?.size > 0) || !ABS_EBOOKS.includes(ext)) continue;
+		if (!full) { for (const r of rows) seen.add(r.abs_ebook); continue; }
+		const usable = (f) => f?.ino && f.metadata?.size > 0 && ABS_EBOOKS.includes(String(f.metadata.ext || "").replace(/^\./, "").toLowerCase());
+		const files = (full.media?.audioFiles || []).length ? [] : (full.libraryFiles || []).filter((f) => f.fileType === "ebook" && usable(f));
 		// The listing's details: a looked-up item lists its authors and series another way.
 		const md = it.media?.metadata || {};
-		const title = str(md.title, 300) || "Untitled";
-		const [series, volume] = absSeries(md.seriesName);
-		const key = `absbook/${it.id}/${file.ino}/${Math.round(file.metadata.mtimeMs || 0)}`;
-		const vals = [title, `${title.replace(/[\\/]/g, " ")}.${ext}`, file.metadata.size, str(md.authorName, 300), str(series, 300), str(volume, 20), key, changed];
-		if (!row) {
-			stmts.push(env.DB.prepare(
-				`INSERT INTO books (title, filename, type, size, author, series, volume, r2_key, abs_updated, created_at, abs_ebook)
-				VALUES (?1, ?2, 'pdf', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
-			).bind(...vals, it.addedAt || now, it.id));
-			added++;
+		const author = str(md.authorName, 300);
+		const found = [];
+		if (files.length > 1) {
+			for (const f of files) {
+				const [title, volume] = issueName(f.metadata.filename);
+				found.push({ ref: `${it.id}:${f.ino}`, file: f, ext: f.metadata.ext.replace(/^\./, "").toLowerCase(), title: str(title, 300), series: str(md.title, 300), volume: str(volume, 20) });
+			}
 		} else {
-			stmts.push(env.DB.prepare(
-				`UPDATE books SET title = ?1, filename = ?2, size = ?3, author = ?4, series = ?5, volume = ?6, r2_key = ?7,
-				abs_updated = ?8, gone_at = NULL WHERE id = ?9`,
-			).bind(...vals, row.id));
-			updated++;
+			const file = full.media?.ebookFile, ext = String(file?.ebookFormat || "").toLowerCase();
+			if (file?.ino && file.metadata?.size > 0 && ABS_EBOOKS.includes(ext)) {
+				const [series, volume] = absSeries(md.seriesName);
+				found.push({ ref: it.id, file, ext, title: str(md.title, 300) || "Untitled", series: str(series, 300), volume: str(volume, 20) });
+			}
+		}
+		for (const { ref, file, ext, title, series, volume } of found) {
+			seen.add(ref);
+			const row = have.get(ref);
+			const key = `absbook/${it.id}/${file.ino}/${Math.round(file.metadata.mtimeMs || 0)}`;
+			const vals = [title, `${title.replace(/[\\/]/g, " ")}.${ext}`, file.metadata.size, author, series, volume, key, changed];
+			if (!row) {
+				stmts.push(env.DB.prepare(
+					`INSERT INTO books (title, filename, type, size, author, series, volume, r2_key, abs_updated, created_at, abs_ebook)
+					VALUES (?1, ?2, 'pdf', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
+				).bind(...vals, it.addedAt || now, ref));
+				added++;
+			} else {
+				stmts.push(env.DB.prepare(
+					`UPDATE books SET title = ?1, filename = ?2, size = ?3, author = ?4, series = ?5, volume = ?6, r2_key = ?7,
+					abs_updated = ?8, gone_at = NULL WHERE id = ?9`,
+				).bind(...vals, row.id));
+				updated++;
+			}
 		}
 	}
 	let gone = 0;
@@ -3315,7 +3358,7 @@ async function absCover(env, book) {
 const ABS_COVERS_PER_RUN = 40;
 async function absWarmCovers(env) {
 	const { results } = await env.DB.prepare(
-		"SELECT id, r2_key, abs_id, abs_ebook FROM books WHERE (abs_id IS NOT NULL OR abs_ebook IS NOT NULL) AND gone_at IS NULL ORDER BY created_at DESC, id DESC",
+		"SELECT id, r2_key, abs_id, abs_ebook FROM books WHERE (abs_id IS NOT NULL OR (abs_ebook IS NOT NULL AND abs_ebook NOT LIKE '%:%')) AND gone_at IS NULL ORDER BY created_at DESC, id DESC",
 	).all();
 	const have = await coverStates(env, new Map(results.map((b) => [b.id, b.r2_key])));
 	let n = 0;

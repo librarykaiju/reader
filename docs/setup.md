@@ -381,6 +381,19 @@ How they behave:
 - While the server is down, these books say the home server is offline; books in R2 still open.
 - They can't be deleted in the app (remove them in ABS), uploading a file with the same name adds a separate book instead of replacing it, and their title, author and series come back from ABS whenever ABS changes the item. A changed file gets its cover and preview made again.
 
+### Comics from Audiobookshelf
+
+Comics kept as a folder per series, with every issue in it (`Comics/Invincible/Invincible 001.cbz`, `Invincible 002.cbz`, …), come in too, one book per issue. ABS makes one item of a folder and lists all but one issue as extra files; Reader takes every CBZ, PDF and EPUB in an item that has no audio and more than one of them.
+
+1. **Make a library.** ABS → Settings → **Libraries** → add one with media type **Book**, named say `Comics`, on the comics folder (it needs to be inside a path the ABS container can see). Keeping comics out of the Ebooks library keeps them apart from novels in ABS; Reader doesn't mind either way.
+2. **Let `reader` see it** and **scan** it, as above. Each series folder is one lookup, so even a big collection comes in within a few syncs.
+
+How they behave:
+- Each issue is titled from its file name, without the `(2015)` and `[tags]` groups. Its series is the folder's title in ABS, and its number is the last number left in that name (`Star Wars 001` → 1).
+- Its cover is its own first page, not the folder's cover.
+- A folder with just one comic is one book, titled and covered the way ABS has it.
+- CBR is left out, as for ebooks: convert it to CBZ (same pages, a different archive).
+
 ## If something goes wrong
 
 | You see | Fix |
