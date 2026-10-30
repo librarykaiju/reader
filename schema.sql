@@ -157,6 +157,7 @@ CREATE TABLE IF NOT EXISTS book_tags (
 CREATE TABLE IF NOT EXISTS book_tag_links (
 	book_id INTEGER NOT NULL REFERENCES books (id) ON DELETE CASCADE,
 	tag_id INTEGER NOT NULL REFERENCES book_tags (id) ON DELETE CASCADE,
+	abs INTEGER NOT NULL DEFAULT 0, -- 1: put on by the sync from Audiobookshelf's genres (it adds and removes these)
 	PRIMARY KEY (book_id, tag_id)
 );
 
