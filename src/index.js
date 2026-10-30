@@ -3174,7 +3174,7 @@ function issueName(filename) {
 	return [bare || name || "Untitled", n ? String(Number(n[1])) : null];
 }
 async function absSyncEbooks(env, items) {
-	const { results } = await env.DB.prepare("SELECT id, abs_ebook, abs_updated, gone_at FROM books WHERE abs_ebook IS NOT NULL").all();
+	const { results } = await env.DB.prepare("SELECT id, abs_ebook, abs_updated, gone_at, r2_key FROM books WHERE abs_ebook IS NOT NULL").all();
 	const have = new Map(results.map((r) => [r.abs_ebook, r]));
 	const byItem = new Map();
 	for (const r of results) {
@@ -3182,7 +3182,7 @@ async function absSyncEbooks(env, items) {
 		byItem.set(item, [...(byItem.get(item) || []), r]);
 	}
 	const seen = new Set(), stmts = [], now = Date.now();
-	let added = 0, updated = 0, waiting = 0, lookups = 0;
+	let added = 0, updated = 0, waiting = 0, lookups = 0, spent = false;
 	// New items get the lookups first: a rescan can mark hundreds of known ones changed.
 	const order = [...items.filter((it) => !byItem.has(it.id)), ...items.filter((it) => byItem.has(it.id))];
 	for (const it of order) {
@@ -3192,10 +3192,15 @@ async function absSyncEbooks(env, items) {
 			continue;
 		}
 		// Not looked at this time: its rows stay as they are until it is.
-		if (lookups >= ABS_EBOOK_LOOKUPS) { waiting++; for (const r of rows) seen.add(r.abs_ebook); continue; }
+		if (spent || lookups >= ABS_EBOOK_LOOKUPS) { waiting++; for (const r of rows) seen.add(r.abs_ebook); continue; }
 		lookups++;
-		const full = await absJSON(env, `/api/items/${encodeURIComponent(it.id)}`).catch((err) => { console.warn("abs ebook", it.id, err); return null; });
-		if (!full) { for (const r of rows) seen.add(r.abs_ebook); continue; }
+		const full = await absJSON(env, `/api/items/${encodeURIComponent(it.id)}`).catch((err) => {
+			// Out of subrequests for this run: every lookup after it would fail too.
+			if (/too many subrequests/i.test(err?.message || "")) spent = true;
+			else console.warn("abs ebook", it.id, err);
+			return null;
+		});
+		if (!full) { if (spent) waiting++; for (const r of rows) seen.add(r.abs_ebook); continue; }
 		const usable = (f) => f?.ino && f.metadata?.size > 0 && ABS_EBOOKS.includes(String(f.metadata.ext || "").replace(/^\./, "").toLowerCase());
 		const files = (full.media?.audioFiles || []).length ? [] : (full.libraryFiles || []).filter((f) => f.fileType === "ebook" && usable(f));
 		// The listing's details: a looked-up item lists its authors and series another way.
@@ -3214,9 +3219,14 @@ async function absSyncEbooks(env, items) {
 				found.push({ ref: it.id, file, ext, title: str(md.title, 300) || "Untitled", series: str(series, 300), volume: str(volume, 20) });
 			}
 		}
+		// An item that goes from one book to one per file (or back) keeps the row
+		// for the file it already pointed at: r2_key is unique, and its tags and place stay.
+		const claimed = new Set();
+		const byIno = (ino) => rows.find((r) => !claimed.has(r.id) && !found.some((f) => f.ref === r.abs_ebook) && String(r.r2_key || "").split("/")[2] === String(ino));
 		for (const { ref, file, ext, title, series, volume } of found) {
 			seen.add(ref);
-			const row = have.get(ref);
+			const row = have.get(ref) || byIno(file.ino);
+			if (row) { claimed.add(row.id); seen.add(row.abs_ebook); }
 			const key = `absbook/${it.id}/${file.ino}/${Math.round(file.metadata.mtimeMs || 0)}`;
 			const vals = [title, `${title.replace(/[\\/]/g, " ")}.${ext}`, file.metadata.size, author, series, volume, key, changed];
 			if (!row) {
@@ -3228,8 +3238,8 @@ async function absSyncEbooks(env, items) {
 			} else {
 				stmts.push(env.DB.prepare(
 					`UPDATE books SET title = ?1, filename = ?2, size = ?3, author = ?4, series = ?5, volume = ?6, r2_key = ?7,
-					abs_updated = ?8, gone_at = NULL WHERE id = ?9`,
-				).bind(...vals, row.id));
+					abs_updated = ?8, gone_at = NULL, abs_ebook = ?10 WHERE id = ?9`,
+				).bind(...vals, row.id, ref));
 				updated++;
 			}
 		}
