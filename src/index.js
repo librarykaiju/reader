@@ -125,7 +125,7 @@
 //                                  hours and the book ids already taken, null for the owner; audio_: the same for
 //                                  audiobooks, which have their own limit); renews the cookie
 //   GET    /api/family/books       -> {"books": [...each with tags: [names]]}, without any tagged "Hide from family"
-//                                  or single ABS comic issues (familyHides)
+//                                  or comics under 100 MB (familyHides)
 //   GET    /api/catalog           -> {"books": [{id, title, author, series, volume, pages, pages_estimated,
 //                                  year?, publisher?, language?, classification?, isbn?}]}: catalog details for the
 //                                  site's book logs; takes CATALOG_TOKEN (read-only) as well as READER_TOKEN
@@ -2940,11 +2940,10 @@ async function familyApi(request, env, url, who) {
 const NOT_HIDDEN = `NOT EXISTS (SELECT 1 FROM book_tag_links l JOIN book_tags t ON t.id = l.tag_id
 	WHERE l.book_id = books.id AND t.name = '${HIDE_TAG}' COLLATE NOCASE)`;
 
-// Single comic issues (one of several files in an ABS folder) stay out of the
-// family library; collections in the same folder, by their names, and
-// one-file comics don't.
-const COLLECTION = /\bvol(?:ume)?\.?\s*\d|\b(?:tpb|omnibus|compendium|collection|deluxe|archive edition|hardcover|graphic novel|ogn|book\s*(?:one|two|three|four|five|\d))\b/i;
-function familyHides(book) { return absIssue(book) && !COLLECTION.test(book.title || ""); }
+// Comics under 100 MB are single issues, not collections, and stay out of
+// the family library (they're still in the app's Library).
+const FAMILY_COMIC_MIN = 100 * 1000 * 1000;
+function familyHides(book) { return bookType(book) === "cbz" && (book.size || 0) < FAMILY_COMIC_MIN; }
 
 async function familyBooks(env) {
 	const { results: all } = await env.DB.prepare(
