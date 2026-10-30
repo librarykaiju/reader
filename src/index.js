@@ -5023,6 +5023,16 @@ var ART = {
 		+ '<path d="M42 30l-10 13h8l-5 13 15-18h-8l5-8z" fill="' + GOLD + '"/>'
 		+ '<g stroke="' + GOLD + '" stroke-width="1.6" stroke-linecap="round" opacity=".7"><path d="M24 40l-4 4M58 38l4 3"/></g>']
 };
+// Comics: a burst and a speech bubble over halftone dots.
+ART.comics = ["#9b3a2f", (function () {
+	var out = '<g fill="' + INK + '" opacity=".16">';
+	for (var y = 6; y < 60; y += 6) for (var x = (y / 6) % 2 ? 3 : 6; x < 80; x += 6) out += '<circle cx="' + x + '" cy="' + y + '" r="' + (1.6 - x / 80).toFixed(2) + '"/>';
+	return out + '</g><path d="M56 8l3 9 8-5-2 9 9 1-7 6 7 6-9 1 2 9-8-5-3 9-3-9-8 5 2-9-9-1 7-6-7-6 9-1-2-9 8 5z" fill="' + GOLD + '"/>'
+		+ '<circle cx="56" cy="30" r="6" fill="' + EMBER + '"/>'
+		+ '<path d="M8 22c0-8 8-13 18-13s18 5 18 13-8 13-18 13c-2 0-4 0-6-.5L11 41l3-9c-4-2.5-6-6-6-10z" fill="' + INK + '"/>'
+		+ '<g stroke="#9b3a2f" stroke-width="2.2" stroke-linecap="round"><path d="M16 18h20M14 23h24M18 28h14"/></g>'
+		+ '<path d="M10 52h60" stroke="' + INK + '" stroke-width="1.5" opacity=".5"/>';
+})()];
 // A laurel wreath for nonfiction Classics: two arcs of leaves.
 ART.laurel = ["#6b5a2e", (function () {
 	var out = "";
@@ -5036,7 +5046,11 @@ ART.laurel = ["#6b5a2e", (function () {
 	return out + '<path d="M33 51l7-4 7 4" fill="none" stroke="' + EMBER + '" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>'
 		+ '<path d="M40 22l2.4 5 5.4.6-4 3.7 1.1 5.3-4.9-2.7-4.9 2.7 1.1-5.3-4-3.7 5.4-.6z" fill="' + INK + '"/>';
 })()];
+// Comics lead: they cut across the other genres, and every comic is one
+// whether or not it was tagged.
+var COMICS = /\bcomics?\b|graphic novel|\bmanga\b/;
 var FICTION = [
+	["Comics", COMICS, "comics", function (b) { return b.type === "cbz"; }],
 	["Classics", /\bclassic/, "classics"],
 	["Westerns", /\bwestern/, "westerns"],
 	["Mysteries", /\bmyster|\bdetective/, "mysteries"],
@@ -5078,7 +5092,7 @@ function genreButton(g) {
 function renderRecs() {
 	var fic = [], non = [], counts = {}, used = {};
 	FICTION.forEach(function (f) {
-		var test = function (b) { return b.tags.some(function (t) { return f[1].test(fold(t)); }); };
+		var test = function (b) { return (f[3] && f[3](b)) || b.tags.some(function (t) { return f[1].test(fold(t)); }); };
 		var n = books.filter(test).length;
 		if (n) fic.push({ id: "f:" + f[0], label: f[0], art: f[2], test: test, n: n });
 	});
@@ -5089,7 +5103,8 @@ function renderRecs() {
 	Object.keys(everywhere).forEach(function (t) { if (everywhere[t] === books.length && books.length > 1) common[t] = 1; });
 	books.forEach(function (b) {
 		if (!b.tags.some(function (t) { return NONFIC.test(fold(t)); })) return;
-		b.tags.forEach(function (t) { if (!NONFIC.test(fold(t)) && everywhere[t] < books.length) counts[t] = (counts[t] || 0) + 1; });
+		// Comics has its own card in Fiction, so a nonfiction comic's tag doesn't make a second.
+		b.tags.forEach(function (t) { if (!NONFIC.test(fold(t)) && !COMICS.test(fold(t)) && everywhere[t] < books.length) counts[t] = (counts[t] || 0) + 1; });
 	});
 	var tags = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a] || fold(a).localeCompare(fold(b)); }), arts = {};
 	// Tags with their own drawing first, so a spare never takes one of those.
