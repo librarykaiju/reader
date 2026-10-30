@@ -3149,7 +3149,38 @@ async function absSync(env) {
 		gone++;
 	}
 	for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
-	return { added, updated, gone, total: seen.size, ebooks: await absSyncEbooks(env, ebooks) };
+	const ebookSync = await absSyncEbooks(env, ebooks);
+	return { added, updated, gone, total: seen.size, ebooks: ebookSync, genres: await absGenreTags(env, items) };
+}
+
+// Genre tags for ABS books from ABS's own tags (an audiobook's are Audible's
+// finer categories), else its genres, matched against GENRES like a file's
+// subjects. Only a book with no tags at all gets them, so tags you change in
+// Reader stay as you left them. -> number of books tagged
+async function absGenreTags(env, items) {
+	const subjects = new Map();
+	for (const it of items) {
+		// Tags first: every Audible fantasy is also "Science Fiction & Fantasy".
+		const media = it.media || {}, list = media.tags?.length ? media.tags : media.metadata?.genres || [];
+		if (it.id && list.length) subjects.set(it.id, list.map(String));
+	}
+	if (!subjects.size) return 0;
+	const { results } = await env.DB.prepare(
+		`SELECT id, abs_id, abs_ebook FROM books WHERE (abs_id IS NOT NULL OR abs_ebook IS NOT NULL) AND gone_at IS NULL
+		AND id NOT IN (SELECT book_id FROM book_tag_links)`,
+	).all();
+	const want = [];
+	for (const b of results) {
+		const names = genresOf(subjects.get(b.abs_id || String(b.abs_ebook).split(":")[0]) || [], 3);
+		if (names.length) want.push([b.id, names]);
+	}
+	if (!want.length) return 0;
+	const all = [...new Set(want.flatMap(([, names]) => names))];
+	const ids = new Map((await bookTagsNamed(env, all)).map((id, i) => [all[i], id]));
+	const stmts = want.flatMap(([book, names]) => names.map((n) =>
+		env.DB.prepare("INSERT OR IGNORE INTO book_tag_links (book_id, tag_id) VALUES (?, ?)").bind(book, ids.get(n))));
+	for (let i = 0; i < stmts.length; i += 100) await env.DB.batch(stmts.slice(i, i + 100));
+	return want.length;
 }
 
 // The ebooks among ABS's items -> {added, updated, gone, total, waiting}. The
