@@ -3183,7 +3183,9 @@ async function absSyncEbooks(env, items) {
 	}
 	const seen = new Set(), stmts = [], now = Date.now();
 	let added = 0, updated = 0, waiting = 0, lookups = 0;
-	for (const it of items) {
+	// New items get the lookups first: a rescan can mark hundreds of known ones changed.
+	const order = [...items.filter((it) => !byItem.has(it.id)), ...items.filter((it) => byItem.has(it.id))];
+	for (const it of order) {
 		const rows = byItem.get(it.id) || [], changed = it.updatedAt || now;
 		if (rows.length && rows.every((r) => r.abs_updated === changed && !r.gone_at)) {
 			for (const r of rows) seen.add(r.abs_ebook);
