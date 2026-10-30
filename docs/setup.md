@@ -379,7 +379,7 @@ How they behave:
 - Covers come from ABS, once, and are kept in R2.
 - The file is read from ABS each time it's opened, a piece at a time for comics, PDFs and previews, so it's a little slower than R2. **Download for offline** in the app works as before.
 - While the server is down, these books say the home server is offline; books in R2 still open.
-- **Genre tags** come from ABS too, for audiobooks and ebooks: an item's tags (an audiobook's are Audible's categories), else its genres, matched against the same list as **Tag genres**. Only a book with no tags at all gets them, so a tag you change in Reader isn't put back. Books ABS has no genres for can still use **Tag genres**.
+- **Genre tags** come from ABS too, for audiobooks and ebooks: an item's tags (an audiobook's are Audible's categories), else its genres, matched against the same list as **Tag genres** (run migration `0020` first). They follow ABS: change an item's tags or genres there and the next sync adds or takes off its genre tags in Reader. Tags you add in Reader stay whatever ABS says, but a genre tag that came from ABS comes back if you remove it in Reader, so change those in ABS. Books ABS has no genres for can still use **Tag genres**.
 - They can't be deleted in the app (remove them in ABS), uploading a file with the same name adds a separate book instead of replacing it, and their title, author and series come back from ABS whenever ABS changes the item. A changed file gets its cover and preview made again.
 
 ### Comics from Audiobookshelf

@@ -651,10 +651,11 @@ async function tagRefs(env, value, t = TAGS.feeds) {
 }
 
 function setFeedTags(env, feedId, ids) { return setTags(env, TAGS.feeds, feedId, ids); }
+// Tags that stay keep their row (a book's says whether it came from Audiobookshelf).
 function setTags(env, t, ownerId, ids) {
 	return env.DB.batch([
-		env.DB.prepare(`DELETE FROM ${t.links} WHERE ${t.col} = ?`).bind(ownerId),
-		...ids.map((tag) => env.DB.prepare(`INSERT INTO ${t.links} (${t.col}, tag_id) VALUES (?, ?)`).bind(ownerId, tag)),
+		env.DB.prepare(`DELETE FROM ${t.links} WHERE ${t.col} = ? AND tag_id NOT IN (SELECT value FROM json_each(?))`).bind(ownerId, JSON.stringify(ids)),
+		...ids.map((tag) => env.DB.prepare(`INSERT OR IGNORE INTO ${t.links} (${t.col}, tag_id) VALUES (?, ?)`).bind(ownerId, tag)),
 	]);
 }
 
@@ -3155,32 +3156,51 @@ async function absSync(env) {
 
 // Genre tags for ABS books from ABS's own tags (an audiobook's are Audible's
 // finer categories), else its genres, matched against GENRES like a file's
-// subjects. Only a book with no tags at all gets them, so tags you change in
-// Reader stay as you left them. -> number of books tagged
+// subjects. These links are marked abs = 1 and follow ABS: one ABS drops is
+// taken off. Tags added in Reader (abs = 0) are left alone.
+// -> {added, removed} links
 async function absGenreTags(env, items) {
 	const subjects = new Map();
 	for (const it of items) {
 		// Tags first: every Audible fantasy is also "Science Fiction & Fantasy".
 		const media = it.media || {}, list = media.tags?.length ? media.tags : media.metadata?.genres || [];
-		if (it.id && list.length) subjects.set(it.id, list.map(String));
+		if (it.id) subjects.set(it.id, list.map(String));
 	}
-	if (!subjects.size) return 0;
-	const { results } = await env.DB.prepare(
-		`SELECT id, abs_id, abs_ebook FROM books WHERE (abs_id IS NOT NULL OR abs_ebook IS NOT NULL) AND gone_at IS NULL
-		AND id NOT IN (SELECT book_id FROM book_tag_links)`,
-	).all();
-	const want = [];
-	for (const b of results) {
-		const names = genresOf(subjects.get(b.abs_id || String(b.abs_ebook).split(":")[0]) || [], 3);
-		if (names.length) want.push([b.id, names]);
+	const [{ results: books }, { results: links }] = await env.DB.batch([
+		env.DB.prepare("SELECT id, abs_id, abs_ebook FROM books WHERE (abs_id IS NOT NULL OR abs_ebook IS NOT NULL) AND gone_at IS NULL"),
+		env.DB.prepare("SELECT book_id, tag_id, abs FROM book_tag_links"),
+	]);
+	const want = new Map();
+	for (const b of books) {
+		const list = subjects.get(b.abs_id || String(b.abs_ebook).split(":")[0]);
+		// An item missing from this listing keeps its tags.
+		if (list) want.set(b.id, genresOf(list, 3));
 	}
-	if (!want.length) return 0;
-	const all = [...new Set(want.flatMap(([, names]) => names))];
-	const ids = new Map((await bookTagsNamed(env, all)).map((id, i) => [all[i], id]));
-	const stmts = want.flatMap(([book, names]) => names.map((n) =>
-		env.DB.prepare("INSERT OR IGNORE INTO book_tag_links (book_id, tag_id) VALUES (?, ?)").bind(book, ids.get(n))));
+	const all = [...new Set([...want.values()].flat())];
+	const ids = new Map((all.length ? await bookTagsNamed(env, all) : []).map((id, i) => [all[i], id]));
+	const has = new Map();
+	for (const l of links) {
+		if (!want.has(l.book_id)) continue;
+		if (!has.has(l.book_id)) has.set(l.book_id, new Map());
+		has.get(l.book_id).set(l.tag_id, l.abs);
+	}
+	const stmts = [];
+	let added = 0, removed = 0;
+	for (const [book, names] of want) {
+		const now = has.get(book) || new Map(), tags = new Set(names.map((n) => ids.get(n)));
+		for (const t of tags) {
+			if (now.has(t)) continue;
+			stmts.push(env.DB.prepare("INSERT OR IGNORE INTO book_tag_links (book_id, tag_id, abs) VALUES (?, ?, 1)").bind(book, t));
+			added++;
+		}
+		for (const [t, abs] of now) {
+			if (!abs || tags.has(t)) continue;
+			stmts.push(env.DB.prepare("DELETE FROM book_tag_links WHERE book_id = ? AND tag_id = ? AND abs = 1").bind(book, t));
+			removed++;
+		}
+	}
 	for (let i = 0; i < stmts.length; i += 100) await env.DB.batch(stmts.slice(i, i + 100));
-	return want.length;
+	return { added, removed };
 }
 
 // The ebooks among ABS's items -> {added, updated, gone, total, waiting}. The
