@@ -125,6 +125,7 @@
 //                                  hours and the book ids already taken, null for the owner; audio_: the same for
 //                                  audiobooks, which have their own limit); renews the cookie
 //   GET    /api/family/books       -> {"books": [...each with tags: [names]]}, without any tagged "Hide from family"
+//                                  or single ABS comic issues (familyHides)
 //   GET    /api/catalog           -> {"books": [{id, title, author, series, volume, pages, pages_estimated,
 //                                  year?, publisher?, language?, classification?, isbn?}]}: catalog details for the
 //                                  site's book logs; takes CATALOG_TOKEN (read-only) as well as READER_TOKEN
@@ -2939,17 +2940,24 @@ async function familyApi(request, env, url, who) {
 const NOT_HIDDEN = `NOT EXISTS (SELECT 1 FROM book_tag_links l JOIN book_tags t ON t.id = l.tag_id
 	WHERE l.book_id = books.id AND t.name = '${HIDE_TAG}' COLLATE NOCASE)`;
 
+// Single comic issues (one of several files in an ABS folder) stay out of the
+// family library; collections in the same folder, by their names, and
+// one-file comics don't.
+const COLLECTION = /\bvol(?:ume)?\.?\s*\d|\b(?:tpb|omnibus|compendium|collection|deluxe|archive edition|hardcover|graphic novel|ogn|book\s*(?:one|two|three|four|five|\d))\b/i;
+function familyHides(book) { return absIssue(book) && !COLLECTION.test(book.title || ""); }
+
 async function familyBooks(env) {
-	const { results } = await env.DB.prepare(
-		`SELECT id, title, ${BOOK_TYPE} AS type, size, created_at, author, series, volume, narrator, duration, r2_key,
+	const { results: all } = await env.DB.prepare(
+		`SELECT id, title, ${BOOK_TYPE} AS type, size, created_at, author, series, volume, narrator, duration, r2_key, abs_ebook,
 			(SELECT json_group_array(t.name) FROM book_tag_links l JOIN book_tags t ON t.id = l.tag_id WHERE l.book_id = books.id) AS tags
 		FROM books WHERE ${NOT_HIDDEN} AND gone_at IS NULL ORDER BY created_at DESC, id DESC`,
 	).all();
+	const results = all.filter((b) => !familyHides(b));
 	const covers = await coverStates(env, new Map(results.map((b) => [b.id, b.r2_key])));
 	for (const b of results) {
 		b.tags = JSON.parse(b.tags || "[]");
 		b.cover = covers.get(b.id) || null;
-		delete b.r2_key;
+		delete b.r2_key; delete b.abs_ebook;
 		if (b.type !== "audiobook") { delete b.narrator; delete b.duration; }
 	}
 	return json({ books: results });
@@ -2958,7 +2966,7 @@ async function familyBooks(env) {
 // A hidden book answers as if it weren't there.
 async function familyBook(env, id) {
 	const book = await env.DB.prepare(`SELECT * FROM books WHERE id = ? AND ${NOT_HIDDEN} AND gone_at IS NULL`).bind(id).first();
-	if (!book) throw new HttpError(404, "No such book");
+	if (!book || familyHides(book)) throw new HttpError(404, "No such book");
 	return book;
 }
 
@@ -3066,6 +3074,8 @@ async function absFetch(env, path, init = {}) {
 	try {
 		res = await fetch(env.ABS_URL.replace(/\/+$/, "") + path, { ...init, headers, redirect: "manual" });
 	} catch (err) {
+		// The free plan's subrequests ran out: not the server's fault, and a sync stops looking things up.
+		if (/too many subrequests/i.test(err?.message || "")) throw Object.assign(new HttpError(503, "Reader ran out of requests for this run"), { spent: true });
 		console.warn("abs", path, err);
 		throw new HttpError(502, ABS_OFFLINE);
 	}
@@ -3247,7 +3257,7 @@ async function absSyncEbooks(env, items) {
 		lookups++;
 		const full = await absJSON(env, `/api/items/${encodeURIComponent(it.id)}`).catch((err) => {
 			// Out of subrequests for this run: every lookup after it would fail too.
-			if (/too many subrequests/i.test(err?.message || "")) spent = true;
+			if (err?.spent) spent = true;
 			else console.warn("abs ebook", it.id, err);
 			return null;
 		});
@@ -3428,7 +3438,7 @@ async function absWarmCovers(env) {
 	for (const b of results) {
 		if (have.has(b.id)) continue;
 		if (n >= ABS_COVERS_PER_RUN) break;
-		await absCover(env, b);
+		try { await absCover(env, b); } catch (err) { if (err?.spent) break; throw err; }
 		n++;
 	}
 	return n;
