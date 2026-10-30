@@ -3074,6 +3074,8 @@ async function absFetch(env, path, init = {}) {
 	try {
 		res = await fetch(env.ABS_URL.replace(/\/+$/, "") + path, { ...init, headers, redirect: "manual" });
 	} catch (err) {
+		// The free plan's subrequests ran out: not the server's fault, and a sync stops looking things up.
+		if (/too many subrequests/i.test(err?.message || "")) throw Object.assign(new HttpError(503, "Reader ran out of requests for this run"), { spent: true });
 		console.warn("abs", path, err);
 		throw new HttpError(502, ABS_OFFLINE);
 	}
@@ -3255,7 +3257,7 @@ async function absSyncEbooks(env, items) {
 		lookups++;
 		const full = await absJSON(env, `/api/items/${encodeURIComponent(it.id)}`).catch((err) => {
 			// Out of subrequests for this run: every lookup after it would fail too.
-			if (/too many subrequests/i.test(err?.message || "")) spent = true;
+			if (err?.spent) spent = true;
 			else console.warn("abs ebook", it.id, err);
 			return null;
 		});
@@ -3436,7 +3438,7 @@ async function absWarmCovers(env) {
 	for (const b of results) {
 		if (have.has(b.id)) continue;
 		if (n >= ABS_COVERS_PER_RUN) break;
-		await absCover(env, b);
+		try { await absCover(env, b); } catch (err) { if (err?.spent) break; throw err; }
 		n++;
 	}
 	return n;
