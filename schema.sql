@@ -120,8 +120,9 @@ CREATE TABLE IF NOT EXISTS books (
 	abs_updated INTEGER,
 	abs_media TEXT,
 	gone_at INTEGER,
-	-- An ebook from Audiobookshelf (migration 0019): its item id. Its r2_key
-	-- starts "absbook/", and its file is read from there, not R2.
+	-- An ebook from Audiobookshelf (migration 0019): its item id, or
+	-- "<item id>:<file ino>" for one issue in a folder of comics (absSyncEbooks).
+	-- Its r2_key starts "absbook/", and its file is read from there, not R2.
 	abs_ebook TEXT
 );
 
