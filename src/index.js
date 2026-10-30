@@ -2360,9 +2360,10 @@ const GENRES = [
 	["Thriller", /\bthrillers?\b|\bsuspense\b|espionage|spy (?:fiction|stories)/],
 	["Romance", /\bromance\b|love stories/],
 	["Historical Fiction", /historical (?:fiction|novels?)|fiction historical/],
+	["Westerns", /\bwesterns?\b/],
 	["Literary Fiction", /literary fiction|fiction literary|psychological fiction/],
 	["Young Adult", /young adult|juvenile fiction|\bteen\b/],
-	["Children's", /children s (?:fiction|stories|books|literature)|picture books|juvenile literature/],
+	["Children's", /children s (?:fiction|stories|books|literature|audiobooks)|picture books|juvenile literature/],
 	["Humor", /\bhumou?r|\bcomedy\b|\bsatire\b|\bparod(?:y|ies)\b/],
 	["Short Fiction", /short (?:stories|fiction)|\banthologies\b|\bnovellas?\b/],
 	["Poetry", /\bpoetry\b|\bpoems\b/],
@@ -2378,7 +2379,10 @@ const GENRES = [
 	["Philosophy", /\bphilosophy\b/, true],
 	["Religion", /\breligio|\btheology\b|\bbible\b|christianity|buddhism|\bislam\b/, true],
 	["Science", /^(?:science|physics|biology|chemistry|astronomy|cosmology|mathematics|evolution)\b/, true],
+	["Self-Help", /self help|personal development|productivity|\bsuccess\b/, true],
+	["Art", /^(?:art|drawing|painting|illustration|design)\b|art instruction/, true],
 ];
+const FACT_GENRES = new Set(GENRES.filter((g) => g[2]).map((g) => g[0]));
 // A more exact genre stands in for the general one.
 const GENRE_OVER = { "Urban Fantasy": "Fantasy" };
 const FICTION_WORDS = /\bfiction\b|\bnovels?\b|\bstories\b/;
@@ -3183,7 +3187,11 @@ async function absGenreTags(env, items) {
 	for (const b of books) {
 		const list = subjects.get(b.abs_id || String(b.abs_ebook).split(":")[0]);
 		// An item missing from this listing keeps its tags.
-		if (list) want.set(b.id, genresOf(list, 3));
+		if (!list) continue;
+		// The family library's Nonfiction row is the books tagged Nonfiction.
+		const names = genresOf(list, 3);
+		if (names.some((n) => FACT_GENRES.has(n)) || list.some((x) => /non ?fiction/.test(subjectKey(x)))) names.push("Nonfiction");
+		want.set(b.id, names);
 	}
 	const all = [...new Set([...want.values()].flat())];
 	const ids = new Map((all.length ? await bookTagsNamed(env, all) : []).map((id, i) => [all[i], id]));
