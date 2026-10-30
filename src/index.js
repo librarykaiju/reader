@@ -215,6 +215,7 @@ export default {
 		if (url.pathname === "/family" && (request.method === "GET" || request.method === "HEAD")) return Response.redirect(new URL("/library" + url.search, url), 301);
 		if (url.pathname === "/sw.js" && request.method === "GET") return serviceWorker();
 		if (url.pathname === "/apple-touch-icon.png" && request.method === "GET") return touchIcon();
+		if (MANIFESTS[url.pathname] && request.method === "GET") return manifest(MANIFESTS[url.pathname]);
 		if (FONTS[url.pathname] && request.method === "GET") return font(FONTS[url.pathname]);
 		const listen = url.pathname.match(/^\/listen\/(\d+)\/(\d+|file)$/);
 		if (listen && request.method === "GET") return listenFile(request, env, url, Number(listen[1]), listen[2]).catch(errorJSON);
@@ -4238,6 +4239,24 @@ function touchIcon() {
 		headers: { "Content-Type": "image/png", "Cache-Control": "public, max-age=86400" },
 	});
 }
+// Web app manifests, one for the app and one for the family library, each
+// with its own id and scope. Without one, iOS can't tell Reader's Home Screen
+// app from another web app on brandonj.ink (wr1t3r), and tapping the lock
+// screen's Now Playing opened that one instead. The family's scope is /library,
+// so it stays its own app on a phone that has both.
+const MANIFESTS = {
+	"/manifest.webmanifest": { id: "/", name: "Reader", short_name: "Reader", start_url: "/", scope: "/", background_color: "#fbfaf7", theme_color: "#fbfaf7" },
+	"/library.webmanifest": { id: "/library", name: "The Back Alley Library", short_name: "Back Alley", start_url: "/library", scope: "/library", background_color: "#f4ecd8", theme_color: "#f4ecd8" },
+};
+function manifest(m) {
+	const body = Object.assign({}, m, {
+		display: "standalone",
+		icons: [{ src: "/apple-touch-icon.png", sizes: "180x180", type: "image/png" }],
+	});
+	return new Response(JSON.stringify(body), {
+		headers: { "Content-Type": "application/manifest+json", "Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff" },
+	});
+}
 // Fraunces (SIL Open Font License, src/fonts/OFL.txt): the variable font
 // with its SOFT axis fixed at 100 (the rounded corners) and WONK at 0, so
 // weight and optical size are all that's left to vary. Latin only; anything
@@ -4264,6 +4283,7 @@ function page() {
 		"media-src 'self' https: blob:",
 		"frame-src " + EMBED_HOSTS.map((h) => "https://" + h).join(" "),
 		"worker-src 'self' blob: https://cdnjs.cloudflare.com",
+		"manifest-src 'self'",
 		"base-uri 'none'",
 		"form-action 'none'",
 		"frame-ancestors 'none'",
@@ -4302,6 +4322,7 @@ function familyPage(env) {
 		"font-src 'self' data:",
 		"connect-src 'self' https://cdn.jsdelivr.net",
 		"worker-src blob: https://cdnjs.cloudflare.com",
+		"manifest-src 'self'",
 		`frame-src${ts || " 'none'"}`,
 		"base-uri 'none'",
 		"form-action 'none'",
@@ -4332,6 +4353,7 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 <meta name="theme-color" content="#f4ecd8">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Back Alley">
+<link rel="manifest" href="/library.webmanifest">
 <link rel="icon" type="image/svg+xml" href="__ICON__">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="preload" href="/fonts/fraunces-soft.woff2" as="font" type="font/woff2" crossorigin>
@@ -6239,6 +6261,7 @@ const PAGE = String.raw`<!doctype html>
 <meta name="apple-mobile-web-app-title" content="Reader">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#fbfaf7">
+<link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" type="image/svg+xml" href="__ICON__">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="preload" href="/fonts/fraunces-soft.woff2" as="font" type="font/woff2" crossorigin>
