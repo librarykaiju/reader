@@ -660,18 +660,27 @@ function setTags(env, t, ownerId, ids) {
 // ---------------------------------------------------------------------------
 // Feeds
 
+// Every count comes from one pass over the items: D1 bills each row read,
+// and a subquery per count read each feed's items eight times over.
 async function listFeeds(env) {
 	const { results } = await env.DB.prepare(
-		`SELECT f.*, (SELECT COUNT(DISTINCT COALESCE(i.story_id, i.id)) FROM items i WHERE i.feed_id = f.id AND i.read = 0 AND i.media_url IS NULL) AS unread,
-			(SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND ${VIEWS.podcasts}) AS episodes,
-			(SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND ${VIEWS.podcasts} AND i.read = 0) AS unread_episodes,
-			(SELECT MAX(COALESCE(i.published_at, i.created_at)) FROM items i WHERE i.feed_id = f.id AND ${VIEWS.podcasts}) AS latest_episode,
-			(SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND ${VIEWS.videos}) AS videos,
-			(SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND ${VIEWS.videos} AND i.read = 0) AS unread_videos,
-			(SELECT MAX(COALESCE(i.published_at, i.created_at)) FROM items i WHERE i.feed_id = f.id AND ${VIEWS.videos}) AS latest_video,
-			(SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND i.media_url IS NULL) AS articles,
+		`SELECT f.*, COALESCE(c.unread, 0) AS unread, COALESCE(c.episodes, 0) AS episodes, COALESCE(c.unread_episodes, 0) AS unread_episodes,
+			c.latest_episode, COALESCE(c.videos, 0) AS videos, COALESCE(c.unread_videos, 0) AS unread_videos, c.latest_video,
+			COALESCE(c.articles, 0) AS articles,
 			(SELECT json_group_array(t.tag_id) FROM feed_tags t WHERE t.feed_id = f.id) AS tags
-		FROM feeds f ORDER BY lower(f.title), f.id`,
+		FROM feeds f LEFT JOIN (
+			SELECT i.feed_id,
+				COUNT(DISTINCT CASE WHEN i.read = 0 AND i.media_url IS NULL THEN COALESCE(i.story_id, i.id) END) AS unread,
+				COUNT(CASE WHEN ${VIEWS.podcasts} THEN 1 END) AS episodes,
+				COUNT(CASE WHEN ${VIEWS.podcasts} AND i.read = 0 THEN 1 END) AS unread_episodes,
+				MAX(CASE WHEN ${VIEWS.podcasts} THEN COALESCE(i.published_at, i.created_at) END) AS latest_episode,
+				COUNT(CASE WHEN ${VIEWS.videos} THEN 1 END) AS videos,
+				COUNT(CASE WHEN ${VIEWS.videos} AND i.read = 0 THEN 1 END) AS unread_videos,
+				MAX(CASE WHEN ${VIEWS.videos} THEN COALESCE(i.published_at, i.created_at) END) AS latest_video,
+				COUNT(CASE WHEN i.media_url IS NULL THEN 1 END) AS articles
+			FROM items i GROUP BY i.feed_id
+		) c ON c.feed_id = f.id
+		ORDER BY lower(f.title), f.id`,
 	).all();
 	for (const f of results) f.tags = JSON.parse(f.tags || "[]");
 	return json({ feeds: results });
