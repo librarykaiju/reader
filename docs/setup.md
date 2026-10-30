@@ -372,13 +372,14 @@ The same sync brings in ABS's ebooks, so books can live on the server instead of
 2. **One folder per book**, as for audiobooks: `ebooks/Author/Title/Title.epub`, with a series folder in between if you like. EPUB, PDF and CBZ come into Reader. ABS also takes MOBI, AZW3 and CBR, but Reader leaves those out (convert CBR to CBZ).
 3. **Add it to a library.** ABS → Settings → **Libraries**: add `/ebooks` as a folder of your Books library, or make a new library with media type **Book** on `/ebooks`. Either works for Reader.
 4. **Let `reader` see it.** Settings → **Users** → `reader`: **Access all libraries** (or tick the new one).
-5. **Scan** the library in ABS, then sync Reader (step 7 above) or wait for the cron. A sync looks up at most 100 new or changed ebooks; the answer's `ebooks.waiting` says how many are left for the next one.
+5. **Scan** the library in ABS, then sync Reader (step 7 above) or wait for the cron. A sync looks up at most 100 new or changed ebooks (fewer on the Workers free plan, which stops it at about 40), new ones first; the answer's `ebooks.waiting` says how many are left for the next one.
 
 How they behave:
 - An ebook sitting in the same folder as an audiobook's files is one ABS item, and one entry with both formats in either library. An ebook in a folder of its own pairs with its audiobook the usual way, by title and author.
 - Covers come from ABS, once, and are kept in R2.
 - The file is read from ABS each time it's opened, a piece at a time for comics, PDFs and previews, so it's a little slower than R2. **Download for offline** in the app works as before.
 - While the server is down, these books say the home server is offline; books in R2 still open.
+- **Genre tags** come from ABS too, for audiobooks and ebooks: an item's tags (an audiobook's are Audible's categories), else its genres, matched against the same list as **Tag genres**. Only a book with no tags at all gets them, so a tag you change in Reader isn't put back. Books ABS has no genres for can still use **Tag genres**.
 - They can't be deleted in the app (remove them in ABS), uploading a file with the same name adds a separate book instead of replacing it, and their title, author and series come back from ABS whenever ABS changes the item. A changed file gets its cover and preview made again.
 
 ### Comics from Audiobookshelf
