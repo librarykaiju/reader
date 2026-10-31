@@ -2262,7 +2262,13 @@ async function updateBook(request, env, id) {
 		? await env.DB.prepare(`UPDATE books SET ${sets.join(", ")} WHERE id = ? RETURNING ${BOOK_COLUMNS}`).bind(...params, id).first()
 		: await env.DB.prepare(`SELECT ${BOOK_COLUMNS} FROM books WHERE id = ?`).bind(id).first();
 	if (!book) throw new HttpError(404, "No such book");
-	if (tagIds) await setTags(env, TAGS.books, id, tagIds);
+	if (tagIds) {
+		// Each tag taken off is kept, so the Audiobookshelf sync doesn't put it back.
+		const { results: had } = await env.DB.prepare("SELECT tag_id FROM book_tag_links WHERE book_id = ?").bind(id).all();
+		const dropped = had.map((r) => r.tag_id).filter((t) => !tagIds.includes(t));
+		await setTags(env, TAGS.books, id, tagIds);
+		if (dropped.length) await env.DB.batch(dropped.map((t) => env.DB.prepare("INSERT OR IGNORE INTO book_tag_drops (book_id, tag_id) VALUES (?, ?)").bind(id, t)));
+	}
 	const { results } = await env.DB.prepare("SELECT tag_id FROM book_tag_links WHERE book_id = ?").bind(id).all();
 	book.tags = results.map((r) => r.tag_id);
 	return json({ book });
@@ -3183,7 +3189,8 @@ async function absSync(env) {
 // Genre tags for ABS books from ABS's own tags (an audiobook's are Audible's
 // finer categories), else its genres, matched against GENRES like a file's
 // subjects. These links are marked abs = 1 and follow ABS: one ABS drops is
-// taken off. Tags added in Reader (abs = 0) are left alone.
+// taken off. Tags added in Reader (abs = 0) are left alone, and one taken off
+// in Reader (book_tag_drops) isn't put back.
 // -> {added, removed} links
 async function absGenreTags(env, items) {
 	const subjects = new Map();
@@ -3192,10 +3199,12 @@ async function absGenreTags(env, items) {
 		const media = it.media || {}, list = media.tags?.length ? media.tags : media.metadata?.genres || [];
 		if (it.id) subjects.set(it.id, list.map(String));
 	}
-	const [{ results: books }, { results: links }] = await env.DB.batch([
+	const [{ results: books }, { results: links }, { results: drops }] = await env.DB.batch([
 		env.DB.prepare("SELECT id, abs_id, abs_ebook FROM books WHERE (abs_id IS NOT NULL OR abs_ebook IS NOT NULL) AND gone_at IS NULL"),
 		env.DB.prepare("SELECT book_id, tag_id, abs FROM book_tag_links"),
+		env.DB.prepare("SELECT book_id, tag_id FROM book_tag_drops"),
 	]);
+	const dropped = new Set(drops.map((d) => d.book_id + ":" + d.tag_id));
 	const want = new Map();
 	for (const b of books) {
 		const list = subjects.get(b.abs_id || String(b.abs_ebook).split(":")[0]);
@@ -3219,7 +3228,7 @@ async function absGenreTags(env, items) {
 	for (const [book, names] of want) {
 		const now = has.get(book) || new Map(), tags = new Set(names.map((n) => ids.get(n)));
 		for (const t of tags) {
-			if (now.has(t)) continue;
+			if (now.has(t) || dropped.has(book + ":" + t)) continue;
 			stmts.push(env.DB.prepare("INSERT OR IGNORE INTO book_tag_links (book_id, tag_id, abs) VALUES (?, ?, 1)").bind(book, t));
 			added++;
 		}

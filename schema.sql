@@ -163,6 +163,13 @@ CREATE TABLE IF NOT EXISTS book_tag_links (
 
 CREATE INDEX IF NOT EXISTS book_tag_links_by_tag ON book_tag_links (tag_id);
 
+-- Tags taken off a book in Reader: the Audiobookshelf sync doesn't put these back.
+CREATE TABLE IF NOT EXISTS book_tag_drops (
+	book_id INTEGER NOT NULL REFERENCES books (id) ON DELETE CASCADE,
+	tag_id INTEGER NOT NULL REFERENCES book_tags (id) ON DELETE CASCADE,
+	PRIMARY KEY (book_id, tag_id)
+);
+
 -- Highlights in .txt books: a stretch of the text by character position
 -- (into the text after any YAML header), the words themselves (so a
 -- re-uploaded file can be searched for them if the positions moved), and

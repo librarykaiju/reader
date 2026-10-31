@@ -186,6 +186,8 @@ npx wrangler d1 execute reader --remote --file migrations/0016_book_catalog.sql
 npx wrangler d1 execute reader --remote --file migrations/0017_audiobooks.sql
 npx wrangler d1 execute reader --remote --file migrations/0018_feed_images.sql
 npx wrangler d1 execute reader --remote --file migrations/0019_abs_ebooks.sql
+npx wrangler d1 execute reader --remote --file migrations/0020_abs_tags.sql
+npx wrangler d1 execute reader --remote --file migrations/0021_book_tag_drops.sql
 npx wrangler deploy
 ```
 
@@ -379,7 +381,7 @@ How they behave:
 - Covers come from ABS, once, and are kept in R2.
 - The file is read from ABS each time it's opened, a piece at a time for comics, PDFs and previews, so it's a little slower than R2. **Download for offline** in the app works as before.
 - While the server is down, these books say the home server is offline; books in R2 still open.
-- **Genre tags** come from ABS too, for audiobooks and ebooks: an item's tags (an audiobook's are Audible's categories), else its genres, matched against the same list as **Tag genres** (run migration `0020` first). They follow ABS: change an item's tags or genres there and the next sync adds or takes off its genre tags in Reader. Tags you add in Reader stay whatever ABS says, but a genre tag that came from ABS comes back if you remove it in Reader, so change those in ABS. A book whose genres are nonfiction (History, Biography & Memoir, Philosophy, Religion, Science, Self-Help, Art), or that ABS calls nonfiction, also gets **Nonfiction**, which is what puts its genres on the family library's Nonfiction row. Books ABS has no genres for can still use **Tag genres**.
+- **Genre tags** come from ABS too, for audiobooks and ebooks: an item's tags (an audiobook's are Audible's categories), else its genres, matched against the same list as **Tag genres** (run migration `0020` first). They follow ABS: change an item's tags or genres there and the next sync adds or takes off its genre tags in Reader. Tags you add in Reader stay whatever ABS says, and a tag you take off a book in Reader stays off, even if ABS still lists that genre (run migration `0021` first). Adding it back in Reader puts it back. A book whose genres are nonfiction (History, Biography & Memoir, Philosophy, Religion, Science, Self-Help, Art), or that ABS calls nonfiction, also gets **Nonfiction**, which is what puts its genres on the family library's Nonfiction row. Books ABS has no genres for can still use **Tag genres**.
 - They can't be deleted in the app (remove them in ABS), uploading a file with the same name adds a separate book instead of replacing it, and their title, author and series come back from ABS whenever ABS changes the item. A changed file gets its cover and preview made again.
 
 ### Comics from Audiobookshelf
