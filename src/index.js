@@ -10989,7 +10989,8 @@ function renderRecord(b) {
 		acts.append(listen);
 	}
 	var tools = h("div", "rtools");
-	if (!off) tools.append(button("Edit details", "btn small", function () { openDetails(b); }));
+	// The click would reach the page and close the box it just opened.
+	if (!off) tools.append(button("Edit details", "btn small", function (e) { e.stopPropagation(); openDetails(b); }));
 	if (e && window.caches) tools.append(bookDlButton(e));
 	if (au && !off) tools.append(button("Player", "btn small", function () { location.hash = "#/listen/" + au.id; }));
 	if (au && !off) tools.append(button("Download audiobook", "btn small", function () {
