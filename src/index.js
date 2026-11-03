@@ -2389,6 +2389,22 @@ const GENRES = [
 	["Art", /^(?:art|drawing|painting|illustration|design)\b|art instruction/, true],
 ];
 const FACT_GENRES = new Set(GENRES.filter((g) => g[2]).map((g) => g[0]));
+// Genres only fiction has. A book with one is never Nonfiction, whatever
+// else it's tagged: The Divine Invasion's Religion doesn't make it so.
+const STORY_GENRES = new Set(["Urban Fantasy", "Science Fiction", "Fantasy", "Horror", "Mystery", "Thriller", "Romance",
+	"Historical Fiction", "Westerns", "Literary Fiction", "Short Fiction", "Poetry", "Drama"]);
+// Whether a book with these subjects and genres is Nonfiction: it has a
+// nonfiction genre, or a subject says nonfiction, and nothing says it's a
+// story. A subject that says fiction counts ("Fiction / Classics"), but not
+// one about writing it. Classics alone isn't enough either: most are novels,
+// and a nonfiction classic has its History or Philosophy to go by.
+function isNonfiction(subjects, names) {
+	if (names.some((n) => STORY_GENRES.has(n))) return false;
+	const keys = subjects.map(subjectKey);
+	if (keys.some((k) => FICTION_WORDS.test(k.replace(/\bnon ?fiction\b/g, " ")) && !/\b(?:writing|authorship|technique)\b/.test(k))) return false;
+	if (names.some((n) => FACT_GENRES.has(n))) return true;
+	return !names.includes("Classics") && keys.some((k) => /\bnon ?fiction\b/.test(k));
+}
 // A more exact genre stands in for the general one.
 const GENRE_OVER = { "Urban Fantasy": "Fantasy" };
 const FICTION_WORDS = /\bfiction\b|\bnovels?\b|\bstories\b/;
@@ -3212,7 +3228,7 @@ async function absGenreTags(env, items) {
 		if (!list) continue;
 		// The family library's Nonfiction row is the books tagged Nonfiction.
 		const names = genresOf(list, 3);
-		if (names.some((n) => FACT_GENRES.has(n)) || list.some((x) => /non ?fiction/.test(subjectKey(x)))) names.push("Nonfiction");
+		if (isNonfiction(list, names)) names.push("Nonfiction");
 		want.set(b.id, names);
 	}
 	const all = [...new Set([...want.values()].flat())];
@@ -5170,6 +5186,12 @@ var FACT_ART = [[/histor|\bwar\b/, "history"], [/biograph|memoir|\blives\b/, "pe
 	[/personal|self|develop|productiv|success/, "summit"], [/myth|folklore|legend/, "bolt"]];
 var SPARE_ART = ["book", "summit", "palette", "bolt", "laurel", "smile", "science", "history", "people", "philosophy", "religion", "poetry"];
 var NONFIC = /^non-?fiction$/;
+// Tags only a story has. A book with one stays off the Nonfiction row even
+// if it's tagged Nonfiction too.
+var STORY = /science fiction|\bsci ?-?fi\b|^sf$|fantasy|horror|\bmyster|\bdetective|\bwestern|\bthriller|\bromance|\bnovels?\b/;
+function isFact(b) {
+	return b.tags.some(function (t) { return NONFIC.test(fold(t)); }) && !b.tags.some(function (t) { return STORY.test(fold(t)); });
+}
 var pick = null, anyRecs = false;
 function svgArt(key) {
 	var a = ART[key] || ART.book;
@@ -5204,7 +5226,7 @@ function renderRecs() {
 	common = {};
 	Object.keys(everywhere).forEach(function (t) { if (everywhere[t] === books.length && books.length > 1) common[t] = 1; });
 	books.forEach(function (b) {
-		if (!b.tags.some(function (t) { return NONFIC.test(fold(t)); })) return;
+		if (!isFact(b)) return;
 		// Comics has its own card in Fiction, so a nonfiction comic's tag doesn't make a second.
 		b.tags.forEach(function (t) { if (!NONFIC.test(fold(t)) && !COMICS.test(fold(t)) && everywhere[t] < books.length) counts[t] = (counts[t] || 0) + 1; });
 	});
@@ -5217,7 +5239,7 @@ function renderRecs() {
 		var art = arts[t];
 		if (!art) { art = SPARE_ART.filter(function (k) { return !used[k]; })[0] || "book"; used[art] = 1; }
 		non.push({ id: "n:" + t, label: t, art: art, n: counts[t], test: function (b) {
-			return b.tags.indexOf(t) >= 0 && b.tags.some(function (x) { return NONFIC.test(fold(x)); });
+			return b.tags.indexOf(t) >= 0 && isFact(b);
 		} });
 	});
 	// A pick whose books have all gone lets go.
