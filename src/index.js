@@ -2400,10 +2400,9 @@ const STORY_GENRES = new Set(["Urban Fantasy", "Science Fiction", "Fantasy", "Ho
 // and a nonfiction classic has its History or Philosophy to go by.
 function isNonfiction(subjects, names) {
 	if (names.some((n) => STORY_GENRES.has(n))) return false;
-	const keys = subjects.map(subjectKey);
-	if (keys.some((k) => FICTION_WORDS.test(k.replace(/\bnon ?fiction\b/g, " ")) && !/\b(?:writing|authorship|technique)\b/.test(k))) return false;
+	if (saysFiction(subjects)) return false;
 	if (names.some((n) => FACT_GENRES.has(n))) return true;
-	return !names.includes("Classics") && keys.some((k) => /\bnon ?fiction\b/.test(k));
+	return !names.includes("Classics") && subjects.some((s) => /\bnon ?fiction\b/.test(subjectKey(s)));
 }
 // A more exact genre stands in for the general one.
 const GENRE_OVER = { "Urban Fantasy": "Fantasy" };
@@ -2424,6 +2423,96 @@ function genresOf(subjects, max) {
 	for (const [exact, general] of Object.entries(GENRE_OVER)) if (hits.has(exact)) hits.delete(general);
 	const order = GENRES.map((g) => g[0]);
 	return [...hits.keys()].sort((a, b) => hits.get(b) - hits.get(a) || order.indexOf(a) - order.indexOf(b)).slice(0, max);
+}
+
+// Brandon's Lazy Classification: Dewey-style hundreds for nonfiction. Each
+// Nonfiction book gets one of these as a tag ("500 Natural Science"), which
+// is what the family library's Nonfiction row is made of. A subject is read
+// from its most exact part first ("BUSINESS & ECONOMICS / Leadership" goes
+// by Leadership), and each subject votes for the first rule that matches
+// it, so the order below settles overlaps ("Political Science" is 300, not
+// 500). The class most subjects vote for wins; a tie goes to the later
+// subject, since ABS lists Audible's broad category before its finer one
+// ("Education & Learning", then "Language Learning"). A subject that says
+// fiction doesn't vote.
+const LAZY_CLASSES = [
+	"000 Computers & Information", "100 Philosophy & Psychology", "200 Spirituality & Mythology", "300 Social Science",
+	"400 Language", "500 Natural Science", "600 Medicine & Engineering", "700 Arts", "800 Literature", "900 World & History",
+];
+// [class (hundreds digit), pattern, counts as nonfiction on its own]
+// Humor, essays and myths can be stories too, so they sort a book that's
+// already Nonfiction without making one.
+const LAZY_RULES = [
+	[3, /true crime|\bcriminolog|political science|social science|\bpolitic|\bgovernment\b|\blaw\b|\blegal\b|\beconomics?\b|\bfinance\b|\bmoney\b|\binvesting\b|\bsociolog|\banthropolog|\beducation\b|\bteaching\b|\bstudy aids\b|\bfeminis|\bgender studies\b|\brace relations\b|\bcivil rights\b|\bcurrent affairs\b|\bpublic policy\b|\bmilitary science\b/, true],
+	[0, /\bcomputer|\bprogramming\b|\bsoftware\b|\binternet\b|\bdata\b|\bdatabase|\bartificial intelligence\b|\bmachine learning\b|\bcybersecurity\b|\binformation\b|\blibrar(?:y|ies|ianship)\b|\bencyclopedi|\breference\b|\btrivia\b|\bgeneral knowledge\b|\bmedia studies\b|\bjournalism\b|\bweb\b/, true],
+	[4, /\blanguage|\blinguistic|\bgrammar\b|\bvocabulary\b|\bdictionar|\betymolog|\bphonetic|\besl\b|\bsign language\b/, true],
+	[2, /\breligio|\bspiritual|\btheolog|\bbible\b|\bchristian|\bbuddhis|\bislam\b|\bjudaism\b|\bhindu|\bmeditation\b|\boccult\b|\bastrolog|\btarot\b|\bnew age\b|\bbody mind & spirit\b|\bmind body spirit\b/, true],
+	[2, /mytholog|folklore|fairy tales|\bmyths\b|\blegends\b/, false],
+	[1, /\bphilosoph|\bpsycholog|\bethics\b|\blogic\b|\bstoicism\b|\bself help\b|\bpersonal development\b|\bpersonal growth\b|\bself improvement\b|\bmotivation|\bhappiness\b|\bmindfulness\b|\bproductivity\b|\bsuccess\b|\bhabits?\b|\bconsciousness\b/, true],
+	[6, /\bmedic|\bhealth\b|\bfitness\b|\bnutrition\b|\bdiet|\bwellness\b|\bdisease|\banatomy\b|\bnursing\b/, true],
+	[5, /\bscience\b|\bphysics\b|\bbiolog|\bchemistry\b|\bastronom|\bcosmolog|\bmathematic|\bmath\b|\bevolution\b|\bgeolog|\becology\b|\benvironment|\bnature\b|\banimals\b|\bbotany\b|\bzoolog|\bspace\b|\bclimate\b|\bnatural history\b/, true],
+	[6, /\bengineering\b|\btechnology\b|\bcooking\b|\bculinary\b|\bcookbooks?\b|\bfood\b|\bhome & garden\b|\bgardening\b|\bhouse & home\b|\bparenting\b|\bpets\b|\bbusiness\b|\bmanagement\b|\bleadership\b|\bmarketing\b|\bentrepreneur|\bcareers?\b|\btransportation\b|\bagricultur/, true],
+	[7, /\bart\b|\barts\b|\bmusic|\bfilm\b|\bmovies\b|\bcinema\b|\btelevision\b|\bphotograph|\barchitectur|\bdesign\b|\bdrawing\b|\bpainting\b|\bcrafts\b|\bhobbies\b|\bsports?\b|\boutdoors\b|\brecreation\b|\bgames\b|\bperforming arts\b|\bdance\b|\btheat(?:er|re)\b|\bentertainment\b/, true],
+	[8, /literary criticism|\bliterary\b|\bliterature\b|\bwriting\b|\bauthorship\b|\bessays?\b|\bpoetry\b|\brhetoric\b/, true],
+	[8, /\bhumou?r|\bcomedy\b|\bsatire\b/, false],
+	[9, /\bhistor|\bbiograph|\bautobiograph|\bmemoirs?\b|\btravel|\bgeograph|\bwar\b|\bmilitary\b|\bworld\b|\bexploration\b|\bcivilization/, true],
+];
+// A tag that names a class ("500", "500s", "Natural Science", "500 Natural
+// Science") is set by hand, so it wins and makes the book Nonfiction.
+function lazyNamed(subjects) {
+	for (const raw of subjects) {
+		const s = subjectKey(raw).trim(), m = /^([0-9])00s?\b/.exec(s);
+		if (m) return LAZY_CLASSES[+m[1]];
+		const named = LAZY_CLASSES.find((c) => subjectKey(c.slice(4)).trim() === s);
+		if (named) return named;
+	}
+	return null;
+}
+// Subjects -> {name: "500 Natural Science" or null, fact: whether it's
+// evidence the book is nonfiction}.
+function lazyClassOf(subjects) {
+	const named = lazyNamed(subjects);
+	if (named) return { name: named, fact: true, named: true };
+	const votes = new Map();
+	let fact = false;
+	subjects.forEach((raw, i) => {
+		const parts = String(raw).split(/\s*(?:\/|--|>|\|)\s*/).map(subjectKey).filter((p) => p.trim());
+		if (parts.some(saysFictionKey)) return;
+		for (const p of parts.reverse()) {
+			const rule = LAZY_RULES.find((r) => r[1].test(p));
+			if (!rule) continue;
+			const v = votes.get(rule[0]) || { n: 0, at: 0 };
+			v.n++;
+			v.at = i;
+			votes.set(rule[0], v);
+			if (rule[2]) fact = true;
+			break;
+		}
+	});
+	if (!votes.size) return { name: null, fact: false };
+	const [best] = [...votes].sort((a, b) => b[1].n - a[1].n || b[1].at - a[1].at)[0];
+	return { name: LAZY_CLASSES[best], fact };
+}
+const LAZY_TAG = /^[0-9]00 /;
+// The class tags a book should have, given its subjects and genre names:
+// [] for a story, else [class] plus Nonfiction. Children's and Young Adult
+// books need more than a class to count (a kids' book about animals is
+// usually a story), so they keep the plain nonfiction test.
+function nonfictionTags(subjects, names) {
+	const lazy = lazyClassOf(subjects);
+	const young = names.includes("Children's") || names.includes("Young Adult");
+	const fact = isNonfiction(subjects, names)
+		|| lazy.named
+		|| (lazy.fact && !young && !names.includes("Classics") && !names.some((n) => STORY_GENRES.has(n)) && !saysFiction(subjects));
+	if (!fact) return [];
+	return lazy.name ? ["Nonfiction", lazy.name] : ["Nonfiction"];
+}
+// A subject that says fiction ("Fiction / Classics"), but not one about writing it.
+function saysFiction(subjects) {
+	return subjects.map(subjectKey).some(saysFictionKey);
+}
+function saysFictionKey(k) {
+	return FICTION_WORDS.test(k.replace(/\bnon ?fiction\b/g, " ")) && !/\b(?:writing|authorship|technique)\b/.test(k);
 }
 
 // What the file says about itself: {subjects, title, author}.
@@ -2558,7 +2647,7 @@ async function addGenreTags(env, book, opts) {
 	if (book.type !== "txt") {
 		try { file = await fileSubjects(env, book); } catch (err) { console.warn("subjects", book.id, err); }
 	}
-	let names = genresOf(file.subjects, 5), from = "file";
+	let subjects = file.subjects, names = genresOf(subjects, 5), from = "file";
 	if (file.subjects.length) {
 		const { results } = await env.DB.prepare("SELECT name FROM book_tags WHERE name IN (SELECT value FROM json_each(?))")
 			.bind(JSON.stringify(file.subjects)).all();
@@ -2568,13 +2657,14 @@ async function addGenreTags(env, book, opts) {
 		// A title still made from the file name is a poor search; the file's own is better.
 		const title = opts.title || (book.title === madeTitle(book.filename) && file.title) || book.title;
 		const author = opts.author || book.author || file.author || "";
-		let subjects;
 		try { subjects = await onlineSubjects(title, author); } catch (err) {
 			throw err instanceof HttpError ? err : new HttpError(502, "Couldn't reach Open Library");
 		}
 		names = genresOf(subjects, 3);
 		from = "online";
 	}
+	// A nonfiction book gets Nonfiction and its Lazy Classification, as an ABS one does.
+	for (const n of nonfictionTags(subjects, names)) if (!names.includes(n)) names.push(n);
 	// Every comic is a comic, whatever else it is.
 	if (bookType(book) === "cbz" && !names.some((n) => n.toLowerCase() === "comics")) names.unshift("Comics");
 	if (!names.length) return { added: [], from: "" };
@@ -3227,8 +3317,9 @@ async function absGenreTags(env, items) {
 		// An item missing from this listing keeps its tags.
 		if (!list) continue;
 		// The family library's Nonfiction row is the books tagged Nonfiction.
+		// Its Lazy Classification tag puts it on a card in that row.
 		const names = genresOf(list, 3);
-		if (isNonfiction(list, names)) names.push("Nonfiction");
+		names.push(...nonfictionTags(list, names));
 		want.set(b.id, names);
 	}
 	const all = [...new Set([...want.values()].flat())];
@@ -5076,8 +5167,7 @@ function seriesCard(name, vols) {
 }
 // Genre picks. Each fiction pick covers the tag names that mean it (Mystery
 // or Mysteries, Urban Fantasy counts as Fantasy). Nonfiction picks are the
-// other tags that turn up on books also tagged Nonfiction: History,
-// Biography & Memoir and so on. Only picks with books show.
+// Lazy Classification's ten classes (LAZY below). Only picks with books show.
 var INK = "#fbf7ee", GOLD = "#f2c66d", EMBER = "#ef9a52";
 var ART = {
 	classics: ["#6b2f45", '<path d="M18 23 40 11l22 12z" fill="' + INK + '"/><rect x="17" y="24" width="46" height="3" fill="' + INK + '"/>'
@@ -5097,11 +5187,6 @@ var ART = {
 		+ '<circle cx="59" cy="20" r="8" fill="' + GOLD + '"/><ellipse cx="59" cy="20" rx="14" ry="4" fill="none" stroke="' + INK + '" stroke-width="1.8" transform="rotate(-18 59 20)"/>'
 		+ '<g transform="translate(30 34) rotate(40)"><path d="M-3 11 0 21l3-10z" fill="' + EMBER + '"/><path d="M0-17c7 6 7 20 4 28h-8c-3-8-3-22 4-28z" fill="' + INK + '"/>'
 		+ '<circle cy="-4" r="2.6" fill="#1f5e5e"/><path d="M-4 3l-6 9 6-1zM4 3l6 9-6-1z" fill="' + INK + '"/></g>'],
-	history: ["#7b4a1c", '<path d="M29 10h22M29 50h22" stroke="' + INK + '" stroke-width="3.5" stroke-linecap="round"/>'
-		+ '<path d="M32 12c0 11 7 13 7 18s-7 7-7 18h16c0-11-7-13-7-18s7-7 7-18z" fill="' + INK + '" fill-opacity=".12" stroke="' + INK + '" stroke-width="2.4"/>'
-		+ '<path d="M35 20h10c-1 3-4 5-5 6-1-1-4-3-5-6zM34 47c1-6 5-8 6-9 1 1 5 3 6 9z" fill="' + GOLD + '"/>'],
-	people: ["#4a4f63", '<rect x="25" y="9" width="30" height="40" rx="3" fill="none" stroke="' + GOLD + '" stroke-width="3"/>'
-		+ '<circle cx="40" cy="24" r="6.5" fill="' + INK + '"/><path d="M29 46c1-8 6-12 11-12s10 4 11 12z" fill="' + INK + '"/>'],
 	philosophy: ["#35524a", '<ellipse cx="40" cy="36" rx="14" ry="16" fill="' + INK + '" fill-opacity=".9"/><path d="M27 24l3-9 6 6M53 24l-3-9-6 6" fill="' + INK + '"/>'
 		+ '<g fill="#35524a"><circle cx="34" cy="30" r="5"/><circle cx="46" cy="30" r="5"/></g><g fill="' + GOLD + '"><circle cx="34" cy="30" r="2.2"/><circle cx="46" cy="30" r="2.2"/><path d="M38 36h4l-2 4z"/></g>'
 		+ '<path d="M18 53h44" stroke="' + INK + '" stroke-width="3" stroke-linecap="round"/>'],
@@ -5131,15 +5216,6 @@ var ART = {
 		+ '<circle cx="31" cy="37" r="3.6" fill="#8a4b5e"/><circle cx="27" cy="26" r="3.4" fill="#c8322c"/><circle cx="36" cy="19" r="3.4" fill="' + GOLD + '"/>'
 		+ '<circle cx="47" cy="20" r="3.4" fill="#5f9e8f"/><circle cx="54" cy="29" r="3.4" fill="#3b6d8f"/>'
 		+ '<path d="M66 8L50 36" stroke="' + EMBER + '" stroke-width="3" stroke-linecap="round"/><path d="M50 36l-3 6 5-3z" fill="#3b3024"/>'],
-	smile: ["#2f6b4f", '<circle cx="40" cy="30" r="19" fill="' + GOLD + '"/><g fill="none" stroke="#3b3024" stroke-width="2.6" stroke-linecap="round"><path d="M30 25q3-4 6 0M44 25q3-4 6 0"/></g>'
-		+ '<path d="M29 33h22c0 7-5 11-11 11s-11-4-11-11z" fill="#3b3024"/><path d="M34 40c3-2 9-2 12 0-2 2.5-10 2.5-12 0z" fill="' + EMBER + '"/>'
-		+ '<g fill="' + INK + '" opacity=".75"><path d="M12 14l2 3 3 2-3 2-2 3-2-3-3-2 3-2zM66 40l1.5 2.5 2.5 1.5-2.5 1.5-1.5 2.5-1.5-2.5-2.5-1.5 2.5-1.5z"/></g>'],
-	summit: ["#4a5f7a", '<circle cx="18" cy="16" r="6" fill="' + GOLD + '"/><path d="M4 52l22-24 10 10 12-20 28 34z" fill="' + INK + '" opacity=".45"/>'
-		+ '<path d="M18 52l26-36 22 36z" fill="' + INK + '"/><path d="M44 16l-6 8 3-1 3 3 3-3 3 1z" fill="#4a5f7a" opacity=".35"/>'
-		+ '<path d="M44 16V5" stroke="#3b3024" stroke-width="1.6"/><path d="M44 5l9 3-9 3z" fill="' + EMBER + '"/>'],
-	bolt: ["#3c3f6e", '<path d="M22 30a8 8 0 0 1 2-15.6A12 12 0 0 1 46 11a9 9 0 0 1 14 7 7 7 0 0 1-2 12z" fill="' + INK + '"/>'
-		+ '<path d="M42 30l-10 13h8l-5 13 15-18h-8l5-8z" fill="' + GOLD + '"/>'
-		+ '<g stroke="' + GOLD + '" stroke-width="1.6" stroke-linecap="round" opacity=".7"><path d="M24 40l-4 4M58 38l4 3"/></g>']
 };
 // Comics: a burst and a speech bubble over halftone dots.
 ART.comics = ["#9b3a2f", (function () {
@@ -5150,19 +5226,6 @@ ART.comics = ["#9b3a2f", (function () {
 		+ '<path d="M8 22c0-8 8-13 18-13s18 5 18 13-8 13-18 13c-2 0-4 0-6-.5L11 41l3-9c-4-2.5-6-6-6-10z" fill="' + INK + '"/>'
 		+ '<g stroke="#9b3a2f" stroke-width="2.2" stroke-linecap="round"><path d="M16 18h20M14 23h24M18 28h14"/></g>'
 		+ '<path d="M10 52h60" stroke="' + INK + '" stroke-width="1.5" opacity=".5"/>';
-})()];
-// A laurel wreath for nonfiction Classics: two arcs of leaves.
-ART.laurel = ["#6b5a2e", (function () {
-	var out = "";
-	for (var i = 0; i < 6; i++) {
-		var deg = 112 + i * 24, r = deg * Math.PI / 180, dx = Math.cos(r) * 18, y = (30 + Math.sin(r) * 18).toFixed(1);
-		[[40 + dx, deg + 25], [40 - dx, 180 - deg - 25]].forEach(function (l) {
-			var x = l[0].toFixed(1);
-			out += '<ellipse cx="' + x + '" cy="' + y + '" rx="2.4" ry="5.4" fill="' + (i % 2 ? GOLD : INK) + '" transform="rotate(' + l[1] + " " + x + " " + y + ')"/>';
-		});
-	}
-	return out + '<path d="M33 51l7-4 7 4" fill="none" stroke="' + EMBER + '" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>'
-		+ '<path d="M40 22l2.4 5 5.4.6-4 3.7 1.1 5.3-4.9-2.7-4.9 2.7 1.1-5.3-4-3.7 5.4-.6z" fill="' + INK + '"/>';
 })()];
 // Comics lead: they cut across the other genres, and every comic is one
 // whether or not it was tagged.
@@ -5178,13 +5241,47 @@ var FICTION = [
 	["Young Adult", /young adult|\bya\b|\bteen/, "ya"],
 	["Middle Grade", /middle grade|children|\bkids?\b/, "kids"]
 ];
-// Which drawing a nonfiction tag gets. No two cards share one: a tag whose
-// drawing is taken, or that matches none, gets the next spare.
-var FACT_ART = [[/histor|\bwar\b/, "history"], [/biograph|memoir|\blives\b/, "people"], [/philosoph/, "philosophy"],
-	[/religio|theolog|bible|spiritual/, "religion"], [/scien|physics|biolog|chemis|astronom|math|nature/, "science"], [/poe/, "poetry"],
-	[/classic/, "laurel"], [/creativ|drawing|\bart\b|design/, "palette"], [/humou?r|comedy/, "smile"],
-	[/personal|self|develop|productiv|success/, "summit"], [/myth|folklore|legend/, "bolt"]];
-var SPARE_ART = ["book", "summit", "palette", "bolt", "laurel", "smile", "science", "history", "people", "philosophy", "religion", "poetry"];
+// The Nonfiction row is Brandon's Lazy Classification: ten Dewey-style
+// classes, in order. The server tags each nonfiction book with its class
+// ("500 Natural Science"); a book tagged Nonfiction by hand with no class
+// goes by its genre tags here, else under Other. Each class has its own
+// drawing.
+var LAZY = [
+	["000", "Computers & Information", "screen"], ["100", "Philosophy & Psychology", "philosophy"], ["200", "Spirituality & Mythology", "religion"],
+	["300", "Social Science", "scales"], ["400", "Language", "letters"], ["500", "Natural Science", "science"],
+	["600", "Medicine & Engineering", "gear"], ["700", "Arts", "palette"], ["800", "Literature", "poetry"], ["900", "World & History", "globe"]
+];
+var LAZY_TAG = /^([0-9])00 /;
+// Reader's own genre tags -> class, for a book with no class tag.
+var LAZY_GENRE = [[/histor|biograph|memoir|travel/, 9], [/philosoph|self.?help|psycholog/, 1], [/religio|spiritual|myth|folklore/, 2],
+	[/scien/, 5], [/\bart\b/, 7], [/poe|drama|humou?r|essay|classic/, 8]];
+function lazyOf(b) {
+	for (var i = 0; i < b.tags.length; i++) { var m = LAZY_TAG.exec(b.tags[i]); if (m) return +m[1]; }
+	for (var j = 0; j < LAZY_GENRE.length; j++) {
+		var r = LAZY_GENRE[j];
+		if (b.tags.some(function (t) { return r[0].test(fold(t)); })) return r[1];
+	}
+	return -1;
+}
+ART.screen = ["#2f4f6f", '<rect x="18" y="12" width="44" height="30" rx="3" fill="' + INK + '"/><rect x="22" y="16" width="36" height="22" fill="#22384f"/>'
+	+ '<path d="M26 22l5 4-5 4" fill="none" stroke="' + GOLD + '" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M34 31h9" stroke="' + GOLD + '" stroke-width="2.2" stroke-linecap="round"/>'
+	+ '<path d="M34 42l-3 7h18l-3-7z" fill="' + INK + '" opacity=".8"/><path d="M26 50h28" stroke="' + INK + '" stroke-width="3" stroke-linecap="round"/>'];
+ART.scales = ["#4a4f63", '<path d="M40 10v38M26 50h28" stroke="' + INK + '" stroke-width="3" stroke-linecap="round"/><path d="M20 18h40" stroke="' + INK + '" stroke-width="2.4" stroke-linecap="round"/>'
+	+ '<circle cx="40" cy="12" r="3" fill="' + GOLD + '"/><g fill="none" stroke="' + INK + '" stroke-width="1.4"><path d="M20 18l-7 15M20 18l7 15M60 18l-7 15M60 18l7 15"/></g>'
+	+ '<path d="M12 33h16a8 8 0 0 1-16 0zM52 33h16a8 8 0 0 1-16 0z" fill="' + GOLD + '"/>'];
+ART.letters = ["#7a3b2e", '<path d="M10 22c0-7 7-11 16-11s16 4 16 11-7 11-16 11c-2 0-3 0-5-.4L13 37l2-7c-3-2-5-5-5-8z" fill="' + INK + '"/>'
+	+ '<path d="M70 34c0-7-7-11-16-11s-16 4-16 11 7 11 16 11c2 0 3 0 5-.4L67 49l-2-7c3-2 5-5 5-8z" fill="' + GOLD + '"/>'
+	+ '<text x="26" y="27" text-anchor="middle" font-family="Georgia,serif" font-size="13" font-weight="700" fill="#7a3b2e">Aa</text>'
+	+ '<text x="54" y="39" text-anchor="middle" font-family="Georgia,serif" font-size="12" font-style="italic" fill="#7a3b2e">ß ñ</text>'];
+ART.gear = ["#2f6b5f", (function () {
+	var out = '<g fill="' + INK + '">';
+	for (var i = 0; i < 8; i++) out += '<rect x="37" y="11" width="6" height="8" rx="1" transform="rotate(' + i * 45 + ' 40 30)"/>';
+	return out + '<circle cx="40" cy="30" r="14"/></g><circle cx="40" cy="30" r="9" fill="#2f6b5f"/>'
+		+ '<path d="M37.5 23h5v4.5H47v5h-4.5V37h-5v-4.5H33v-5h4.5z" fill="' + GOLD + '"/>';
+})()];
+ART.globe = ["#3b5a7a", '<circle cx="40" cy="29" r="17" fill="' + INK + '"/>'
+	+ '<path d="M30 18c3 2 2 5 5 6s3 4 1 6-5 1-6 4 1 5-1 6M45 13c-1 3 1 5 4 5s5 3 4 6-4 3-3 6 4 4 3 7" fill="none" stroke="#3b5a7a" stroke-width="3" stroke-linecap="round" opacity=".55"/>'
+	+ '<ellipse cx="40" cy="29" rx="17" ry="17" fill="none" stroke="' + GOLD + '" stroke-width="2"/><path d="M40 46v4M30 52h20" stroke="' + GOLD + '" stroke-width="3" stroke-linecap="round"/>'];
 var NONFIC = /^non-?fiction$/;
 // Tags only a story has. A book with one stays off the Nonfiction row even
 // if it's tagged Nonfiction too.
@@ -5214,7 +5311,7 @@ function genreButton(g) {
 	return btn;
 }
 function renderRecs() {
-	var fic = [], non = [], counts = {}, used = {};
+	var fic = [], non = [];
 	FICTION.forEach(function (f) {
 		var test = function (b) { return (f[3] && f[3](b)) || b.tags.some(function (t) { return f[1].test(fold(t)); }); };
 		var n = books.filter(test).length;
@@ -5225,22 +5322,10 @@ function renderRecs() {
 	books.forEach(function (b) { b.tags.forEach(function (t) { everywhere[t] = (everywhere[t] || 0) + 1; }); });
 	common = {};
 	Object.keys(everywhere).forEach(function (t) { if (everywhere[t] === books.length && books.length > 1) common[t] = 1; });
-	books.forEach(function (b) {
-		if (!isFact(b)) return;
-		// Comics has its own card in Fiction, so a nonfiction comic's tag doesn't make a second.
-		b.tags.forEach(function (t) { if (!NONFIC.test(fold(t)) && !COMICS.test(fold(t)) && everywhere[t] < books.length) counts[t] = (counts[t] || 0) + 1; });
-	});
-	var tags = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a] || fold(a).localeCompare(fold(b)); }), arts = {};
-	// Tags with their own drawing first, so a spare never takes one of those.
-	tags.forEach(function (t) {
-		FACT_ART.some(function (r) { if (r[0].test(fold(t)) && !used[r[1]]) { arts[t] = r[1]; used[r[1]] = 1; return true; } return false; });
-	});
-	tags.forEach(function (t) {
-		var art = arts[t];
-		if (!art) { art = SPARE_ART.filter(function (k) { return !used[k]; })[0] || "book"; used[art] = 1; }
-		non.push({ id: "n:" + t, label: t, art: art, n: counts[t], test: function (b) {
-			return b.tags.indexOf(t) >= 0 && isFact(b);
-		} });
+	LAZY.concat([["", "Other", "book"]]).forEach(function (c, i) {
+		var k = c[0] ? i : -1, test = function (b) { return isFact(b) && lazyOf(b) === k; };
+		var n = books.filter(test).length;
+		if (n) non.push({ id: "n:" + (c[0] || "other"), label: c[0] ? c[0] + " " + c[1] : c[1], art: c[2], test: test, n: n });
 	});
 	// A pick whose books have all gone lets go.
 	if (pick && !fic.concat(non).some(function (g) { return g.id === pick.id; })) pick = null;
