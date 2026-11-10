@@ -4895,6 +4895,7 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	<p id="sub" class="sub muted" hidden></p>
 	<div id="intro" class="intro" hidden>
 		<p>Welcome to the Back Alley Library. All of the books in the collection are DRM free and work anywhere. Consolidating the history of my digital purchases is a big job and I add more to the collection when I have time.</p>
+		<p>Nonfiction titles are organized into broad categories that I call the Lazy Classification System (LCS for short).</p>
 		<p>I put a download limit of 10 books per person per day so you guys don't hog my internet. Happy Reading!</p>
 	</div>
 	<p id="note" class="muted">Loading…</p>
