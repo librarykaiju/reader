@@ -17,6 +17,8 @@ Moved here from `workers/reader/` in `librarykaiju/w3bz1n3`.
 
 ## Deploy
 
+Merges to `main` deploy on their own: the Worker is connected to this repo in Cloudflare (Workers → reader → Settings → Builds). A migration still has to be run by hand first, and a deploy from a terminal works as before:
+
 ```
 npx wrangler d1 execute reader --remote --file migrations/<new migration>.sql   # only if there is one
 npx wrangler deploy
