@@ -3962,77 +3962,6 @@ function cleanCatalog(c) {
 	return out;
 }
 
-// The Library of Congress catalog (its SRU search, on port 210; no key):
-// {classification, subjects, year, publisher, language} from the MARC record
-// for this ISBN, else for this title and author. Its Dewey number (082), else
-// its LC call number (050), and its LC subject headings (6XX, second
-// indicator 0). null when LC has no record, as for most self-published and
-// ebook-only books.
-const LOC_SRU = "http://lx2.loc.gov:210/lcdb";
-async function locRecord(isbn, title, author) {
-	const search = async (query) => {
-		const res = await fetch(LOC_SRU + "?" + new URLSearchParams({
-			version: "1.1", operation: "searchRetrieve", query, maximumRecords: "5", recordSchema: "marcxml",
-		}), { headers: { "User-Agent": LOOKUP_UA } });
-		if (!res.ok) {
-			await res.body?.cancel();
-			throw new HttpError(502, `lx2.loc.gov answered ${res.status}`);
-		}
-		return marcRecords(await res.text());
-	};
-	const want = looseTitle(title);
-	const surname = looseTitle(String(author || "").split(/,|&| and /)[0]).split(" ").pop();
-	const fits = (m) => {
-		const t = looseTitle(m.title);
-		return !want || t === want || t.startsWith(want + " ") || want.startsWith(t + " ");
-	};
-	const byAuthor = (m) => !surname || looseTitle(m.author).split(" ").includes(surname);
-	let found = isbn ? (await search(`bath.isbn=${isbn}`))[0] : null;
-	if (!found && want) {
-		const q = `dc.title="${want}"` + (surname ? ` and dc.creator="${surname}"` : "");
-		found = (await search(q)).find((m) => fits(m) && byAuthor(m));
-	}
-	return found ? found.catalog : null;
-}
-// MARCXML (an SRU answer) -> [{title, author, catalog}].
-function marcRecords(xml) {
-	return [...xml.matchAll(/<(?:\w+:)?record\b[^>]*>([\s\S]*?)<\/(?:\w+:)?record>/g)]
-		.filter((m) => /<(?:\w+:)?datafield\b/.test(m[1]))
-		.map((m) => marcRecord(m[1]));
-}
-function marcRecord(xml) {
-	const fields = [...xml.matchAll(/<(?:\w+:)?datafield\b([^>]*)>([\s\S]*?)<\/(?:\w+:)?datafield>/g)].map((m) => ({
-		tag: (/\btag="(\d{3})"/.exec(m[1]) || [])[1],
-		ind2: (/\bind2="(.)"/.exec(m[1]) || [])[1],
-		subs: [...m[2].matchAll(/<(?:\w+:)?subfield\b[^>]*\bcode="(.)"[^>]*>([\s\S]*?)<\/(?:\w+:)?subfield>/g)].map((s) => [s[1], xmlText(s[2])]),
-	}));
-	const field = (tag) => fields.find((f) => f.tag === tag);
-	const sub = (f, codes) => (f ? f.subs.filter(([c]) => codes.includes(c)).map(([, v]) => v) : []);
-	// ISBD punctuation ("Dune /", "Chilton Books,", "1965.") goes.
-	const tidy = (v) => String(v || "").replace(/\s*[\/:;,=]\s*$/, "").replace(/(\w{3,})\.$/, "$1").replace(/^\[|\]$/g, "").trim();
-	const control = (/<(?:\w+:)?controlfield\b[^>]*\btag="008"[^>]*>([^<]*)</.exec(xml) || [])[1] || "";
-	const pub = field("264") || field("260");
-	const dewey = sub(field("082"), ["a"])[0];
-	const lcc = sub(field("050"), ["a", "b"]).join(" ");
-	const subjects = fields
-		.filter((f) => ["600", "610", "611", "630", "650", "651"].includes(f.tag) && f.ind2 === "0")
-		.map((f) => {
-			const main = sub(f, ["a", "b", "c", "d", "t"]).map(tidy).join(" ");
-			return [main, ...sub(f, ["v", "x", "y", "z"]).map(tidy)].filter(Boolean).join(" -- ");
-		});
-	return {
-		title: tidy(sub(field("245"), ["a", "b"]).join(" ")),
-		author: tidy(sub(field("100") || field("110"), ["a"])[0]),
-		catalog: cleanCatalog({
-			classification: dewey ? dewey.replace(/\//g, "") : lcc || null,
-			subjects,
-			year: sub(pub, ["c"])[0] || control.slice(7, 11),
-			publisher: tidy(sub(pub, ["b"])[0]),
-			language: control.slice(35, 38).trim(),
-		}),
-	};
-}
-
 // The named entities descriptions use besides XML's own.
 const HTML_ENTITIES = { nbsp: " ", ldquo: "\u201c", rdquo: "\u201d", lsquo: "\u2018", rsquo: "\u2019", mdash: "\u2014", ndash: "\u2013",
 	hellip: "\u2026", eacute: "\u00e9", egrave: "\u00e8", aacute: "\u00e1", iacute: "\u00ed", oacute: "\u00f3", uacute: "\u00fa",
@@ -4243,8 +4172,8 @@ function recordJSON(book) {
 function recordDue(book, soon) {
 	if (!book.record_at) return true;
 	const r = recordJSON(book);
-	// Records looked up before catalog details (or the Library of Congress) existed get them once.
-	if (!r.from.catalog || !r.from.loc) return true;
+	// Records looked up before catalog details existed get them once.
+	if (!r.from.catalog) return true;
 	return !r.appeal && r.from.appeal !== "edited" && (soon || Date.now() - book.record_at > RECORD_RETRY_MS);
 }
 
@@ -4277,15 +4206,7 @@ async function fillRecord(env, book, refresh) {
 		if (!pages && !audio && online.pages) { pages = online.pages; from.pages = online.from.pages; }
 		for (const [k, v] of Object.entries(online.catalog)) { catalog[k] = v; catFrom[k] = online.from.catalog[k]; }
 	}
-	// The Library of Congress's call number and subject headings win over
-	// Open Library's and Google's; its other details only fill gaps. Edits stay.
-	const loc = await within(() => locRecord(catalog.isbn, book.title, book.author || ""), undefined, 8000);
-	// "unreached" (LC down, or too slow) isn't tried again until the next refresh.
-	from.loc = loc === undefined ? "unreached" : loc ? "found" : "none";
-	for (const [k, v] of Object.entries(loc || {})) {
-		if (catFrom[k] === "edited" || catFrom[k] === "file") continue;
-		if (k === "classification" || k === "subjects" || !catalog[k]) { catalog[k] = v; catFrom[k] = "loc"; }
-	}
+	delete from.loc;
 	from.catalog = catFrom;
 	if (!pages && file.words > 2000) { pages = Math.max(1, Math.round(file.words / WORDS_PER_PAGE)); from.pages = "estimate"; }
 	if (!keep("appeal")) {
@@ -5549,9 +5470,39 @@ function recordFacts(b, rec) {
 	add("Publisher", c.publisher);
 	add("Language", c.language);
 	add("Shelved", b.tags.filter(function (t) { return !common[t]; }).join(", "));
-	add("Call number", c.classification);
+	add("Call number", callNumber(b));
 	add("Subjects", (c.subjects || []).join("; "));
 	add("ISBN", c.isbn);
+}
+// The library's own call number, like a spine label: nonfiction by its Lazy
+// Classification class ("700 MOO"), fiction by its genre ("FAN TOL", "YA SF
+// COL", "MG FIC COO"), each with a three-letter cutter from the author's
+// surname (or the title's first word when there's no author).
+var SPINE = [["fantasy", "FAN"], ["science fiction", "SF"], ["horror", "HOR"], ["myster", "MYS"], ["thriller", "THR"],
+	["romance", "ROM"], ["western", "WES"]];
+function callNumber(b) {
+	var tags = b.tags.map(fold), lazy = isFact(b) ? lazyOf(b)[0] : null, label;
+	if (lazy != null && lazy >= 0) label = lazy + "00";
+	else if (lazy === -1) label = "NF";
+	else if (b.type === "cbz" || tags.some(function (t) { return COMICS.test(t); })) label = "GN";
+	else {
+		var g = SPINE.filter(function (s) { return tags.some(function (t) { return t.indexOf(s[0]) >= 0; }); })[0];
+		label = g ? g[1] : "FIC";
+		if (tags.some(function (t) { return /young adult|\bya\b|\bteen/.test(t); })) label = "YA " + label;
+		else if (tags.some(function (t) { return /middle grade|children|\bkids?\b/.test(t); })) label = "MG " + label;
+	}
+	return label + " " + cutter(b);
+}
+function cutter(b) {
+	var a = String(b.author || "").split(/;|&| and |\//)[0].trim(), word;
+	// "Doctorow, Cory" is surname first; "S. A. Cosby, Adam Lazarre-White" is two authors.
+	if (a.indexOf(",") > 0 && !/\s/.test(a.split(",")[0].trim())) word = a.split(",")[0];
+	else {
+		var parts = a.split(",")[0].split(/\s+/).filter(function (w) { return w && !/^(?:jr|sr|ii|iii|iv|phd|md)\.?,?$/i.test(w); });
+		word = parts[parts.length - 1] || "";
+	}
+	if (!/[a-z]/i.test(fold(word))) word = String(b.title || "").replace(/^(?:the|a|an)\s+/i, "");
+	return fold(word).replace(/[^a-z]/g, "").slice(0, 3).toUpperCase() || "XXX";
 }
 function downloadButton(dl, left, b) {
 	dl.href = "/api/family/books/" + b.id + "/file";
@@ -12378,7 +12329,6 @@ function fillDetailsRecord(rec) {
 	$("dRecStatus").textContent = !rec ? "" : !rec.filled ? "Not looked up yet." : [
 		from.blurb && from.blurb !== "edited" && "copy from " + ({ file: "the file", openlibrary: "Open Library", google: "Google Books", ai: "AI" }[from.blurb] || from.blurb),
 		from.pages === "estimate" && "pages estimated",
-		from.loc === "none" && "no Library of Congress record",
 		from.appeal && from.appeal !== "edited" && "terms by " + from.appeal,
 		from.appeal_error && "no appeal factors: " + from.appeal_error
 	].filter(Boolean).join(", ");
