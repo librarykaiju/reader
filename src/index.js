@@ -2369,7 +2369,7 @@ const GENRES = [
 	["Westerns", /\bwesterns?\b/],
 	["Literary Fiction", /literary fiction|fiction literary|psychological fiction/],
 	["Young Adult", /young adult|juvenile fiction|\bteen\b/],
-	["School Age", /school age|middle grade|children s (?:fiction|stories|books|literature|audiobooks)|picture books|juvenile literature/],
+	["Middle Grade", /middle grade|children s (?:fiction|stories|books|literature|audiobooks)|picture books|juvenile literature/],
 	["Humor", /\bhumou?r|\bcomedy\b|\bsatire\b|\bparod(?:y|ies)\b/],
 	["Short Fiction", /short (?:stories|fiction)|\banthologies\b|\bnovellas?\b/],
 	["Poetry", /\bpoetry\b|\bpoems\b/],
@@ -2516,12 +2516,12 @@ function lazyClassOf(subjects) {
 }
 const LAZY_TAG = /^[0-9]00 /;
 // The class tags a book should have, given its subjects and genre names:
-// [] for a story, else [class] plus Nonfiction. School Age and Young Adult
+// [] for a story, else [class] plus Nonfiction. Middle Grade and Young Adult
 // books need more than a class to count (a kids' book about animals is
 // usually a story), so they keep the plain nonfiction test.
 function nonfictionTags(subjects, names) {
 	const lazy = lazyClassOf(subjects);
-	const young = names.includes("School Age") || names.includes("Young Adult");
+	const young = names.includes("Middle Grade") || names.includes("Young Adult");
 	const fact = isNonfiction(subjects, names)
 		|| lazy.named
 		|| (lazy.fact && !young && !names.includes("Classics") && !names.some((n) => STORY_GENRES.has(n)) && !saysFiction(subjects));
@@ -5279,7 +5279,7 @@ var FICTION = [
 	["Horror", /horror/, "horror"],
 	["Westerns", /\bwestern/, "westerns"],
 	["Young Adult", /young adult|\bya\b|\bteen/, "ya"],
-	["School Age", /school age|middle grade|children|\bkids?\b/, "kids"]
+	["Middle Grade", /middle grade|children|\bkids?\b/, "kids"]
 ];
 // The Nonfiction row is Brandon's Lazy Classification: ten Dewey-style
 // classes, in order. The server tags each nonfiction book with its class
