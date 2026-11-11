@@ -249,7 +249,7 @@ export default {
 
 	// Every 30 minutes (wrangler.toml): new and changed audiobooks and ebooks from Audiobookshelf.
 	async scheduled(event, env, ctx) {
-		if (absOn(env)) ctx.waitUntil(absSync(env).then(() => absWarmCovers(env)).catch((err) => console.warn("audiobooks", err)));
+		if (absOn(env)) ctx.waitUntil(absSync(env).then((r) => absWarmCovers(env, r.coverPaths)).catch((err) => console.warn("audiobooks", err)));
 	},
 };
 
@@ -323,7 +323,10 @@ async function api(request, env, url) {
 		if (m === "PATCH") return updateItem(request, env, id);
 	}
 
-	if (p === "/api/audiobooks/sync" && m === "POST") return json({ ...(await absSync(env)), covers: await absWarmCovers(env) });
+	if (p === "/api/audiobooks/sync" && m === "POST") {
+		const { coverPaths, ...synced } = await absSync(env);
+		return json({ ...synced, covers: await absWarmCovers(env, coverPaths) });
+	}
 	if (p === "/api/books") {
 		if (m === "GET") return listBooks(env);
 		if (m === "PUT") return uploadBook(request, env, url);
@@ -3312,7 +3315,9 @@ async function absSync(env) {
 	}
 	for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
 	const ebookSync = await absSyncEbooks(env, ebooks);
-	return { added, updated, gone, total: seen.size, ebooks: ebookSync, genres: await absGenreTags(env, items) };
+	// Each item's cover file in ABS, for absWarmCovers to tell a new or changed one.
+	const coverPaths = new Map(items.filter((it) => it.id).map((it) => [it.id, String(it.media?.coverPath || "")]));
+	return { added, updated, gone, total: seen.size, ebooks: ebookSync, genres: await absGenreTags(env, items), coverPaths };
 }
 
 // Genre tags for ABS books from ABS's own tags (an audiobook's are Audible's
@@ -3572,32 +3577,51 @@ function fileChapters(media) {
 
 // An audiobook's cover from Audiobookshelf, 600 px wide (an original can be
 // a few MB), kept in R2 like the others so the home server is asked once.
+// coverPath, when known, is the item's cover file in ABS, kept with it so a
+// cover added or changed there later is fetched again.
 // -> {img, kind}, or null when it has none.
-async function absCover(env, book) {
+async function absCover(env, book, coverPath) {
 	const res = await absFetch(env, `/api/items/${encodeURIComponent(book.abs_id || book.abs_ebook)}/cover?format=jpeg&width=600`);
 	let img = null;
 	if (res.ok && Number(res.headers.get("Content-Length") || 0) <= MAX_COVER_BYTES) img = new Uint8Array(await res.arrayBuffer());
 	else await res.body?.cancel();
 	const kind = img && imageType(img);
-	await env.BOOKS.put(coverKey(book.id), kind ? img : new Uint8Array(0), { customMetadata: { src: book.r2_key, type: kind || "" } });
+	const meta = { src: book.r2_key, type: kind || "" };
+	if (coverPath !== undefined) meta.abscover = coverPath;
+	await env.BOOKS.put(coverKey(book.id), kind ? img : new Uint8Array(0), { customMetadata: meta });
 	return kind ? { img, kind } : null;
 }
 
 // Covers are fetched ahead, a batch each sync (newest first), so browsing
 // /library never waits on the home server: hundreds of first-time covers
 // at once tie up the Worker and the home upload, and slow the app with them.
+// A cover is fetched again when ABS's cover file for it changes: one added
+// to a book that had none, or swapped for another. Missing ones go first.
+// coverPaths: ABS item id -> its cover file ("" for none), from absSync.
 // -> how many were fetched.
 const ABS_COVERS_PER_RUN = 40;
-async function absWarmCovers(env) {
+async function absWarmCovers(env, coverPaths = new Map()) {
 	const { results } = await env.DB.prepare(
 		"SELECT id, r2_key, abs_id, abs_ebook FROM books WHERE (abs_id IS NOT NULL OR (abs_ebook IS NOT NULL AND abs_ebook NOT LIKE '%:%')) AND gone_at IS NULL ORDER BY created_at DESC, id DESC",
 	).all();
-	const have = await coverStates(env, new Map(results.map((b) => [b.id, b.r2_key])));
-	let n = 0;
+	const stored = new Map();
+	let cursor;
+	do {
+		const page = await env.BOOKS.list({ prefix: "covers/", cursor, include: ["customMetadata"] });
+		for (const o of page.objects) stored.set(Number(o.key.slice(7)), { src: o.customMetadata?.src, abscover: o.customMetadata?.abscover, size: o.size });
+		cursor = page.truncated ? page.cursor : null;
+	} while (cursor);
+	const missing = [], changed = [];
 	for (const b of results) {
-		if (have.has(b.id)) continue;
+		const have = stored.get(b.id), path = coverPaths.get(b.abs_id || b.abs_ebook);
+		if (!have || have.src !== b.r2_key) missing.push([b, path]);
+		// A cover kept before ABS's file was noted counts as current; an empty one doesn't once ABS has a file.
+		else if (path !== undefined && (have.abscover !== undefined ? have.abscover !== path : !have.size && path)) changed.push([b, path]);
+	}
+	let n = 0;
+	for (const [b, path] of missing.concat(changed)) {
 		if (n >= ABS_COVERS_PER_RUN) break;
-		try { await absCover(env, b); } catch (err) { if (err?.spent) break; throw err; }
+		try { await absCover(env, b, path); } catch (err) { if (err?.spent) break; throw err; }
 		n++;
 	}
 	return n;
