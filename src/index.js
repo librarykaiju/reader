@@ -3619,8 +3619,9 @@ async function absWarmCovers(env, coverPaths = new Map()) {
 	for (const b of results) {
 		const have = stored.get(b.id), path = coverPaths.get(b.abs_id || b.abs_ebook);
 		if (!have || have.src !== b.r2_key) missing.push([b, path]);
-		// A cover kept before ABS's file was noted counts as current; an empty one doesn't once ABS has a file.
-		else if (path !== undefined && (have.abscover !== undefined ? have.abscover !== path : !have.size && path)) changed.push([b, path]);
+		// A cover kept before ABS's file was noted counts as current, unless ABS has since dropped its cover;
+		// an empty one doesn't once ABS has a file.
+		else if (path !== undefined && (have.abscover !== undefined ? have.abscover !== path : have.size ? !path : !!path)) changed.push([b, path]);
 	}
 	let n = 0;
 	for (const [b, path] of missing.concat(changed)) {
