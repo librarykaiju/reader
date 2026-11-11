@@ -2369,13 +2369,16 @@ const GENRES = [
 	["Westerns", /\bwesterns?\b/],
 	["Literary Fiction", /literary fiction|fiction literary|psychological fiction/],
 	["Young Adult", /young adult|juvenile fiction|\bteen\b/],
-	["Children's", /children s (?:fiction|stories|books|literature|audiobooks)|picture books|juvenile literature/],
+	["Middle Grade", /middle grade|children s (?:fiction|stories|books|literature|audiobooks)|picture books|juvenile literature/],
 	["Humor", /\bhumou?r|\bcomedy\b|\bsatire\b|\bparod(?:y|ies)\b/],
 	["Short Fiction", /short (?:stories|fiction)|\banthologies\b|\bnovellas?\b/],
 	["Poetry", /\bpoetry\b|\bpoems\b/],
 	["Drama", /\bdrama\b|\bplays\b|\btragedies\b/],
 	["Classics", /\bclassics?\b|classic literature/],
 	["Mythology & Folklore", /mytholog|folklore|fairy tales|\bmyths\b|\blegends\b/],
+	// General fiction: a tag that says only that ("Fiction", "General
+	// Fiction"). It's dropped when the book has one of the MAIN_GENRES.
+	["Fiction", /^ (?:general )?fiction $/],
 	["Comics", /\bcomics\b|comic (?:books?|strips)|graphic novels?|\bmanga\b/],
 	["Superheroes", /\bsuper ?heroe?s?\b/],
 	// Only for subjects that don't say fiction: "History" alone, not
@@ -2392,7 +2395,12 @@ const FACT_GENRES = new Set(GENRES.filter((g) => g[2]).map((g) => g[0]));
 // Genres only fiction has. A book with one is never Nonfiction, whatever
 // else it's tagged: The Divine Invasion's Religion doesn't make it so.
 const STORY_GENRES = new Set(["Urban Fantasy", "Science Fiction", "Fantasy", "Horror", "Mystery", "Thriller", "Romance",
-	"Historical Fiction", "Westerns", "Literary Fiction", "Short Fiction", "Poetry", "Drama"]);
+	"Historical Fiction", "Westerns", "Literary Fiction", "Short Fiction", "Poetry", "Drama", "Fiction"]);
+// The main genres. A book in one of them isn't general Fiction.
+const MAIN_GENRES = new Set(["Fantasy", "Science Fiction", "Mystery", "Thriller", "Romance", "Horror"]);
+// Audible's broad categories name two genres at once and say nothing about
+// which one a book is in. Its finer tags do, so these are left out.
+const BROAD_SUBJECTS = new Set([" science fiction & fantasy ", " mystery thriller & suspense "]);
 // Whether a book with these subjects and genres is Nonfiction: it has a
 // nonfiction genre, or a subject says nonfiction, and nothing says it's a
 // story. A subject that says fiction counts ("Fiction / Classics"), but not
@@ -2404,23 +2412,36 @@ function isNonfiction(subjects, names) {
 	if (names.some((n) => FACT_GENRES.has(n))) return true;
 	return !names.includes("Classics") && subjects.some((s) => /\bnon ?fiction\b/.test(subjectKey(s)));
 }
-// A more exact genre stands in for the general one.
-const GENRE_OVER = { "Urban Fantasy": "Fantasy" };
 const FICTION_WORDS = /\bfiction\b|\bnovels?\b|\bstories\b/;
 function subjectKey(s) {
 	return " " + String(s).normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9&]+/g, " ").trim() + " ";
 }
 // Subjects -> up to max genre names, the ones the most subjects point to first.
+// Fantasy and Science Fiction never go together: the one more subjects point
+// to wins (Urban Fantasy counts for Fantasy), and a tie goes to the one named
+// first.
 function genresOf(subjects, max) {
-	const hits = new Map();
+	const hits = new Map(), first = new Map();
 	for (const raw of subjects) {
 		const s = subjectKey(raw), fiction = FICTION_WORDS.test(s);
+		// A Lazy Classification tag ("900 World & History") names a class, not a genre.
+		if (BROAD_SUBJECTS.has(s) || /^ [0-9]00s? /.test(s)) continue;
 		GENRES.forEach(([name, re, factOnly]) => {
 			if (factOnly && fiction) return;
-			if (re.test(factOnly ? s.trim() : s)) hits.set(name, (hits.get(name) || 0) + 1);
+			if (!re.test(factOnly ? s.trim() : s)) return;
+			hits.set(name, (hits.get(name) || 0) + 1);
+			if (!first.has(name)) first.set(name, first.size);
 		});
 	}
-	for (const [exact, general] of Object.entries(GENRE_OVER)) if (hits.has(exact)) hits.delete(general);
+	const fantasy = (hits.get("Fantasy") || 0) + (hits.get("Urban Fantasy") || 0), sf = hits.get("Science Fiction") || 0;
+	if (fantasy && sf) {
+		const fFirst = Math.min(first.get("Fantasy") ?? Infinity, first.get("Urban Fantasy") ?? Infinity);
+		if (fantasy > sf || (fantasy === sf && fFirst < first.get("Science Fiction"))) hits.delete("Science Fiction");
+		else { hits.delete("Fantasy"); hits.delete("Urban Fantasy"); }
+	}
+	// Urban Fantasy is a kind of Fantasy: the main genre comes with it.
+	if (hits.has("Urban Fantasy") && !hits.has("Fantasy")) hits.set("Fantasy", hits.get("Urban Fantasy"));
+	if ([...hits.keys()].some((n) => MAIN_GENRES.has(n))) hits.delete("Fiction");
 	const order = GENRES.map((g) => g[0]);
 	return [...hits.keys()].sort((a, b) => hits.get(b) - hits.get(a) || order.indexOf(a) - order.indexOf(b)).slice(0, max);
 }
@@ -2495,12 +2516,12 @@ function lazyClassOf(subjects) {
 }
 const LAZY_TAG = /^[0-9]00 /;
 // The class tags a book should have, given its subjects and genre names:
-// [] for a story, else [class] plus Nonfiction. Children's and Young Adult
+// [] for a story, else [class] plus Nonfiction. Middle Grade and Young Adult
 // books need more than a class to count (a kids' book about animals is
 // usually a story), so they keep the plain nonfiction test.
 function nonfictionTags(subjects, names) {
 	const lazy = lazyClassOf(subjects);
-	const young = names.includes("Children's") || names.includes("Young Adult");
+	const young = names.includes("Middle Grade") || names.includes("Young Adult");
 	const fact = isNonfiction(subjects, names)
 		|| lazy.named
 		|| (lazy.fact && !young && !names.includes("Classics") && !names.some((n) => STORY_GENRES.has(n)) && !saysFiction(subjects));
@@ -3318,7 +3339,7 @@ async function absGenreTags(env, items) {
 		if (!list) continue;
 		// The family library's Nonfiction row is the books tagged Nonfiction.
 		// Its Lazy Classification tag puts it on a card in that row.
-		const names = genresOf(list, 3);
+		const names = genresOf(list, 6);
 		names.push(...nonfictionTags(list, names));
 		want.set(b.id, names);
 	}
@@ -5228,17 +5249,35 @@ ART.comics = ["#9b3a2f", (function () {
 		+ '<g stroke="#9b3a2f" stroke-width="2.2" stroke-linecap="round"><path d="M16 18h20M14 23h24M18 28h14"/></g>'
 		+ '<path d="M10 52h60" stroke="' + INK + '" stroke-width="1.5" opacity=".5"/>';
 })()];
+// Literary Fiction: a fountain pen over a page of lines.
+ART.literary = ["#4a3b5e", '<rect x="16" y="10" width="34" height="42" rx="2" fill="' + INK + '"/>'
+	+ '<g stroke="#4a3b5e" stroke-width="1.6" opacity=".55"><path d="M21 18h24M21 24h24M21 30h24M21 36h16"/></g>'
+	+ '<g transform="rotate(35 54 30)"><path d="M51 8h6v30l-3 7-3-7z" fill="' + GOLD + '"/><path d="M54 38v6" stroke="#4a3b5e" stroke-width="1.2"/><rect x="51" y="8" width="6" height="8" fill="' + EMBER + '"/></g>'];
+// Thriller: a lit fuse on a stick of dynamite.
+ART.thriller = ["#7a2f2a", '<rect x="18" y="30" width="40" height="14" rx="3" fill="' + INK + '"/><g fill="#7a2f2a" opacity=".5"><rect x="26" y="30" width="2" height="14"/><rect x="48" y="30" width="2" height="14"/></g>'
+	+ '<path d="M58 34c6-2 7-8 3-12" fill="none" stroke="' + INK + '" stroke-width="2" stroke-linecap="round" stroke-dasharray="3 2"/>'
+	+ '<circle cx="61" cy="20" r="5" fill="' + EMBER + '"/><circle cx="61" cy="20" r="2.4" fill="' + GOLD + '"/>'
+	+ '<g stroke="' + GOLD + '" stroke-width="1.6" stroke-linecap="round"><path d="M61 10v-4M69 14l3-3M70 22h4M53 14l-3-3"/></g>'];
+// Romance: two hearts.
+ART.romance = ["#8a3b55", '<path d="M33 50C17 39 12 31 12 24a9 9 0 0 1 21-5 9 9 0 0 1 21 5c0 7-5 15-21 26z" fill="' + INK + '"/>'
+	+ '<path d="M57 34c-8-5-10-9-10-12a5 5 0 0 1 10-2.5 5 5 0 0 1 10 2.5c0 3-2 7-10 12z" fill="' + GOLD + '"/>'];
 // Comics lead: they cut across the other genres, and every comic is one
 // whether or not it was tagged.
 var COMICS = /\bcomics?\b|graphic novel|\bmanga\b/;
+// Then general fiction (Fiction, Classics, Literary Fiction), the main
+// genres, and who it's for.
 var FICTION = [
 	["Comics", COMICS, "comics", function (b) { return b.type === "cbz"; }],
+	["Fiction", /^(?:general )?fiction$/, "book"],
 	["Classics", /\bclassic/, "classics"],
-	["Westerns", /\bwestern/, "westerns"],
-	["Mysteries", /\bmyster|\bdetective/, "mysteries"],
+	["Literary Fiction", /literary fiction/, "literary"],
 	["Fantasy", /fantasy/, "fantasy"],
 	["Science Fiction", /science fiction|\bsci ?-?fi\b|^sf$/, "scifi"],
+	["Mystery", /\bmyster|\bdetective/, "mysteries"],
+	["Thriller", /\bthriller|\bsuspense/, "thriller"],
+	["Romance", /\bromance|love stories/, "romance"],
 	["Horror", /horror/, "horror"],
+	["Westerns", /\bwestern/, "westerns"],
 	["Young Adult", /young adult|\bya\b|\bteen/, "ya"],
 	["Middle Grade", /middle grade|children|\bkids?\b/, "kids"]
 ];
@@ -5286,7 +5325,7 @@ ART.globe = ["#3b5a7a", '<circle cx="40" cy="29" r="17" fill="' + INK + '"/>'
 var NONFIC = /^non-?fiction$/;
 // Tags only a story has. A book with one stays off the Nonfiction row even
 // if it's tagged Nonfiction too.
-var STORY = /science fiction|\bsci ?-?fi\b|^sf$|fantasy|horror|\bmyster|\bdetective|\bwestern|\bthriller|\bromance|\bnovels?\b/;
+var STORY = /science fiction|\bsci ?-?fi\b|^sf$|fantasy|horror|\bmyster|\bdetective|\bwestern|\bthriller|\bromance|\bnovels?\b|^(?:general )?fiction$|literary fiction/;
 function isFact(b) {
 	return b.tags.some(function (t) { return NONFIC.test(fold(t)); }) && !b.tags.some(function (t) { return STORY.test(fold(t)); });
 }
