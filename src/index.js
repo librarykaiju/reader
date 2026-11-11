@@ -3319,8 +3319,8 @@ async function absSync(env) {
 	}
 	for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
 	const ebookSync = await absSyncEbooks(env, ebooks);
-	// Each item's cover file in ABS, for absWarmCovers to tell a new or changed one.
-	const coverPaths = new Map(items.filter((it) => it.id).map((it) => [it.id, String(it.media?.coverPath || "")]));
+	// Each item's cover file in ABS and when ABS last changed it, for absWarmCovers to tell a new or changed cover.
+	const coverPaths = new Map(items.filter((it) => it.id).map((it) => [it.id, { path: String(it.media?.coverPath || ""), at: Number(it.updatedAt) || 0 }]));
 	return { added, updated, gone, total: seen.size, ebooks: ebookSync, genres: await absGenreTags(env, items), coverPaths };
 }
 
@@ -3599,9 +3599,10 @@ async function absCover(env, book, coverPath) {
 // Covers are fetched ahead, a batch each sync (newest first), so browsing
 // /library never waits on the home server: hundreds of first-time covers
 // at once tie up the Worker and the home upload, and slow the app with them.
-// A cover is fetched again when ABS's cover file for it changes: one added
-// to a book that had none, or swapped for another. Missing ones go first.
-// coverPaths: ABS item id -> its cover file ("" for none), from absSync.
+// A cover is fetched again when ABS's cover file for it changes (one added,
+// swapped or taken off), or when ABS changed the item after the cover was
+// kept, since a new cover can have the same file name. Missing ones go first.
+// coverPaths: ABS item id -> {path: its cover file ("" for none), at: its updatedAt}, from absSync.
 // -> how many were fetched.
 const ABS_COVERS_PER_RUN = 40;
 async function absWarmCovers(env, coverPaths = new Map()) {
@@ -3612,16 +3613,15 @@ async function absWarmCovers(env, coverPaths = new Map()) {
 	let cursor;
 	do {
 		const page = await env.BOOKS.list({ prefix: "covers/", cursor, include: ["customMetadata"] });
-		for (const o of page.objects) stored.set(Number(o.key.slice(7)), { src: o.customMetadata?.src, abscover: o.customMetadata?.abscover, size: o.size });
+		for (const o of page.objects) stored.set(Number(o.key.slice(7)), { src: o.customMetadata?.src, abscover: o.customMetadata?.abscover, size: o.size, at: o.uploaded ? o.uploaded.getTime() : 0 });
 		cursor = page.truncated ? page.cursor : null;
 	} while (cursor);
 	const missing = [], changed = [];
 	for (const b of results) {
-		const have = stored.get(b.id), path = coverPaths.get(b.abs_id || b.abs_ebook);
+		const abs = coverPaths.get(b.abs_id || b.abs_ebook), path = abs?.path;
+		const have = stored.get(b.id);
 		if (!have || have.src !== b.r2_key) missing.push([b, path]);
-		// A cover kept before ABS's file was noted counts as current, unless ABS has since dropped its cover;
-		// an empty one doesn't once ABS has a file.
-		else if (path !== undefined && (have.abscover !== undefined ? have.abscover !== path : have.size ? !path : !!path)) changed.push([b, path]);
+		else if (abs && ((have.abscover !== undefined && have.abscover !== path) || abs.at > have.at)) changed.push([b, path]);
 	}
 	let n = 0;
 	for (const [b, path] of missing.concat(changed)) {
