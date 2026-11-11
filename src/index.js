@@ -2478,22 +2478,24 @@ const LAZY_RULES = [
 	[8, /\bhumou?r|\bcomedy\b|\bsatire\b/, false],
 	[9, /\bhistor|\bbiograph|\bautobiograph|\bmemoirs?\b|\btravel|\bgeograph|\bwar\b|\bmilitary\b|\bworld\b|\bexploration\b|\bcivilization/, true],
 ];
-// A tag that names a class ("500", "500s", "Natural Science", "500 Natural
-// Science") is set by hand, so it wins and makes the book Nonfiction.
+// Tags that name a class ("500", "500s", "Natural Science", "500 Natural
+// Science") are set by hand, so they win and make the book Nonfiction. A book
+// can be named into more than one class (a history of comics is 700 and 900).
 function lazyNamed(subjects) {
+	const out = [];
 	for (const raw of subjects) {
 		const s = subjectKey(raw).trim(), m = /^([0-9])00s?\b/.exec(s);
-		if (m) return LAZY_CLASSES[+m[1]];
-		const named = LAZY_CLASSES.find((c) => subjectKey(c.slice(4)).trim() === s);
-		if (named) return named;
+		const named = m ? LAZY_CLASSES[+m[1]] : LAZY_CLASSES.find((c) => subjectKey(c.slice(4)).trim() === s);
+		if (named && !out.includes(named)) out.push(named);
 	}
-	return null;
+	return out;
 }
-// Subjects -> {name: "500 Natural Science" or null, fact: whether it's
-// evidence the book is nonfiction}.
+// Subjects -> {names: ["500 Natural Science"], or [] for none; fact: whether
+// it's evidence the book is nonfiction}. Only a class named by hand gives more
+// than one.
 function lazyClassOf(subjects) {
 	const named = lazyNamed(subjects);
-	if (named) return { name: named, fact: true, named: true };
+	if (named.length) return { names: named, fact: true, named: true };
 	const votes = new Map();
 	let fact = false;
 	subjects.forEach((raw, i) => {
@@ -2510,13 +2512,13 @@ function lazyClassOf(subjects) {
 			break;
 		}
 	});
-	if (!votes.size) return { name: null, fact: false };
+	if (!votes.size) return { names: [], fact: false };
 	const [best] = [...votes].sort((a, b) => b[1].n - a[1].n || b[1].at - a[1].at)[0];
-	return { name: LAZY_CLASSES[best], fact };
+	return { names: [LAZY_CLASSES[best]], fact };
 }
 const LAZY_TAG = /^[0-9]00 /;
 // The class tags a book should have, given its subjects and genre names:
-// [] for a story, else [class] plus Nonfiction. Middle Grade and Young Adult
+// [] for a story, else its class (or classes) plus Nonfiction. Middle Grade and Young Adult
 // books need more than a class to count (a kids' book about animals is
 // usually a story), so they keep the plain nonfiction test.
 function nonfictionTags(subjects, names) {
@@ -2526,7 +2528,7 @@ function nonfictionTags(subjects, names) {
 		|| lazy.named
 		|| (lazy.fact && !young && !names.includes("Classics") && !names.some((n) => STORY_GENRES.has(n)) && !saysFiction(subjects));
 	if (!fact) return [];
-	return lazy.name ? ["Nonfiction", lazy.name] : ["Nonfiction"];
+	return ["Nonfiction", ...lazy.names];
 }
 // A subject that says fiction ("Fiction / Classics"), but not one about writing it.
 function saysFiction(subjects) {
@@ -5295,13 +5297,17 @@ var LAZY_TAG = /^([0-9])00 /;
 // Reader's own genre tags -> class, for a book with no class tag.
 var LAZY_GENRE = [[/histor|biograph|memoir|travel/, 9], [/philosoph|self.?help|psycholog/, 1], [/religio|spiritual|myth|folklore/, 2],
 	[/scien/, 5], [/\bart\b/, 7], [/poe|drama|humou?r|essay|classic/, 8]];
+// A book's classes: every class tag it has (a history of comics is 700 and
+// 900), else one from its genre tags, else [-1] for Other.
 function lazyOf(b) {
-	for (var i = 0; i < b.tags.length; i++) { var m = LAZY_TAG.exec(b.tags[i]); if (m) return +m[1]; }
+	var out = [];
+	for (var i = 0; i < b.tags.length; i++) { var m = LAZY_TAG.exec(b.tags[i]); if (m && out.indexOf(+m[1]) < 0) out.push(+m[1]); }
+	if (out.length) return out;
 	for (var j = 0; j < LAZY_GENRE.length; j++) {
 		var r = LAZY_GENRE[j];
-		if (b.tags.some(function (t) { return r[0].test(fold(t)); })) return r[1];
+		if (b.tags.some(function (t) { return r[0].test(fold(t)); })) return [r[1]];
 	}
-	return -1;
+	return [-1];
 }
 ART.screen = ["#2f4f6f", '<rect x="18" y="12" width="44" height="30" rx="3" fill="' + INK + '"/><rect x="22" y="16" width="36" height="22" fill="#22384f"/>'
 	+ '<path d="M26 22l5 4-5 4" fill="none" stroke="' + GOLD + '" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M34 31h9" stroke="' + GOLD + '" stroke-width="2.2" stroke-linecap="round"/>'
@@ -5363,7 +5369,7 @@ function renderRecs() {
 	common = {};
 	Object.keys(everywhere).forEach(function (t) { if (everywhere[t] === books.length && books.length > 1) common[t] = 1; });
 	LAZY.concat([["", "Other", "book"]]).forEach(function (c, i) {
-		var k = c[0] ? i : -1, test = function (b) { return isFact(b) && lazyOf(b) === k; };
+		var k = c[0] ? i : -1, test = function (b) { return isFact(b) && lazyOf(b).indexOf(k) >= 0; };
 		var n = books.filter(test).length;
 		if (n) non.push({ id: "n:" + (c[0] || "other"), label: c[0] ? c[0] + " " + c[1] : c[1], art: c[2], test: test, n: n });
 	});
