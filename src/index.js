@@ -4590,6 +4590,16 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.genre[aria-pressed=true] .gl { color: var(--accent); }
 	.genre:focus-visible { outline: none; }
 	.genre:focus-visible .art { box-shadow: 0 0 0 3px var(--bg), 0 0 0 5px var(--muted); }
+	/* Arrows to page a row of genre cards, for a mouse (a finger swipes). Centered on the cards' art. */
+	.gwrap { position: relative; }
+	.gscroll { display: none; position: absolute; top: 48px; transform: translateY(-50%); z-index: 1; width: 36px; height: 36px; border-radius: 50%;
+		border: 1px solid var(--line); background: var(--card); color: var(--fg); padding: 0; cursor: pointer; box-shadow: 0 1px 5px rgba(0,0,0,.2);
+		align-items: center; justify-content: center; }
+	.gscroll:hover { background: var(--sel); }
+	.gscroll svg { width: 18px; height: 18px; }
+	.gscroll.prev { left: -8px; }
+	.gscroll.next { right: -8px; }
+	@media (hover: hover) and (pointer: fine) { .gscroll:not([hidden]) { display: flex; } }
 	.covers { list-style: none; margin: 14px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 22px 14px; }
 	.covers a { display: flex; flex-direction: column; gap: 3px; color: inherit; text-decoration: none; min-width: 0; }
 	.cover { position: relative; aspect-ratio: 2 / 3; border-radius: 5px; overflow: hidden; background: var(--sel); box-shadow: 0 1px 4px rgba(0,0,0,.22); margin-bottom: 5px; }
@@ -4860,9 +4870,13 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 			<input id="q" type="search" placeholder="Search title, author, series" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="search">
 			<div id="recs" class="recs" hidden>
 				<h2 id="hFic">Fiction</h2>
-				<div id="fiction" class="genres" role="group" aria-labelledby="hFic"></div>
+				<div class="gwrap"><div id="fiction" class="genres" role="group" aria-labelledby="hFic"></div>
+					<button type="button" class="gscroll prev" data-row="fiction" data-dir="-1" aria-label="Scroll Fiction left" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+					<button type="button" class="gscroll next" data-row="fiction" data-dir="1" aria-label="Scroll Fiction right" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
 				<h2 id="hNon">Nonfiction</h2>
-				<div id="nonfiction" class="genres" role="group" aria-labelledby="hNon"></div>
+				<div class="gwrap"><div id="nonfiction" class="genres" role="group" aria-labelledby="hNon"></div>
+					<button type="button" class="gscroll prev" data-row="nonfiction" data-dir="-1" aria-label="Scroll Nonfiction left" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+					<button type="button" class="gscroll next" data-row="nonfiction" data-dir="1" aria-label="Scroll Nonfiction right" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
 			</div>
 			<div class="filters">
 				<div id="formats" class="formats" role="group" aria-label="Format"></div>
@@ -5301,9 +5315,29 @@ function renderRecs() {
 		box.textContent = "";
 		row[2].forEach(function (g) { box.append(genreButton(g)); });
 		box.hidden = $(row[1]).hidden = !row[2].length;
+		box.scrollLeft = 0;
+		rowArrows(box);
 	});
 	anyRecs = fic.length + non.length > 0;
 }
+// A row's arrows show only where there's more to see that way.
+function rowArrows(box) {
+	var wrap = box.parentNode, max = box.scrollWidth - box.clientWidth;
+	wrap.querySelector(".prev").hidden = box.hidden || box.scrollLeft <= 2;
+	wrap.querySelector(".next").hidden = box.hidden || box.scrollLeft >= max - 2;
+}
+["fiction", "nonfiction"].forEach(function (id) {
+	var box = $(id);
+	box.addEventListener("scroll", function () { rowArrows(box); }, { passive: true });
+	// Also when the row first shows, or the window changes width.
+	if (window.ResizeObserver) new ResizeObserver(function () { rowArrows(box); }).observe(box);
+	else window.addEventListener("resize", function () { rowArrows(box); });
+	box.parentNode.querySelectorAll(".gscroll").forEach(function (btn) {
+		btn.addEventListener("click", function () {
+			box.scrollBy({ left: +btn.dataset.dir * Math.max(120, box.clientWidth - 120), behavior: "smooth" });
+		});
+	});
+});
 function renderTags() {
 	var sel = $("tag"), names = {};
 	books.forEach(function (b) { b.tags.forEach(function (t) { names[t] = 1; }); });
