@@ -216,6 +216,10 @@ export default {
 		if (url.pathname === "/family" && (request.method === "GET" || request.method === "HEAD")) return Response.redirect(new URL("/library" + url.search, url), 301);
 		if (url.pathname === "/sw.js" && request.method === "GET") return serviceWorker();
 		if (url.pathname === "/apple-touch-icon.png" && request.method === "GET") return touchIcon();
+		if (url.pathname === "/library-icon.png" && request.method === "GET") return touchIcon(FAMILY_ICON_PNG);
+		if (url.pathname === "/library-icon.svg" && request.method === "GET") {
+			return new Response(FAMILY_ICON_SVG, { headers: { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400", "X-Content-Type-Options": "nosniff" } });
+		}
 		if (MANIFESTS[url.pathname] && request.method === "GET") return manifest(MANIFESTS[url.pathname]);
 		if (FONTS[url.pathname] && request.method === "GET") return font(FONTS[url.pathname]);
 		const listen = url.pathname.match(/^\/listen\/(\d+)\/(\d+|file)$/);
@@ -249,7 +253,7 @@ export default {
 
 	// Every 30 minutes (wrangler.toml): new and changed audiobooks and ebooks from Audiobookshelf.
 	async scheduled(event, env, ctx) {
-		if (absOn(env)) ctx.waitUntil(absSync(env).then(() => absWarmCovers(env)).catch((err) => console.warn("audiobooks", err)));
+		if (absOn(env)) ctx.waitUntil(absSync(env).then((r) => absWarmCovers(env, r.coverPaths)).catch((err) => console.warn("audiobooks", err)));
 	},
 };
 
@@ -323,7 +327,10 @@ async function api(request, env, url) {
 		if (m === "PATCH") return updateItem(request, env, id);
 	}
 
-	if (p === "/api/audiobooks/sync" && m === "POST") return json({ ...(await absSync(env)), covers: await absWarmCovers(env) });
+	if (p === "/api/audiobooks/sync" && m === "POST") {
+		const { coverPaths, ...synced } = await absSync(env);
+		return json({ ...synced, covers: await absWarmCovers(env, coverPaths) });
+	}
 	if (p === "/api/books") {
 		if (m === "GET") return listBooks(env);
 		if (m === "PUT") return uploadBook(request, env, url);
@@ -2478,22 +2485,24 @@ const LAZY_RULES = [
 	[8, /\bhumou?r|\bcomedy\b|\bsatire\b/, false],
 	[9, /\bhistor|\bbiograph|\bautobiograph|\bmemoirs?\b|\btravel|\bgeograph|\bwar\b|\bmilitary\b|\bworld\b|\bexploration\b|\bcivilization/, true],
 ];
-// A tag that names a class ("500", "500s", "Natural Science", "500 Natural
-// Science") is set by hand, so it wins and makes the book Nonfiction.
+// Tags that name a class ("500", "500s", "Natural Science", "500 Natural
+// Science") are set by hand, so they win and make the book Nonfiction. A book
+// can be named into more than one class (a history of comics is 700 and 900).
 function lazyNamed(subjects) {
+	const out = [];
 	for (const raw of subjects) {
 		const s = subjectKey(raw).trim(), m = /^([0-9])00s?\b/.exec(s);
-		if (m) return LAZY_CLASSES[+m[1]];
-		const named = LAZY_CLASSES.find((c) => subjectKey(c.slice(4)).trim() === s);
-		if (named) return named;
+		const named = m ? LAZY_CLASSES[+m[1]] : LAZY_CLASSES.find((c) => subjectKey(c.slice(4)).trim() === s);
+		if (named && !out.includes(named)) out.push(named);
 	}
-	return null;
+	return out;
 }
-// Subjects -> {name: "500 Natural Science" or null, fact: whether it's
-// evidence the book is nonfiction}.
+// Subjects -> {names: ["500 Natural Science"], or [] for none; fact: whether
+// it's evidence the book is nonfiction}. Only a class named by hand gives more
+// than one.
 function lazyClassOf(subjects) {
 	const named = lazyNamed(subjects);
-	if (named) return { name: named, fact: true, named: true };
+	if (named.length) return { names: named, fact: true, named: true };
 	const votes = new Map();
 	let fact = false;
 	subjects.forEach((raw, i) => {
@@ -2510,13 +2519,13 @@ function lazyClassOf(subjects) {
 			break;
 		}
 	});
-	if (!votes.size) return { name: null, fact: false };
+	if (!votes.size) return { names: [], fact: false };
 	const [best] = [...votes].sort((a, b) => b[1].n - a[1].n || b[1].at - a[1].at)[0];
-	return { name: LAZY_CLASSES[best], fact };
+	return { names: [LAZY_CLASSES[best]], fact };
 }
 const LAZY_TAG = /^[0-9]00 /;
 // The class tags a book should have, given its subjects and genre names:
-// [] for a story, else [class] plus Nonfiction. Middle Grade and Young Adult
+// [] for a story, else its class (or classes) plus Nonfiction. Middle Grade and Young Adult
 // books need more than a class to count (a kids' book about animals is
 // usually a story), so they keep the plain nonfiction test.
 function nonfictionTags(subjects, names) {
@@ -2526,7 +2535,7 @@ function nonfictionTags(subjects, names) {
 		|| lazy.named
 		|| (lazy.fact && !young && !names.includes("Classics") && !names.some((n) => STORY_GENRES.has(n)) && !saysFiction(subjects));
 	if (!fact) return [];
-	return lazy.name ? ["Nonfiction", lazy.name] : ["Nonfiction"];
+	return ["Nonfiction", ...lazy.names];
 }
 // A subject that says fiction ("Fiction / Classics"), but not one about writing it.
 function saysFiction(subjects) {
@@ -3310,7 +3319,9 @@ async function absSync(env) {
 	}
 	for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
 	const ebookSync = await absSyncEbooks(env, ebooks);
-	return { added, updated, gone, total: seen.size, ebooks: ebookSync, genres: await absGenreTags(env, items) };
+	// Each item's cover file in ABS, for absWarmCovers to tell a new or changed one.
+	const coverPaths = new Map(items.filter((it) => it.id).map((it) => [it.id, String(it.media?.coverPath || "")]));
+	return { added, updated, gone, total: seen.size, ebooks: ebookSync, genres: await absGenreTags(env, items), coverPaths };
 }
 
 // Genre tags for ABS books from ABS's own tags (an audiobook's are Audible's
@@ -3570,32 +3581,51 @@ function fileChapters(media) {
 
 // An audiobook's cover from Audiobookshelf, 600 px wide (an original can be
 // a few MB), kept in R2 like the others so the home server is asked once.
+// coverPath, when known, is the item's cover file in ABS, kept with it so a
+// cover added or changed there later is fetched again.
 // -> {img, kind}, or null when it has none.
-async function absCover(env, book) {
+async function absCover(env, book, coverPath) {
 	const res = await absFetch(env, `/api/items/${encodeURIComponent(book.abs_id || book.abs_ebook)}/cover?format=jpeg&width=600`);
 	let img = null;
 	if (res.ok && Number(res.headers.get("Content-Length") || 0) <= MAX_COVER_BYTES) img = new Uint8Array(await res.arrayBuffer());
 	else await res.body?.cancel();
 	const kind = img && imageType(img);
-	await env.BOOKS.put(coverKey(book.id), kind ? img : new Uint8Array(0), { customMetadata: { src: book.r2_key, type: kind || "" } });
+	const meta = { src: book.r2_key, type: kind || "" };
+	if (coverPath !== undefined) meta.abscover = coverPath;
+	await env.BOOKS.put(coverKey(book.id), kind ? img : new Uint8Array(0), { customMetadata: meta });
 	return kind ? { img, kind } : null;
 }
 
 // Covers are fetched ahead, a batch each sync (newest first), so browsing
 // /library never waits on the home server: hundreds of first-time covers
 // at once tie up the Worker and the home upload, and slow the app with them.
+// A cover is fetched again when ABS's cover file for it changes: one added
+// to a book that had none, or swapped for another. Missing ones go first.
+// coverPaths: ABS item id -> its cover file ("" for none), from absSync.
 // -> how many were fetched.
 const ABS_COVERS_PER_RUN = 40;
-async function absWarmCovers(env) {
+async function absWarmCovers(env, coverPaths = new Map()) {
 	const { results } = await env.DB.prepare(
 		"SELECT id, r2_key, abs_id, abs_ebook FROM books WHERE (abs_id IS NOT NULL OR (abs_ebook IS NOT NULL AND abs_ebook NOT LIKE '%:%')) AND gone_at IS NULL ORDER BY created_at DESC, id DESC",
 	).all();
-	const have = await coverStates(env, new Map(results.map((b) => [b.id, b.r2_key])));
-	let n = 0;
+	const stored = new Map();
+	let cursor;
+	do {
+		const page = await env.BOOKS.list({ prefix: "covers/", cursor, include: ["customMetadata"] });
+		for (const o of page.objects) stored.set(Number(o.key.slice(7)), { src: o.customMetadata?.src, abscover: o.customMetadata?.abscover, size: o.size });
+		cursor = page.truncated ? page.cursor : null;
+	} while (cursor);
+	const missing = [], changed = [];
 	for (const b of results) {
-		if (have.has(b.id)) continue;
+		const have = stored.get(b.id), path = coverPaths.get(b.abs_id || b.abs_ebook);
+		if (!have || have.src !== b.r2_key) missing.push([b, path]);
+		// A cover kept before ABS's file was noted counts as current; an empty one doesn't once ABS has a file.
+		else if (path !== undefined && (have.abscover !== undefined ? have.abscover !== path : !have.size && path)) changed.push([b, path]);
+	}
+	let n = 0;
+	for (const [b, path] of missing.concat(changed)) {
 		if (n >= ABS_COVERS_PER_RUN) break;
-		try { await absCover(env, b); } catch (err) { if (err?.spent) break; throw err; }
+		try { await absCover(env, b, path); } catch (err) { if (err?.spent) break; throw err; }
 		n++;
 	}
 	return n;
@@ -3960,77 +3990,6 @@ function cleanCatalog(c) {
 	return out;
 }
 
-// The Library of Congress catalog (its SRU search, on port 210; no key):
-// {classification, subjects, year, publisher, language} from the MARC record
-// for this ISBN, else for this title and author. Its Dewey number (082), else
-// its LC call number (050), and its LC subject headings (6XX, second
-// indicator 0). null when LC has no record, as for most self-published and
-// ebook-only books.
-const LOC_SRU = "http://lx2.loc.gov:210/lcdb";
-async function locRecord(isbn, title, author) {
-	const search = async (query) => {
-		const res = await fetch(LOC_SRU + "?" + new URLSearchParams({
-			version: "1.1", operation: "searchRetrieve", query, maximumRecords: "5", recordSchema: "marcxml",
-		}), { headers: { "User-Agent": LOOKUP_UA } });
-		if (!res.ok) {
-			await res.body?.cancel();
-			throw new HttpError(502, `lx2.loc.gov answered ${res.status}`);
-		}
-		return marcRecords(await res.text());
-	};
-	const want = looseTitle(title);
-	const surname = looseTitle(String(author || "").split(/,|&| and /)[0]).split(" ").pop();
-	const fits = (m) => {
-		const t = looseTitle(m.title);
-		return !want || t === want || t.startsWith(want + " ") || want.startsWith(t + " ");
-	};
-	const byAuthor = (m) => !surname || looseTitle(m.author).split(" ").includes(surname);
-	let found = isbn ? (await search(`bath.isbn=${isbn}`))[0] : null;
-	if (!found && want) {
-		const q = `dc.title="${want}"` + (surname ? ` and dc.creator="${surname}"` : "");
-		found = (await search(q)).find((m) => fits(m) && byAuthor(m));
-	}
-	return found ? found.catalog : null;
-}
-// MARCXML (an SRU answer) -> [{title, author, catalog}].
-function marcRecords(xml) {
-	return [...xml.matchAll(/<(?:\w+:)?record\b[^>]*>([\s\S]*?)<\/(?:\w+:)?record>/g)]
-		.filter((m) => /<(?:\w+:)?datafield\b/.test(m[1]))
-		.map((m) => marcRecord(m[1]));
-}
-function marcRecord(xml) {
-	const fields = [...xml.matchAll(/<(?:\w+:)?datafield\b([^>]*)>([\s\S]*?)<\/(?:\w+:)?datafield>/g)].map((m) => ({
-		tag: (/\btag="(\d{3})"/.exec(m[1]) || [])[1],
-		ind2: (/\bind2="(.)"/.exec(m[1]) || [])[1],
-		subs: [...m[2].matchAll(/<(?:\w+:)?subfield\b[^>]*\bcode="(.)"[^>]*>([\s\S]*?)<\/(?:\w+:)?subfield>/g)].map((s) => [s[1], xmlText(s[2])]),
-	}));
-	const field = (tag) => fields.find((f) => f.tag === tag);
-	const sub = (f, codes) => (f ? f.subs.filter(([c]) => codes.includes(c)).map(([, v]) => v) : []);
-	// ISBD punctuation ("Dune /", "Chilton Books,", "1965.") goes.
-	const tidy = (v) => String(v || "").replace(/\s*[\/:;,=]\s*$/, "").replace(/(\w{3,})\.$/, "$1").replace(/^\[|\]$/g, "").trim();
-	const control = (/<(?:\w+:)?controlfield\b[^>]*\btag="008"[^>]*>([^<]*)</.exec(xml) || [])[1] || "";
-	const pub = field("264") || field("260");
-	const dewey = sub(field("082"), ["a"])[0];
-	const lcc = sub(field("050"), ["a", "b"]).join(" ");
-	const subjects = fields
-		.filter((f) => ["600", "610", "611", "630", "650", "651"].includes(f.tag) && f.ind2 === "0")
-		.map((f) => {
-			const main = sub(f, ["a", "b", "c", "d", "t"]).map(tidy).join(" ");
-			return [main, ...sub(f, ["v", "x", "y", "z"]).map(tidy)].filter(Boolean).join(" -- ");
-		});
-	return {
-		title: tidy(sub(field("245"), ["a", "b"]).join(" ")),
-		author: tidy(sub(field("100") || field("110"), ["a"])[0]),
-		catalog: cleanCatalog({
-			classification: dewey ? dewey.replace(/\//g, "") : lcc || null,
-			subjects,
-			year: sub(pub, ["c"])[0] || control.slice(7, 11),
-			publisher: tidy(sub(pub, ["b"])[0]),
-			language: control.slice(35, 38).trim(),
-		}),
-	};
-}
-
 // The named entities descriptions use besides XML's own.
 const HTML_ENTITIES = { nbsp: " ", ldquo: "\u201c", rdquo: "\u201d", lsquo: "\u2018", rsquo: "\u2019", mdash: "\u2014", ndash: "\u2013",
 	hellip: "\u2026", eacute: "\u00e9", egrave: "\u00e8", aacute: "\u00e1", iacute: "\u00ed", oacute: "\u00f3", uacute: "\u00fa",
@@ -4241,8 +4200,8 @@ function recordJSON(book) {
 function recordDue(book, soon) {
 	if (!book.record_at) return true;
 	const r = recordJSON(book);
-	// Records looked up before catalog details (or the Library of Congress) existed get them once.
-	if (!r.from.catalog || !r.from.loc) return true;
+	// Records looked up before catalog details existed get them once.
+	if (!r.from.catalog) return true;
 	return !r.appeal && r.from.appeal !== "edited" && (soon || Date.now() - book.record_at > RECORD_RETRY_MS);
 }
 
@@ -4275,15 +4234,7 @@ async function fillRecord(env, book, refresh) {
 		if (!pages && !audio && online.pages) { pages = online.pages; from.pages = online.from.pages; }
 		for (const [k, v] of Object.entries(online.catalog)) { catalog[k] = v; catFrom[k] = online.from.catalog[k]; }
 	}
-	// The Library of Congress's call number and subject headings win over
-	// Open Library's and Google's; its other details only fill gaps. Edits stay.
-	const loc = await within(() => locRecord(catalog.isbn, book.title, book.author || ""), undefined, 8000);
-	// "unreached" (LC down, or too slow) isn't tried again until the next refresh.
-	from.loc = loc === undefined ? "unreached" : loc ? "found" : "none";
-	for (const [k, v] of Object.entries(loc || {})) {
-		if (catFrom[k] === "edited" || catFrom[k] === "file") continue;
-		if (k === "classification" || k === "subjects" || !catalog[k]) { catalog[k] = v; catFrom[k] = "loc"; }
-	}
+	delete from.loc;
 	from.catalog = catFrom;
 	if (!pages && file.words > 2000) { pages = Math.max(1, Math.round(file.words / WORDS_PER_PAGE)); from.pages = "estimate"; }
 	if (!keep("appeal")) {
@@ -4507,8 +4458,13 @@ const ICON_URI = "data:image/svg+xml," + encodeURIComponent(ICON_SVG);
 // "Reader" set in Romana, the icon's typeface, as outlines.
 const WORDMARK_SVG = '<svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" viewBox="0 -345 1450 383" fill="currentColor"><path d="M327 22.5L327 33.5C228.5-4 180-56 156-154C152.5-153.5 149.5-153.5 148-153.5L141.5-153.5C135.5-153.5 130.5-153.5 121-155L121-40C121-21.5 125.5-13.5 141-7L141 0L18.9 0L18.9-7C34.4-13.5 38.9-21.5 38.9-40L38.9-293.6C38.9-312.1 34.4-320.1 18.9-326.6L18.9-333.6L57.5-333.6C66-333.6 81.5-334.1 102-335.6C126-337.1 153.5-338.1 170-338.1C262.5-338.1 313-305.6 313-246.1C313-220.1 301.5-196 280-180C271-173 255-166 232.5-159C260.5-66.5 295 2.5 327 22.5ZM121-289.1L121-170.5C127.5-170 132-169.5 135.5-169.5L146-169.5C202.5-169.5 231.5-195.5 231.5-245.6C231.5-289.6 197.5-324.1 155.5-324.1C131-324.1 121-314.6 121-289.1ZM121-289.1M519.1-57.5L528.1-51.5C489.6-9 464.5 5.5 427.5 5.5C367.5 5.5 327-43.5 327-115C327-184.5 371-235.1 431-235.1C465-235.1 496.6-216.6 512.6-188C522.1-170.5 525.6-154.5 525.6-126L525.6-122.5C525.6-121 525.6-119 525.1-117L400.5-117C402.5-83 409-65 424.5-52.5C436.5-42 451-37 468-37C485.6-37 497.1-42 519.1-57.5ZM398.5-134.5L443.5-134.5C463-134.5 467.5-141.5 467.5-167C467.5-200.5 455-220.6 435-220.6C409.5-220.6 398.5-193 398.5-134.5ZM398.5-134.5M764.6-22L773.1-13.5C753.6 1 743.6 5 724.1 5C696.6 5 680.6-6.5 675.6-29C659.6-17 658.1-14.5 651.6-10.5C637.1-0.5 618.6 5 601.1 5C565.1 5 540.1-16.5 540.1-47C540.1-70.5 555.6-90.5 587.1-107C608.6-119 624.6-125.5 675.6-145.5L675.6-197.5C675.6-213 668.6-221.1 654.6-221.1C642.1-221.1 635.6-215 631.1-200.5C623.6-175 611.1-162 593.6-162C577.1-162 564.1-172.5 564.1-186.5C564.1-215 605.1-235.1 663.6-235.1C719.6-235.1 748.6-215.5 748.6-179L748.6-29C748.6-21 751.1-17 756.1-17C758.6-17 761.1-18.5 764.6-22ZM675.6-43.5L675.6-129.5C649.6-118 637.1-112 627.6-102.5C618.1-93 612.1-78 612.1-62.5C612.1-41 622.6-27.5 638.6-27.5C649.1-27.5 658.1-31.5 675.6-43.5ZM675.6-43.5M938.2 0L938.2-28C914.6-4 897.6 5 873.1 5C848.6 5 823.6-8 809.6-27.5C795.6-47.5 788.6-74.5 788.6-108.5C788.6-184 827.6-235.6 883.6-235.6C905.6-235.6 917.6-231.1 938.2-214.5L938.2-281.6C938.2-296.1 935.2-301.1 925.2-303.6L925.2-314.6C962.2-324.1 968.7-325.6 1001.2-341.6L1011.7-341.6L1011.7-34C1011.7-18.5 1014.7-13 1025.2-6.5L1025.2 0ZM938.2-44.5L938.2-172.5C938.2-198.5 925.7-215.5 906.1-215.5C893.6-215.5 884.1-208.5 877.1-194C869.1-178.5 863.6-142.5 863.6-112C863.6-55.5 877.6-26 905.1-26C915.1-26 922.6-30 938.2-44.5ZM938.2-44.5M1242.7-57.5L1251.7-51.5C1213.2-9 1188.2 5.5 1151.2 5.5C1091.2 5.5 1050.7-43.5 1050.7-115C1050.7-184.5 1094.7-235.1 1154.7-235.1C1188.7-235.1 1220.2-216.6 1236.2-188C1245.7-170.5 1249.2-154.5 1249.2-126L1249.2-122.5C1249.2-121 1249.2-119 1248.7-117L1124.2-117C1126.2-83 1132.7-65 1148.2-52.5C1160.2-42 1174.7-37 1191.7-37C1209.2-37 1220.7-42 1242.7-57.5ZM1122.2-134.5L1167.2-134.5C1186.7-134.5 1191.2-141.5 1191.2-167C1191.2-200.5 1178.7-220.6 1158.7-220.6C1133.2-220.6 1122.2-193 1122.2-134.5ZM1122.2-134.5M1361.7-180.5L1361.7-34C1361.7-18.5 1364.7-12.5 1375.3-6.5L1375.3 0L1274.7 0L1274.7-6.5C1285.2-12.5 1288.2-18.5 1288.2-34L1288.2-177C1288.2-191.5 1285.2-196.5 1274.7-199L1274.7-210C1312.2-219.6 1318.2-220.6 1350.7-236.6L1361.7-236.6L1361.7-197C1379.3-224.6 1394.8-235.1 1416.3-235.1C1433.8-235.1 1446.8-223.1 1446.8-207C1446.8-191 1435.3-179 1419.3-179C1410.3-179 1409.3-179 1394.8-189.5C1391.3-192 1387.8-193 1383.8-193C1375.3-193 1368.2-189 1361.7-180.5ZM1361.7-180.5"/></svg>';
 const ICON_PNG = "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";
-function touchIcon() {
-	return new Response(Uint8Array.from(atob(ICON_PNG), (c) => c.charCodeAt(0)), {
+// The family library's icon: a library lit on a diagonal by a street lamp, on a dark blue night.
+// The page carries the SVG; iPhones want a PNG for the home screen.
+const FAMILY_ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" fill="#1d2238"/><g fill="#353d64"><path d="M58 212 226 124 394 212z"/><path d="M58 222 394 222 394 244 58 244z"/><path d="M80 256 114 256 114 388 80 388z"/><path d="M146 256 180 256 180 388 146 388z"/><path d="M272 256 306 256 306 388 272 388z"/><path d="M338 256 372 256 372 388 338 388z"/><path d="M46 388 406 388 406 420 46 420z"/></g><g fill="#f2c66d"><path d="M314.6 212 344.9 186.3 394 212z"/><path d="M302.8 222 394 222 394 244 276.8 244z"/><path d="M114 381.9 114 388 106.8 388z"/><path d="M146 354.8 180 326 180 388 146 388z"/><path d="M272 256 306 256 306 388 272 388z"/><path d="M338 256 372 256 372 388 338 388z"/><path d="M106.8 388 406 388 406 420 69 420z"/></g><path d="M200 388v-70a26 26 0 0 1 52 0v70z" fill="#12152a"/><rect y="420" width="512" height="92" fill="#12152a"/><g fill="#12152a"><rect x="432" y="160" width="14" height="260"/><path d="M439 166c0-34-26-50-58-50h-6v14h6c25 0 44 12 44 36z"/><path d="M354 124h44l-8 28h-28z"/></g><circle cx="376" cy="160" r="12" fill="#f2c66d"/></svg>';
+const FAMILY_ICON_URI = "data:image/svg+xml," + encodeURIComponent(FAMILY_ICON_SVG);
+const FAMILY_ICON_PNG = "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";
+function touchIcon(png = ICON_PNG) {
+	return new Response(Uint8Array.from(atob(png), (c) => c.charCodeAt(0)), {
 		headers: { "Content-Type": "image/png", "Cache-Control": "public, max-age=86400" },
 	});
 }
@@ -4519,13 +4475,11 @@ function touchIcon() {
 // so it stays its own app on a phone that has both.
 const MANIFESTS = {
 	"/manifest.webmanifest": { id: "/", name: "Reader", short_name: "Reader", start_url: "/", scope: "/", background_color: "#fbfaf7", theme_color: "#fbfaf7" },
-	"/library.webmanifest": { id: "/library", name: "The Back Alley Library", short_name: "Back Alley", start_url: "/library", scope: "/library", background_color: "#f4ecd8", theme_color: "#f4ecd8" },
+	"/library.webmanifest": { id: "/library", name: "The Back Alley Library", short_name: "Back Alley", start_url: "/library", scope: "/library", background_color: "#f4ecd8", theme_color: "#f4ecd8",
+		icons: [{ src: "/library-icon.png", sizes: "180x180", type: "image/png" }, { src: "/library-icon.svg", sizes: "any", type: "image/svg+xml" }] },
 };
 function manifest(m) {
-	const body = Object.assign({}, m, {
-		display: "standalone",
-		icons: [{ src: "/apple-touch-icon.png", sizes: "180x180", type: "image/png" }],
-	});
+	const body = Object.assign({ icons: [{ src: "/apple-touch-icon.png", sizes: "180x180", type: "image/png" }] }, m, { display: "standalone" });
 	return new Response(JSON.stringify(body), {
 		headers: { "Content-Type": "application/manifest+json", "Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff" },
 	});
@@ -4602,7 +4556,7 @@ function familyPage(env) {
 		"frame-ancestors 'none'",
 	].join("; ");
 	const siteKey = turnstileOn(env) ? env.TURNSTILE_SITE_KEY.replace(/[^\w-]/g, "") : "";
-	const html = FAMILY_PAGE.replaceAll("__NONCE__", nonce).replaceAll("__ICON__", ICON_URI).replaceAll("__TURNSTILE__", siteKey)
+	const html = FAMILY_PAGE.replaceAll("__NONCE__", nonce).replaceAll("__ICON__", FAMILY_ICON_URI).replaceAll("__TURNSTILE__", siteKey)
 		.replaceAll("__PDFJS__", PDFJS_URL).replaceAll("__PDFJS_DATA__", PDFJS_DATA_URL);
 	return new Response(html, {
 		headers: {
@@ -4628,7 +4582,7 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 <meta name="apple-mobile-web-app-title" content="Back Alley">
 <link rel="manifest" href="/library.webmanifest">
 <link rel="icon" type="image/svg+xml" href="__ICON__">
-<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="apple-touch-icon" href="/library-icon.png">
 <link rel="preload" href="/fonts/fraunces-soft.woff2" as="font" type="font/woff2" crossorigin>
 <title>The Back Alley Library</title>
 <style nonce="__NONCE__">
@@ -4667,6 +4621,16 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.genre[aria-pressed=true] .gl { color: var(--accent); }
 	.genre:focus-visible { outline: none; }
 	.genre:focus-visible .art { box-shadow: 0 0 0 3px var(--bg), 0 0 0 5px var(--muted); }
+	/* Arrows to page a row of genre cards, for a mouse (a finger swipes). Centered on the cards' art. */
+	.gwrap { position: relative; }
+	.gscroll { display: none; position: absolute; top: 48px; transform: translateY(-50%); z-index: 1; width: 36px; height: 36px; border-radius: 50%;
+		border: 1px solid var(--line); background: var(--card); color: var(--fg); padding: 0; cursor: pointer; box-shadow: 0 1px 5px rgba(0,0,0,.2);
+		align-items: center; justify-content: center; }
+	.gscroll:hover { background: var(--sel); }
+	.gscroll svg { width: 18px; height: 18px; }
+	.gscroll.prev { left: -8px; }
+	.gscroll.next { right: -8px; }
+	@media (hover: hover) and (pointer: fine) { .gscroll:not([hidden]) { display: flex; } }
 	.covers { list-style: none; margin: 14px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 22px 14px; }
 	.covers a { display: flex; flex-direction: column; gap: 3px; color: inherit; text-decoration: none; min-width: 0; }
 	.cover { position: relative; aspect-ratio: 2 / 3; border-radius: 5px; overflow: hidden; background: var(--sel); box-shadow: 0 1px 4px rgba(0,0,0,.22); margin-bottom: 5px; }
@@ -4937,9 +4901,13 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 			<input id="q" type="search" placeholder="Search title, author, series" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="search">
 			<div id="recs" class="recs" hidden>
 				<h2 id="hFic">Fiction</h2>
-				<div id="fiction" class="genres" role="group" aria-labelledby="hFic"></div>
+				<div class="gwrap"><div id="fiction" class="genres" role="group" aria-labelledby="hFic"></div>
+					<button type="button" class="gscroll prev" data-row="fiction" data-dir="-1" aria-label="Scroll Fiction left" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+					<button type="button" class="gscroll next" data-row="fiction" data-dir="1" aria-label="Scroll Fiction right" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
 				<h2 id="hNon">Nonfiction</h2>
-				<div id="nonfiction" class="genres" role="group" aria-labelledby="hNon"></div>
+				<div class="gwrap"><div id="nonfiction" class="genres" role="group" aria-labelledby="hNon"></div>
+					<button type="button" class="gscroll prev" data-row="nonfiction" data-dir="-1" aria-label="Scroll Nonfiction left" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+					<button type="button" class="gscroll next" data-row="nonfiction" data-dir="1" aria-label="Scroll Nonfiction right" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
 			</div>
 			<div class="filters">
 				<div id="formats" class="formats" role="group" aria-label="Format"></div>
@@ -5295,13 +5263,17 @@ var LAZY_TAG = /^([0-9])00 /;
 // Reader's own genre tags -> class, for a book with no class tag.
 var LAZY_GENRE = [[/histor|biograph|memoir|travel/, 9], [/philosoph|self.?help|psycholog/, 1], [/religio|spiritual|myth|folklore/, 2],
 	[/scien/, 5], [/\bart\b/, 7], [/poe|drama|humou?r|essay|classic/, 8]];
+// A book's classes: every class tag it has (a history of comics is 700 and
+// 900), else one from its genre tags, else [-1] for Other.
 function lazyOf(b) {
-	for (var i = 0; i < b.tags.length; i++) { var m = LAZY_TAG.exec(b.tags[i]); if (m) return +m[1]; }
+	var out = [];
+	for (var i = 0; i < b.tags.length; i++) { var m = LAZY_TAG.exec(b.tags[i]); if (m && out.indexOf(+m[1]) < 0) out.push(+m[1]); }
+	if (out.length) return out;
 	for (var j = 0; j < LAZY_GENRE.length; j++) {
 		var r = LAZY_GENRE[j];
-		if (b.tags.some(function (t) { return r[0].test(fold(t)); })) return r[1];
+		if (b.tags.some(function (t) { return r[0].test(fold(t)); })) return [r[1]];
 	}
-	return -1;
+	return [-1];
 }
 ART.screen = ["#2f4f6f", '<rect x="18" y="12" width="44" height="30" rx="3" fill="' + INK + '"/><rect x="22" y="16" width="36" height="22" fill="#22384f"/>'
 	+ '<path d="M26 22l5 4-5 4" fill="none" stroke="' + GOLD + '" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M34 31h9" stroke="' + GOLD + '" stroke-width="2.2" stroke-linecap="round"/>'
@@ -5363,7 +5335,7 @@ function renderRecs() {
 	common = {};
 	Object.keys(everywhere).forEach(function (t) { if (everywhere[t] === books.length && books.length > 1) common[t] = 1; });
 	LAZY.concat([["", "Other", "book"]]).forEach(function (c, i) {
-		var k = c[0] ? i : -1, test = function (b) { return isFact(b) && lazyOf(b) === k; };
+		var k = c[0] ? i : -1, test = function (b) { return isFact(b) && lazyOf(b).indexOf(k) >= 0; };
 		var n = books.filter(test).length;
 		if (n) non.push({ id: "n:" + (c[0] || "other"), label: c[0] ? c[0] + " " + c[1] : c[1], art: c[2], test: test, n: n });
 	});
@@ -5374,9 +5346,29 @@ function renderRecs() {
 		box.textContent = "";
 		row[2].forEach(function (g) { box.append(genreButton(g)); });
 		box.hidden = $(row[1]).hidden = !row[2].length;
+		box.scrollLeft = 0;
+		rowArrows(box);
 	});
 	anyRecs = fic.length + non.length > 0;
 }
+// A row's arrows show only where there's more to see that way.
+function rowArrows(box) {
+	var wrap = box.parentNode, max = box.scrollWidth - box.clientWidth;
+	wrap.querySelector(".prev").hidden = box.hidden || box.scrollLeft <= 2;
+	wrap.querySelector(".next").hidden = box.hidden || box.scrollLeft >= max - 2;
+}
+["fiction", "nonfiction"].forEach(function (id) {
+	var box = $(id);
+	box.addEventListener("scroll", function () { rowArrows(box); }, { passive: true });
+	// Also when the row first shows, or the window changes width.
+	if (window.ResizeObserver) new ResizeObserver(function () { rowArrows(box); }).observe(box);
+	else window.addEventListener("resize", function () { rowArrows(box); });
+	box.parentNode.querySelectorAll(".gscroll").forEach(function (btn) {
+		btn.addEventListener("click", function () {
+			box.scrollBy({ left: +btn.dataset.dir * Math.max(120, box.clientWidth - 120), behavior: "smooth" });
+		});
+	});
+});
 function renderTags() {
 	var sel = $("tag"), names = {};
 	books.forEach(function (b) { b.tags.forEach(function (t) { names[t] = 1; }); });
@@ -5543,9 +5535,39 @@ function recordFacts(b, rec) {
 	add("Publisher", c.publisher);
 	add("Language", c.language);
 	add("Shelved", b.tags.filter(function (t) { return !common[t]; }).join(", "));
-	add("Call number", c.classification);
+	add("Call number", callNumber(b));
 	add("Subjects", (c.subjects || []).join("; "));
 	add("ISBN", c.isbn);
+}
+// The library's own call number, like a spine label: nonfiction by its Lazy
+// Classification class ("700 MOO"), fiction by its genre ("FAN TOL", "YA SF
+// COL", "MG FIC COO"), each with a three-letter cutter from the author's
+// surname (or the title's first word when there's no author).
+var SPINE = [["fantasy", "FAN"], ["science fiction", "SF"], ["horror", "HOR"], ["myster", "MYS"], ["thriller", "THR"],
+	["romance", "ROM"], ["western", "WES"]];
+function callNumber(b) {
+	var tags = b.tags.map(fold), lazy = isFact(b) ? lazyOf(b)[0] : null, label;
+	if (lazy != null && lazy >= 0) label = lazy + "00";
+	else if (lazy === -1) label = "NF";
+	else if (b.type === "cbz" || tags.some(function (t) { return COMICS.test(t); })) label = "GN";
+	else {
+		var g = SPINE.filter(function (s) { return tags.some(function (t) { return t.indexOf(s[0]) >= 0; }); })[0];
+		label = g ? g[1] : "FIC";
+		if (tags.some(function (t) { return /young adult|\bya\b|\bteen/.test(t); })) label = "YA " + label;
+		else if (tags.some(function (t) { return /middle grade|children|\bkids?\b/.test(t); })) label = "MG " + label;
+	}
+	return label + " " + cutter(b);
+}
+function cutter(b) {
+	var a = String(b.author || "").split(/;|&| and |\//)[0].trim(), word;
+	// "Doctorow, Cory" is surname first; "S. A. Cosby, Adam Lazarre-White" is two authors.
+	if (a.indexOf(",") > 0 && !/\s/.test(a.split(",")[0].trim())) word = a.split(",")[0];
+	else {
+		var parts = a.split(",")[0].split(/\s+/).filter(function (w) { return w && !/^(?:jr|sr|ii|iii|iv|phd|md)\.?,?$/i.test(w); });
+		word = parts[parts.length - 1] || "";
+	}
+	if (!/[a-z]/i.test(fold(word))) word = String(b.title || "").replace(/^(?:the|a|an)\s+/i, "");
+	return fold(word).replace(/[^a-z]/g, "").slice(0, 3).toUpperCase() || "XXX";
 }
 function downloadButton(dl, left, b) {
 	dl.href = "/api/family/books/" + b.id + "/file";
@@ -12372,7 +12394,6 @@ function fillDetailsRecord(rec) {
 	$("dRecStatus").textContent = !rec ? "" : !rec.filled ? "Not looked up yet." : [
 		from.blurb && from.blurb !== "edited" && "copy from " + ({ file: "the file", openlibrary: "Open Library", google: "Google Books", ai: "AI" }[from.blurb] || from.blurb),
 		from.pages === "estimate" && "pages estimated",
-		from.loc === "none" && "no Library of Congress record",
 		from.appeal && from.appeal !== "edited" && "terms by " + from.appeal,
 		from.appeal_error && "no appeal factors: " + from.appeal_error
 	].filter(Boolean).join(", ");
