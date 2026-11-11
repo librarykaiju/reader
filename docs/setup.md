@@ -188,6 +188,7 @@ npx wrangler d1 execute reader --remote --file migrations/0018_feed_images.sql
 npx wrangler d1 execute reader --remote --file migrations/0019_abs_ebooks.sql
 npx wrangler d1 execute reader --remote --file migrations/0020_abs_tags.sql
 npx wrangler d1 execute reader --remote --file migrations/0021_book_tag_drops.sql
+npx wrangler d1 execute reader --remote --file migrations/0022_abs_tidy.sql
 npx wrangler deploy
 ```
 
@@ -397,6 +398,22 @@ How they behave:
 - Its cover is its own first page, not the folder's cover.
 - A folder with just one comic is one book, titled and covered the way ABS has it.
 - CBR is left out, as for ebooks: convert it to CBZ (same pages, a different archive).
+
+### ABS tidy-up
+
+Every hour (at :15) Reader looks at books added to ABS in the last three days and tidies them in ABS, a few at a time, so they reach both libraries in good shape. Run migration `0022` first (Updating). Comics are left alone.
+
+- **Names:** a title or author that's plainly junk (a hash, a download site's name, "Unknown") is worked out from the file name.
+- **Details from ABS's lookups** (Audible, then Google), only where ABS has none: the series and number, the description (a download site's note counts as none, and is cleared when nothing better turns up) and the cover.
+- **Tags by your rules:** general fiction gets Fiction (plus Classics or Literary Fiction); the main genres are Fantasy, Science Fiction, Mystery, Thriller, Romance and Horror, never Fantasy and Science Fiction together; Young Adult and Middle Grade where they fit; nonfiction gets its subjects and one Lazy Classification class. A book that already has tags from the list (set by hand, say) keeps them. Claude picks the tags when `ANTHROPIC_API_KEY` is set, Workers AI otherwise; with neither, the tags come from the catalog's categories only.
+- **What it did** is listed under **New in Audiobookshelf** on the Family page (settings, Family library). Fix anything wrong in ABS; the next sync brings it to Reader. A book is only tidied once.
+
+To turn it on:
+
+1. **An ABS user that can edit.** ABS → Settings → **Users** → **Add User**: username `reader-tidy`, type **User**. Turn on **Can Update**, **Access all libraries**, **Access all tags** and explicit content. Turn off Download, Delete and Upload.
+2. **An API key for it:** Settings → **API Keys** → **Add API Key**, name `Reader tidy-up`, never expires, acting as `reader-tidy`. Copy it.
+3. **The secret:** Workers → `reader` → Settings → Variables and Secrets → add **Secret** `ABS_EDIT_TOKEN` with that key. It goes through the same tunnel and service token as `ABS_TOKEN`.
+4. To run it now instead of waiting: `curl -X POST https://reader.brandonj.ink/api/abs/tidy -H "Authorization: Bearer <READER_TOKEN>"`.
 
 ## If something goes wrong
 

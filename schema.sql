@@ -244,3 +244,14 @@ CREATE TABLE IF NOT EXISTS previews (
 	bytes INTEGER NOT NULL,
 	PRIMARY KEY (person_id, book_id)
 );
+
+-- The ABS tidy-up's log: each Audiobookshelf item it has looked at and what
+-- it changed there (JSON). An item with a row isn't looked at again.
+CREATE TABLE IF NOT EXISTS abs_tidy (
+	item_id TEXT PRIMARY KEY,
+	title TEXT,
+	author TEXT,
+	changes TEXT,
+	at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS abs_tidy_by_at ON abs_tidy (at);

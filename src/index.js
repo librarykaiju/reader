@@ -78,6 +78,8 @@
 //                                  send the token)
 //   GET    /listen/:id/:n?e=&s=    audiobook file n (from 0), streamed from Audiobookshelf with ranged reads
 //                                  (/listen/:id/file: the whole audiobook as a download, as the family library's)
+//   GET    /api/abs/tidy           -> {"on", "tidied": [{item_id, title, author, changes, at}]}: the ABS tidy-up's log
+//   POST   /api/abs/tidy           -> {"done": [titles], "waiting"}: runs the ABS tidy-up now (the cron runs it hourly)
 //   POST   /api/audiobooks/sync    -> {"added", "updated", "gone", "total", "ebooks", "covers"}: reads Audiobookshelf now (a cron
 //                                  also does every 30 minutes), and fetches up to 40 covers not kept yet; 503 when
 //                                  it isn't set up
@@ -252,7 +254,9 @@ export default {
 	},
 
 	// Every 30 minutes (wrangler.toml): new and changed audiobooks and ebooks from Audiobookshelf.
+	// Every hour at :15: the ABS tidy-up for books new there.
 	async scheduled(event, env, ctx) {
+		if (event.cron === TIDY_CRON) { ctx.waitUntil(absTidy(env).catch((err) => console.warn("tidy", err))); return; }
 		if (absOn(env)) ctx.waitUntil(absSync(env).then((r) => absWarmCovers(env, r.coverPaths)).catch((err) => console.warn("audiobooks", err)));
 	},
 };
@@ -327,6 +331,8 @@ async function api(request, env, url) {
 		if (m === "PATCH") return updateItem(request, env, id);
 	}
 
+	if (p === "/api/abs/tidy" && m === "GET") return tidyLog(env);
+	if (p === "/api/abs/tidy" && m === "POST") return json(await absTidy(env));
 	if (p === "/api/audiobooks/sync" && m === "POST") {
 		const { coverPaths, ...synced } = await absSync(env);
 		return json({ ...synced, covers: await absWarmCovers(env, coverPaths) });
@@ -3223,7 +3229,10 @@ const ABS_PAGE = 200;
 async function absFetch(env, path, init = {}) {
 	if (!absOn(env)) throw new HttpError(503, "Audiobooks aren't set up (ABS_URL and ABS_TOKEN)");
 	const headers = new Headers(init.headers);
-	headers.set("Authorization", `Bearer ${env.ABS_TOKEN}`);
+	// The tidy-up's writes use their own key (ABS_EDIT_TOKEN); everything else reads with ABS_TOKEN.
+	const { edit, ...rest } = init;
+	init = rest;
+	headers.set("Authorization", `Bearer ${edit ? env.ABS_EDIT_TOKEN : env.ABS_TOKEN}`);
 	if (env.CF_ACCESS_CLIENT_ID) {
 		headers.set("CF-Access-Client-Id", env.CF_ACCESS_CLIENT_ID);
 		headers.set("CF-Access-Client-Secret", env.CF_ACCESS_CLIENT_SECRET || "");
@@ -3630,6 +3639,193 @@ async function absWarmCovers(env, coverPaths = new Map()) {
 		n++;
 	}
 	return n;
+}
+
+// ---------- ABS tidy-up: new books in Audiobookshelf, tidied and tagged
+//
+// Every hour (wrangler.toml), books added to ABS in the last few days that
+// haven't been tidied yet get, a few at a time:
+//   * a real title and author when the file came with junk (a hash, a
+//     download site's name, "Unknown"), worked out by the model from the
+//     file name;
+//   * a series, a description and a cover from ABS's own Audible, Google
+//     and Open Library lookups, where ABS has none (or only a download
+//     site's note for a description);
+//   * genre and Lazy Classification tags in ABS by Brandon's rules (below),
+//     which the sync then turns into Reader's tags as usual.
+// What was done is kept in abs_tidy (migration 0022) and shown on the
+// Family page. Needs ABS_EDIT_TOKEN, an API key for an ABS user that may
+// update but not delete or upload (docs/setup.md, "ABS tidy-up"); the
+// model is Claude with ANTHROPIC_API_KEY, else Workers AI. Comics are left
+// alone: they get their card by file type.
+const TIDY_CRON = "15 * * * *";
+const TIDY_DAYS = 3;
+const TIDY_PER_RUN = 6;
+const TIDY_CLAUDE_MODEL = "claude-sonnet-5-5";
+const TIDY_TAGS = [...GENRES.map((g) => g[0]), ...LAZY_CLASSES];
+const TIDY_RULES = `You tag books for a family library. Pick tags only from the allowed list.
+- General fiction (no main genre) gets "Fiction", plus "Classics" and/or "Literary Fiction" where they fit.
+- The main genres are Fantasy, Science Fiction, Mystery, Thriller, Romance and Horror. A book may have more than one, but NEVER both Fantasy and Science Fiction: pick the one it is closer to.
+- A genre book can also be "Classics" or "Literary Fiction".
+- Subgenres (Urban Fantasy, Historical Fiction, Westerns, Humor, Short Fiction, Superheroes, Mythology & Folklore and the like) are fine where they apply. Urban Fantasy comes with Fantasy.
+- "Young Adult" for teen books, "Middle Grade" for children's books (not both unless it truly spans them).
+- Nonfiction gets its subject tags (History, Biography & Memoir, Philosophy, Religion, Science, Self-Help, Art) and exactly one Lazy Classification class ("000 Computers & Information" ... "900 World & History"), Dewey-style: self-help and psychology 100, religion and myth 200, social science, politics, economics, education 300, language 400, natural science 500, medicine, business, cooking, crafts-as-technology 600, arts, drawing, music, sports, crafts, comics about comics 700, literature, writing, essays, humor 800, history, biography, travel 900.
+- Never give a story a Lazy class. Two to five tags in all.`;
+const TIDY_SCHEMA = {
+	type: "object",
+	properties: {
+		title: { type: "string", description: "The book's real title, without series or format notes" },
+		author: { type: "string", description: "The author's name, first name first; several separated by commas" },
+		tags: { type: "array", items: { type: "string", enum: TIDY_TAGS } },
+	},
+	required: ["title", "author", "tags"],
+	additionalProperties: false,
+};
+// A title or author that's clearly not one: a hash, a download site, a file name.
+function tidyJunk(md) {
+	const t = String(md.title || ""), a = String(md.authorName || "");
+	return /^[0-9a-f]{20,}$/i.test(t) || /z-?lib|libgen|\.(?:epub|pdf|mobi)$|_-_|\(\d{9,}\)/i.test(t) || !a || /^(?:unknown|box|various)$/i.test(a.trim());
+}
+function tidyBlankBlurb(s) {
+	const text = String(s || "").replace(/<[^>]+>/g, "").trim();
+	return !text || (text.length < 200 && /z-?library|purchased from libro\.fm|downloaded from/i.test(text));
+}
+async function absEdit(env, path, method, body) {
+	const res = await absFetch(env, path, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), edit: true });
+	if (!res.ok) throw new HttpError(502, `Audiobookshelf answered ${res.status} to ${method} ${path.split("/").slice(0, 4).join("/")}`);
+	await res.body?.cancel();
+}
+async function tidyModel(env, user) {
+	if (env.ANTHROPIC_API_KEY) return claudeJSON(env, { model: TIDY_CLAUDE_MODEL, maxTokens: 2000, effort: "low", schema: TIDY_SCHEMA, system: TIDY_RULES, user });
+	if (!env.AI) return null;
+	const out = await env.AI.run(RECORD_AI_MODEL, {
+		messages: [
+			{ role: "system", content: `${TIDY_RULES}\n\nAllowed tags: ${TIDY_TAGS.join("; ")}\n\nAnswer with JSON: {"title": "...", "author": "...", "tags": ["..."]}` },
+			{ role: "user", content: user },
+		],
+		response_format: { type: "json_schema", json_schema: { ...TIDY_SCHEMA, properties: { ...TIDY_SCHEMA.properties, tags: { type: "array", items: { type: "string" } } } } },
+		max_tokens: 400,
+	});
+	const raw = out?.response;
+	return typeof raw === "string" ? JSON.parse((/\{[\s\S]*\}/.exec(raw) || [raw])[0]) : raw;
+}
+// ABS's own lookup (it asks Audible, Google or Open Library): the first
+// result whose title and author agree with the book's.
+async function tidyLookup(env, title, author) {
+	const key = (s) => String(s || "").toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, " ").trim();
+	const short = (s) => key(String(s || "").replace(/\([^)]*\)|\[[^\]]*\]/g, "").split(":")[0]);
+	const names = key(author).split(" ").filter((w) => w.length > 2);
+	for (const provider of ["audible", "google"]) {
+		let list = [];
+		try { list = await absJSON(env, `/api/search/books?${new URLSearchParams({ provider, title: short(title) || title, author: String(author || "").split(",")[0] })}`); } catch (err) { if (err?.spent) throw err; continue; }
+		const hit = (Array.isArray(list) ? list : []).find((x) => {
+			const a = short(title), b = short(x.title);
+			return a && b && (a === b || a.includes(b) || b.includes(a)) && (!names.length || names.some((w) => key(x.author).includes(w)));
+		});
+		if (hit) return { ...hit, provider };
+	}
+	return null;
+}
+// -> {done: [titles], waiting} for this run.
+async function absTidy(env) {
+	if (!absOn(env) || !env.ABS_EDIT_TOKEN) return { done: [], waiting: 0, off: true };
+	const since = Date.now() - TIDY_DAYS * 864e5, fresh = [];
+	const { libraries = [] } = await absJSON(env, "/api/libraries");
+	for (const lib of libraries) {
+		if (lib.mediaType && lib.mediaType !== "book") continue;
+		if (/comic/i.test(lib.name || "")) continue;
+		const d = await absJSON(env, `/api/libraries/${encodeURIComponent(lib.id)}/items?minified=1&sort=addedAt&desc=1&limit=50`);
+		for (const it of d.results || []) if (it.addedAt >= since && !it.isMissing && !it.isInvalid) fresh.push(it);
+	}
+	if (!fresh.length) return { done: [], waiting: 0 };
+	const seen = new Set();
+	for (let i = 0; i < fresh.length; i += 50) {
+		const ids = fresh.slice(i, i + 50).map((it) => it.id);
+		const { results } = await env.DB.prepare(`SELECT item_id FROM abs_tidy WHERE item_id IN (${ids.map(() => "?").join(",")})`).bind(...ids).all();
+		results.forEach((r) => seen.add(r.item_id));
+	}
+	const todo = fresh.filter((it) => !seen.has(it.id)).sort((a, b) => a.addedAt - b.addedAt);
+	const done = [];
+	for (const it of todo.slice(0, TIDY_PER_RUN)) {
+		try { done.push(await tidyItem(env, it.id)); } catch (err) {
+			if (err?.spent) break;
+			console.warn("tidy", it.id, err);
+			await env.DB.prepare("INSERT OR REPLACE INTO abs_tidy (item_id, title, author, changes, at) VALUES (?, ?, ?, ?, ?)")
+				.bind(it.id, str(it.media?.metadata?.title, 300), str(it.media?.metadata?.authorName, 300), JSON.stringify({ error: String(err?.message || err).slice(0, 200) }), Date.now()).run();
+		}
+	}
+	return { done, waiting: Math.max(0, todo.length - done.length) };
+}
+async function tidyItem(env, id) {
+	const item = await absJSON(env, `/api/items/${encodeURIComponent(id)}?expanded=1`);
+	const media = item.media || {}, md = media.metadata || {};
+	const changes = {};
+	let title = md.title || "", author = md.authorName || "";
+	const junk = tidyJunk(md);
+	let renamed = false;
+	const file = String(item.relPath || item.path || "").split("/").pop();
+	const ask = (hit) => [
+		`Title in the file: ${title || "(none)"}`,
+		`Author in the file: ${author || "(none)"}`,
+		`File name: ${file}`,
+		md.publishedYear && `Published: ${md.publishedYear}`,
+		(media.tags || []).length && `Tags now: ${media.tags.join(", ")}`,
+		(md.genres || []).length && `Genres now: ${md.genres.join(", ")}`,
+		hit && `A catalog match: "${hit.title}" by ${hit.author}${hit.genres?.length ? `; genres ${hit.genres.join(", ")}` : ""}${hit.tags?.length ? `; categories ${hit.tags.join(", ")}` : ""}`,
+		!tidyBlankBlurb(md.description) && `Description: ${String(md.description).replace(/<[^>]+>/g, " ").slice(0, 1200)}`,
+		hit?.description && `Catalog description: ${String(hit.description).replace(/<[^>]+>/g, " ").slice(0, 1200)}`,
+		"",
+		junk && !renamed ? "The title and author in the file look wrong: work out the real ones from the file name." : "Keep the title and author as they are unless they are plainly wrong.",
+		"Then pick this book's tags.",
+	].filter(Boolean).join("\n");
+	// A junk title gets cleaned up first, so the catalog can find the book.
+	if (junk) {
+		const named = await within(() => tidyModel(env, ask(null)).catch(() => null), null, 40000);
+		if (named?.title && named?.author) { title = str(named.title, 300); author = str(named.author, 300); renamed = true; }
+	}
+	const hit = await tidyLookup(env, title, author);
+	const tagged0 = (media.tags || []).some((t) => TIDY_TAGS.includes(t));
+	const answer = tagged0 ? null : await within(() => tidyModel(env, ask(hit)).catch((err) => { console.warn("tidy model", id, err); return null; }), null, 40000);
+	const metadata = {};
+	if (junk && title && author) {
+		if (title !== md.title) metadata.title = changes.title = title;
+		if (author !== md.authorName) { metadata.authors = author.split(/\s*,\s*/).filter(Boolean).map((name) => ({ name })); changes.author = author; }
+	}
+	if (hit && !(md.series || []).length && !md.seriesName && hit.series?.length) {
+		metadata.series = hit.series.filter((s) => s.series).map((s) => ({ name: s.series, sequence: s.sequence || null }));
+		if (metadata.series.length) changes.series = metadata.series.map((s) => s.name + (s.sequence ? ` #${s.sequence}` : "")).join(", ");
+		else delete metadata.series;
+	}
+	if (hit?.description && tidyBlankBlurb(md.description)) { metadata.description = hit.description; changes.description = hit.provider; }
+	else if (tidyBlankBlurb(md.description) && md.description) { metadata.description = ""; changes.description = "cleared"; }
+	// The model's tags, kept to the allowed list and the rules it might bend.
+	let tags = [...new Set((answer?.tags || []).filter((t) => TIDY_TAGS.includes(t)))];
+	if (tags.includes("Fantasy") && tags.includes("Science Fiction")) tags = tags.filter((t) => t !== (genresOf([...(media.tags || []), ...(hit?.tags || [])], 6).includes("Science Fiction") ? "Fantasy" : "Science Fiction"));
+	if (tags.includes("Urban Fantasy") && !tags.includes("Fantasy")) tags.unshift("Fantasy");
+	if (!tags.length) {
+		// No model: Reader's own reading of the catalog's categories.
+		const raw = [...(media.tags || []), ...(md.genres || []), ...(hit?.genres || []), ...(hit?.tags || [])];
+		tags = genresOf(raw, 6);
+		tags.push(...nonfictionTags(raw, tags).filter((t) => t !== "Nonfiction"));
+	}
+	const body = {};
+	// Tags already in the library's own words were set by hand (or by an earlier tidy): they stay.
+	const tagged = (media.tags || []).some((t) => TIDY_TAGS.includes(t));
+	if (!tagged && tags.length && tags.join("|") !== (media.tags || []).join("|")) { body.tags = tags; changes.tags = tags; }
+	if (Object.keys(metadata).length) body.metadata = metadata;
+	if (Object.keys(body).length) await absEdit(env, `/api/items/${encodeURIComponent(id)}/media`, "PATCH", body);
+	if (!media.coverPath && hit?.cover) {
+		try { await absEdit(env, `/api/items/${encodeURIComponent(id)}/cover`, "POST", { url: hit.cover }); changes.cover = hit.provider; } catch (err) { console.warn("tidy cover", id, err); }
+	}
+	if (!tagged0 && !env.ANTHROPIC_API_KEY && !env.AI) changes.note = "no model: tags from the catalog only";
+	await env.DB.prepare("INSERT OR REPLACE INTO abs_tidy (item_id, title, author, changes, at) VALUES (?, ?, ?, ?, ?)")
+		.bind(id, str(title, 300), str(author, 300), JSON.stringify(changes), Date.now()).run();
+	return title;
+}
+// GET /api/abs/tidy -> {tidied: [{item_id, title, author, changes, at}], on}
+async function tidyLog(env) {
+	const { results } = await env.DB.prepare("SELECT item_id, title, author, changes, at FROM abs_tidy ORDER BY at DESC LIMIT 60").all();
+	return json({ on: !!(absOn(env) && env.ABS_EDIT_TOKEN), tidied: results.map((r) => ({ ...r, changes: JSON.parse(r.changes || "{}") })) });
 }
 
 const AUDIO_PASS = ["Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"];
@@ -7051,6 +7247,10 @@ const PAGE = String.raw`<!doctype html>
 	.covers .series .cover > * { border-radius: 5px; overflow: hidden; }
 	.covers .series .cover { isolation: isolate; }
 	.people li { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+	.tidyh { font-size: 18px; margin: 28px 0 4px; }
+	.tidy li { padding: 10px 0; border-bottom: 1px solid var(--line); }
+	.tidy .ttl { font-weight: 600; overflow-wrap: anywhere; }
+	.tidy .meta { font: 13px/1.4 var(--sans); color: var(--muted); margin-top: 2px; overflow-wrap: anywhere; }
 	.people .who { flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; }
 	.people .who b { display: block; font: 500 18px/1.25 var(--display); }
 	.people .who span { color: var(--muted); font-size: 14px; }
@@ -7557,6 +7757,11 @@ const PAGE = String.raw`<!doctype html>
 	<div id="famLink" class="famlink" hidden></div>
 	<ul id="people" class="items people"></ul>
 	<p id="famEmpty" class="empty" hidden>No one yet.</p>
+	<div id="tidyBox" hidden>
+		<h2 class="tidyh">New in Audiobookshelf</h2>
+		<p class="hint">Books added to ABS get tidied and tagged by your rules each hour. Fix anything that's wrong in ABS; the next sync brings it here.</p>
+		<ul id="tidyList" class="items tidy"></ul>
+	</div>
 </section>
 </main>
 <div id="pbar" class="pbar" hidden>
@@ -9447,6 +9652,30 @@ async function loadPeople() {
 	var data = await apiJSON("/api/people");
 	renderPeople(data.people || []);
 	showRequests(data.people || []);
+	loadTidy();
+}
+// The ABS tidy-up's log: what it changed on each new book.
+async function loadTidy() {
+	var data;
+	try { data = await apiJSON("/api/abs/tidy"); } catch (e) { return; }
+	var list = $("tidyList"), rows = data.tidied || [];
+	list.textContent = "";
+	show($("tidyBox"), data.on || rows.length > 0);
+	if (!rows.length) { list.append(h("li", "empty", data.on ? "Nothing new yet." : "")); return; }
+	rows.forEach(function (r) {
+		var c = r.changes || {}, bits = [];
+		if (c.error) bits.push("Couldn't tidy: " + c.error);
+		if (c.title || c.author) bits.push("Renamed from the file name");
+		if (c.series) bits.push("Series: " + c.series);
+		if (c.description) bits.push(c.description === "cleared" ? "Junk description cleared" : "Description from " + c.description);
+		if (c.cover) bits.push("Cover from " + c.cover);
+		if (c.tags) bits.push("Tags: " + c.tags.join(", "));
+		if (c.note) bits.push(c.note);
+		if (!bits.length) bits.push("Already tidy");
+		var li = h("li");
+		li.append(h("div", "ttl", (r.title || "Untitled") + (r.author ? " · " + r.author : "")), h("div", "meta", bits.join(" · ") + " · " + ago(r.at)));
+		list.append(li);
+	});
 }
 function personStatus(p) {
 	var bits = [];

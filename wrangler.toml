@@ -32,8 +32,10 @@ TURNSTILE_SITE_KEY = "0x4AAAAAAFrq7rE_nOxB_Qvu"
 
 # Audiobooks from Audiobookshelf (docs/setup.md, "Audiobooks"): new and
 # changed ones every 30 minutes. Does nothing until ABS_URL and ABS_TOKEN are set.
+# At :15 each hour, the ABS tidy-up (docs/setup.md, "ABS tidy-up"); does nothing
+# until ABS_EDIT_TOKEN is set too.
 [triggers]
-crons = ["*/30 * * * *"]
+crons = ["*/30 * * * *", "15 * * * *"]
 
 # Workers AI, for "Compare coverage" (docs/setup.md, Part 7). In the
 # dashboard: Settings -> Bindings -> Add binding -> Workers AI, name AI.
@@ -49,6 +51,8 @@ binding = "AI"
 #                        (Workers AI does when it isn't set).
 #   ABS_URL, ABS_TOKEN -- optional; Audiobookshelf's tunnel address and an API key
 #                         for a read-only user there (docs/setup.md, "Audiobooks")
+#   ABS_EDIT_TOKEN -- optional; an API key for an ABS user that may update (not
+#                     delete or upload), for the hourly tidy-up (docs/setup.md, "ABS tidy-up")
 #   CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET -- the Cloudflare Access service
 #                         token in front of ABS_URL
 #
