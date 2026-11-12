@@ -187,6 +187,21 @@ CREATE TABLE IF NOT EXISTS highlights (
 
 CREATE INDEX IF NOT EXISTS highlights_by_book ON highlights (book_id, start_pos);
 
+-- Bookmarks and clips in audiobooks (migration 0022): a place in the whole
+-- book in seconds, and an optional note. A clip also has end_t, running from
+-- t to end_t.
+CREATE TABLE IF NOT EXISTS audio_marks (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	book_id INTEGER NOT NULL REFERENCES books (id) ON DELETE CASCADE,
+	t REAL NOT NULL,
+	end_t REAL,
+	note TEXT,
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS audio_marks_by_book ON audio_marks (book_id, t);
+
 -- Saved "Compare coverage" digests: how several feeds covered one story.
 -- item_ids is a JSON array of the articles compared (the one it was asked
 -- from first); digest is the JSON the page shows. No foreign key, so a
