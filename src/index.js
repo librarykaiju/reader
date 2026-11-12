@@ -2724,6 +2724,15 @@ async function deleteBook(env, id) {
 // object, so the file isn't searched again. The Library list says which
 // books have one (cover: "yes"), have none ("none"), or haven't been looked
 // at (null).
+//
+// customMetadata.from says where a cover came from: "file" (the book's own
+// EPUB or comic), "abs" (Audiobookshelf's cover for the item) or "page" (a
+// PDF's first page or a cover picked on the Record, sent up by the page).
+// An ebook in the same ABS item as an audiobook (absSharesItem) never takes
+// ABS's cover, which is the audiobook's square one: it takes its file's own,
+// so the library shows the print cover and the square one stays with the
+// audiobook and its player. Kept before from was written, such an ebook's
+// cover is the audiobook's, so one without from is looked at again.
 const MAX_COVER_BYTES = 8 * 1024 * 1024;
 function coverKey(id) { return `covers/${id}`; }
 // books: id -> r2_key.
@@ -2757,33 +2766,45 @@ function coverResponse(bytes, type) {
 		},
 	});
 }
+// An ebook from Audiobookshelf whose ABS item also holds an audiobook.
+async function absSharesItem(env, book) {
+	if (!book.abs_ebook || absIssue(book)) return false;
+	return !!(await env.DB.prepare("SELECT 1 FROM books WHERE abs_id = ? AND gone_at IS NULL LIMIT 1").bind(book.abs_ebook).first());
+}
 async function bookCover(env, id) {
 	const book = await getBook(env, id);
+	const shared = await absSharesItem(env, book);
 	const stored = await env.BOOKS.get(coverKey(id));
-	if (stored && stored.customMetadata?.src === book.r2_key) {
+	if (stored && stored.customMetadata?.src === book.r2_key && !(shared && !stored.customMetadata.from)) {
 		if (!stored.size) throw new HttpError(404, "No cover");
 		return coverResponse(stored.body, stored.customMetadata.type || "image/jpeg");
 	}
 	if (stored) await stored.arrayBuffer().catch(() => {});
 	const type = bookType(book);
 	// An issue from a folder of them has its own first page, not the folder's cover.
-	const fromAbs = type === "audiobook" || (book.abs_ebook && !absIssue(book));
-	if (type !== "epub" && type !== "cbz" && !fromAbs) throw new HttpError(404, "No cover");
-	if (fromAbs) {
-		const got = await absCover(env, book);
-		if (!got) throw new HttpError(404, "No cover");
-		return coverResponse(got.img, got.kind);
+	const fromAbs = !shared && (type === "audiobook" || (book.abs_ebook && !absIssue(book)));
+	if (type !== "epub" && type !== "cbz" && !fromAbs) {
+		// A PDF sharing an item with an audiobook: the page draws its first page instead.
+		if (stored) await env.BOOKS.delete(coverKey(id));
+		throw new HttpError(404, "No cover");
 	}
+	const got = fromAbs ? await absCover(env, book) : await fileCover(env, book, type);
+	if (!got) throw new HttpError(404, "No cover");
+	return coverResponse(got.img, got.kind);
+}
+// An EPUB's or comic's own cover, kept in R2. -> {img, kind}, or null when it has none.
+async function fileCover(env, book, type) {
 	let img = null;
 	try {
 		img = await findZipCover(env, book.r2_key, book.size, type);
 	} catch (err) {
-		console.warn("cover", id, err);
+		// The home server down, or the run out of requests, isn't "no cover": try again another time.
+		if (err?.spent || (err instanceof HttpError && err.status >= 502)) throw err;
+		console.warn("cover", book.id, err);
 	}
 	const kind = img && imageType(img);
-	await env.BOOKS.put(coverKey(id), kind ? img : new Uint8Array(0), { customMetadata: { src: book.r2_key, type: kind || "" } });
-	if (!kind) throw new HttpError(404, "No cover");
-	return coverResponse(img, kind);
+	await env.BOOKS.put(coverKey(book.id), kind ? img : new Uint8Array(0), { customMetadata: { src: book.r2_key, type: kind || "", from: "file" } });
+	return kind ? { img, kind } : null;
 }
 async function putBookCover(request, env, id) {
 	const book = await getBook(env, id);
@@ -2791,7 +2812,7 @@ async function putBookCover(request, env, id) {
 	if (img.length > MAX_COVER_BYTES) throw new HttpError(413, "Cover too large");
 	const kind = imageType(img);
 	if (!kind || kind === "image/gif") throw new HttpError(415, "A cover must be a JPEG, PNG or WebP");
-	await env.BOOKS.put(coverKey(id), img, { customMetadata: { src: book.r2_key, type: kind } });
+	await env.BOOKS.put(coverKey(id), img, { customMetadata: { src: book.r2_key, type: kind, from: "page" } });
 	return json({ ok: true });
 }
 
@@ -3590,7 +3611,7 @@ async function absCover(env, book, coverPath) {
 	if (res.ok && Number(res.headers.get("Content-Length") || 0) <= MAX_COVER_BYTES) img = new Uint8Array(await res.arrayBuffer());
 	else await res.body?.cancel();
 	const kind = img && imageType(img);
-	const meta = { src: book.r2_key, type: kind || "" };
+	const meta = { src: book.r2_key, type: kind || "", from: "abs" };
 	if (coverPath !== undefined) meta.abscover = coverPath;
 	await env.BOOKS.put(coverKey(book.id), kind ? img : new Uint8Array(0), { customMetadata: meta });
 	return kind ? { img, kind } : null;
@@ -3602,31 +3623,46 @@ async function absCover(env, book, coverPath) {
 // A cover is fetched again when ABS's cover file for it changes (one added,
 // swapped or taken off), or when ABS changed the item after the cover was
 // kept, since a new cover can have the same file name. Missing ones go first.
+// An ebook sharing an item with an audiobook gets its file's own cover
+// instead (see "Covers"), and isn't fetched again when ABS changes the item.
 // coverPaths: ABS item id -> {path: its cover file ("" for none), at: its updatedAt}, from absSync.
 // -> how many were fetched.
-const ABS_COVERS_PER_RUN = 40;
+// Reading an ebook's own cover reads the ebook (whole, up to ABS_ZIP_WHOLE), so fewer of those.
+const ABS_COVERS_PER_RUN = 40, ABS_FILE_COVERS_PER_RUN = 10;
 async function absWarmCovers(env, coverPaths = new Map()) {
 	const { results } = await env.DB.prepare(
-		"SELECT id, r2_key, abs_id, abs_ebook FROM books WHERE (abs_id IS NOT NULL OR (abs_ebook IS NOT NULL AND abs_ebook NOT LIKE '%:%')) AND gone_at IS NULL ORDER BY created_at DESC, id DESC",
+		`SELECT id, r2_key, abs_id, abs_ebook, filename, type, size,
+			abs_ebook IS NOT NULL AND EXISTS (SELECT 1 FROM books a WHERE a.abs_id = books.abs_ebook AND a.gone_at IS NULL) AS shared
+		FROM books WHERE (abs_id IS NOT NULL OR (abs_ebook IS NOT NULL AND abs_ebook NOT LIKE '%:%')) AND gone_at IS NULL ORDER BY created_at DESC, id DESC`,
 	).all();
 	const stored = new Map();
 	let cursor;
 	do {
 		const page = await env.BOOKS.list({ prefix: "covers/", cursor, include: ["customMetadata"] });
-		for (const o of page.objects) stored.set(Number(o.key.slice(7)), { src: o.customMetadata?.src, abscover: o.customMetadata?.abscover, size: o.size, at: o.uploaded ? o.uploaded.getTime() : 0 });
+		for (const o of page.objects) stored.set(Number(o.key.slice(7)), { src: o.customMetadata?.src, abscover: o.customMetadata?.abscover, from: o.customMetadata?.from, size: o.size, at: o.uploaded ? o.uploaded.getTime() : 0 });
 		cursor = page.truncated ? page.cursor : null;
 	} while (cursor);
 	const missing = [], changed = [];
 	for (const b of results) {
 		const abs = coverPaths.get(b.abs_id || b.abs_ebook), path = abs?.path;
 		const have = stored.get(b.id);
-		if (!have || have.src !== b.r2_key) missing.push([b, path]);
+		if (b.shared) { if (!have || have.src !== b.r2_key || !have.from) missing.push([b, path]); }
+		else if (!have || have.src !== b.r2_key) missing.push([b, path]);
 		else if (abs && ((have.abscover !== undefined && have.abscover !== path) || abs.at > have.at)) changed.push([b, path]);
 	}
-	let n = 0;
+	let n = 0, files = 0;
 	for (const [b, path] of missing.concat(changed)) {
 		if (n >= ABS_COVERS_PER_RUN) break;
-		try { await absCover(env, b, path); } catch (err) { if (err?.spent) break; throw err; }
+		if (b.shared) {
+			const type = bookType(b);
+			// A PDF's first page is drawn by the page; a cover kept from ABS before is dropped for it.
+			if (type !== "epub" && type !== "cbz") { if (stored.has(b.id)) await env.BOOKS.delete(coverKey(b.id)); continue; }
+			if (files >= ABS_FILE_COVERS_PER_RUN) continue;
+			files++;
+			try { await fileCover(env, b, type); } catch (err) { if (err?.spent) break; throw err; }
+		} else {
+			try { await absCover(env, b, path); } catch (err) { if (err?.spent) break; throw err; }
+		}
 		n++;
 	}
 	return n;
