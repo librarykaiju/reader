@@ -10948,6 +10948,7 @@ function findListed(id) { return state.episodes.filter(function (e) { return e.i
 	audio.addEventListener("ratechange", renderPlayer);
 	$("pPlay").addEventListener("click", function () {
 		if (!player.ep) return;
+		if (player.ep.book && audio.paused) { var au = libBook(player.ep.book); if (au && readAhead(au)) return listenTo(au); }
 		if (!audio.src) return playEpisode(player.ep, true).catch(fail);
 		if (audio.paused) audio.play().catch(playFailed); else audio.pause();
 	});
@@ -11301,6 +11302,8 @@ async function listenInfo(id) {
 function playingBook(au) { return !!(player.ep && player.ep.book === au.id); }
 function audioPos(au) {
 	if (playingBook(au)) return abNow();
+	var ahead = readAhead(au);
+	if (ahead) return ahead.t;
 	var p = parsePos(au.position);
 	return (p && p.t) || 0;
 }
@@ -11313,6 +11316,8 @@ function listenLabel(au) {
 function listenTo(au, at) {
 	var audio = $("pAudio");
 	if (voice.level) voiceCtx();
+	var ahead = at == null && (!playingBook(au) || audio.paused) ? readAhead(au) : null;
+	if (ahead) { readAheadToast(au, ahead); at = ahead.t; }
 	if (at == null && playingBook(au) && player.ab && audio.src && !audio.ended) {
 		if (audio.paused) audio.play().catch(playFailed); else audio.pause();
 		return;
@@ -11407,6 +11412,178 @@ function keepListening(now, ended) {
 	var b = (state.books || []).filter(function (x) { return x.id === ep.book; })[0] || { id: ep.book };
 	setPosition(b, JSON.stringify({ t: Math.floor(t), f: ab.total ? Math.min(1, t / ab.total) : 0, at: Date.now() }), true);
 	if (ended) setFinished(b, true).then(repaintRecord, function () {});
+}
+
+// ---------- reading and listening in step
+// A book the Library has as an ebook and an audiobook (one entry, b.audio)
+// keeps one place across the two. Each still saves its own place as before
+// ({f, at} on the ebook, {t, f, at} on the audiobook); whichever was saved
+// last wins when the other one is opened. Opening the ebook after listening
+// goes to where the listening stopped; Listen after reading starts where the
+// reading stopped. A toast says so, with Undo.
+// The two are lined up by chapter: the EPUB's contents are matched to the
+// audiobook's chapters by name or number ("Chapter 7", "7. The Storm",
+// "Seven" and "VII" all match), and inside a chapter the place goes by its
+// share of the chapter's text and of its time. Between matched chapters
+// (front matter, credits, a part title) it runs in proportion. With no
+// chapters to match (a PDF, an audiobook without chapters, or fewer than two
+// matches) it goes by the share of the whole book, which is rougher.
+// While an EPUB is open the matching audiobook time is saved with the place
+// (pos.t), so Listen needs no EPUB open to find it.
+function libBook(id) { return (state.books || []).filter(function (b) { return b.id === id; })[0] || null; }
+function ebookOf(au) { var e = libEntry(au.id); return e && e !== au && e.audio && e.audio.id === au.id ? e : null; }
+var SYNC_ONES = "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen".split(" ");
+var SYNC_TENS = { twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90 };
+var SYNC_MATTER = /\b(credits?|intro|introduction|prologue|epilogue|foreword|preface|afterword|acknowledg?ments?|dedication|contents|copyright|cover|title page|about the author|notes|glossary|appendix)\b/;
+function romanNum(w) {
+	if (!/^[ivxlc]+$/.test(w)) return null;
+	var v = { i: 1, v: 5, x: 10, l: 50, c: 100 }, n = 0;
+	for (var i = 0; i < w.length; i++) n += v[w[i]] < (v[w[i + 1]] || 0) ? -v[w[i]] : v[w[i]];
+	return n > 0 && n < 400 ? n : null;
+}
+// A chapter's name -> {num: "7" or "p2" (a part, book or act), text: its
+// other words}, either of which may be null. The number after "Chapter"
+// wins over a track number before it ("03 - Chapter 2" is 2), and a name
+// like "01 - Opening Credits" has no number, so it can't pass for chapter 1.
+function chapterKey(s) {
+	var w = fold(s).replace(/[^a-z0-9]+/g, " ").trim().split(" ").filter(Boolean), toks = [];
+	for (var i = 0; i < w.length; i++) {
+		var x = w[i], n = null;
+		if (/^\d+$/.test(x)) n = parseInt(x, 10);
+		else if (SYNC_TENS[x] != null) { n = SYNC_TENS[x]; var o = SYNC_ONES.indexOf(w[i + 1]); if (o > 0 && o < 10) { n += o; i++; } }
+		else if (SYNC_ONES.indexOf(x) >= 0) n = SYNC_ONES.indexOf(x);
+		// A lone "i" is a numeral only after Chapter or Part, or as the whole name.
+		else if (x !== "i" || w.length === 1 || /^(chapter|ch|chap|part|book)$/.test(w[i - 1] || "")) n = romanNum(x);
+		toks.push({ w: x, n: n });
+	}
+	var pre = "", num = null, rest = [];
+	toks.forEach(function (t, k) {
+		var prev = toks[k - 1];
+		if (t.n != null && prev && /^(chapter|ch|chap|part|book|act|volume|vol)$/.test(prev.w) && num == null) {
+			num = t.n;
+			if (/^(part|book|act|volume|vol)$/.test(prev.w)) pre = "p";
+		}
+	});
+	if (num == null) for (var k = 0; k < Math.min(4, toks.length); k++) if (toks[k].n != null) { num = toks[k].n; break; }
+	toks.forEach(function (t) { if (t.n == null && !/^(chapter|ch|chap|part|book|act|volume|vol|the|a|an|of|and|track)$/.test(t.w)) rest.push(t.w); });
+	var text = rest.length ? rest.join(" ") : null;
+	if (text && SYNC_MATTER.test(text)) num = null;
+	return { num: num == null ? null : pre + num, text: text };
+}
+function chaptersMatch(a, b) {
+	if (a.text && b.text) return a.text === b.text && (a.num == null || b.num == null || a.num === b.num);
+	return a.num != null && a.num === b.num;
+}
+// The EPUB's chapters ([{at: character, label}], in order) and the
+// audiobook's ([{start, title}]) -> a map {anchors: [[character, seconds]],
+// chars, secs}, or null when fewer than two chapters match. Matching goes
+// forward only, each looking a few chapters ahead, so one stray match can't
+// pull the rest out of order.
+function syncMap(eps, chs, chars, secs) {
+	if (!eps.length || chs.length < 2 || !(chars > 0) || !(secs > 0)) return null;
+	var ek = eps.map(function (e) { return chapterKey(e.label); }), ak = chs.map(function (c) { return chapterKey(c.title); });
+	var pairs = [], j = 0;
+	for (var i = 0; i < eps.length && j < chs.length; i++) {
+		for (var k = j; k < Math.min(chs.length, j + 8); k++) {
+			if (chaptersMatch(ek[i], ak[k])) { pairs.push([i, k]); j = k + 1; break; }
+		}
+	}
+	if (pairs.length < 2) return null;
+	var anchors = [[0, 0]];
+	pairs.forEach(function (p) {
+		var c = eps[p[0]].at, s = chs[p[1]].start;
+		var last = anchors[anchors.length - 1];
+		if (c > last[0] && s > last[1]) anchors.push([c, s]);
+	});
+	// The end of the last matched chapter: where the next one starts in each.
+	var lp = pairs[pairs.length - 1], ec = eps[lp[0] + 1] ? eps[lp[0] + 1].at : chars, es = chs[lp[1] + 1] ? chs[lp[1] + 1].start : secs;
+	var tail = anchors[anchors.length - 1];
+	if (ec > tail[0] && es > tail[1]) anchors.push([ec, es]);
+	if (chars > anchors[anchors.length - 1][0] && secs > anchors[anchors.length - 1][1]) anchors.push([chars, secs]);
+	return anchors.length > 2 ? { anchors: anchors, chars: chars, secs: secs } : null;
+}
+// Along the anchors from one side (0: characters, 1: seconds) to the other.
+function syncAlong(map, v, from) {
+	var a = map.anchors, to = 1 - from;
+	if (v <= a[0][from]) return a[0][to];
+	for (var i = 1; i < a.length; i++) {
+		if (v <= a[i][from]) {
+			var span = a[i][from] - a[i - 1][from];
+			return a[i - 1][to] + (span > 0 ? (v - a[i - 1][from]) / span : 0) * (a[i][to] - a[i - 1][to]);
+		}
+	}
+	return a[a.length - 1][to];
+}
+// The audiobook's chapters, kept on this device too so the matching works offline.
+async function syncChapters(au) {
+	var key = "readerAbChapters:" + au.id;
+	try {
+		var d = await listenInfo(au.id), cs = (d.chapters || []).map(function (c) { return { start: c.start, title: c.title || "" }; });
+		store(key, JSON.stringify(cs));
+		return cs;
+	} catch (e) { return readJSON(key) || []; }
+}
+// The open EPUB's chapters, by where each starts in its text.
+function epubChapters(sess) {
+	var t = sess.txt, seen = {}, out = [];
+	(sess.epub.toc || []).forEach(function (x) {
+		var hit = epubTarget(t, x.to);
+		if (!hit || seen[hit.i]) return;
+		seen[hit.i] = true;
+		out.push({ at: t.starts[hit.i], label: x.label });
+	});
+	return out.sort(function (a, b) { return a.at - b.at; });
+}
+// The audiobook's latest place: {t, at} (playing: where it is now).
+function audioPlace(au) {
+	var p = parsePos(au.position) || {};
+	if (playingBook(au) && player.ab) return { t: abNow(), at: $("pAudio").paused ? Math.max(p.at || 0, player.savedAt || 0) : Date.now() };
+	return { t: p.t || 0, at: p.at || 0 };
+}
+// For an open ebook paired with an audiobook: line them up, then if the
+// listening is newer than the reading, go to it.
+async function syncOpenBook(sess) {
+	var entry = libEntry(sess.book.id), au = entry && entry === sess.book && entry.audio;
+	if (!au || !au.duration) return;
+	var map = null;
+	if (sess.epub && sess.txt) map = syncMap(epubChapters(sess), await syncChapters(au), sess.txt.total, au.duration);
+	if (!sess.alive) return;
+	sess.sync = {
+		au: au,
+		mapped: !!map,
+		toT: function (f) { return map ? syncAlong(map, f * map.chars, 0) : f * au.duration; },
+		toF: function (t) { return map ? syncAlong(map, t, 1) / map.chars : t / au.duration; }
+	};
+	// Against the place as it was saved before this opening (restoring it
+	// saves it again), and only while the reader hasn't moved on from it.
+	var heard = audioPlace(au), read = here(sess), opened = sess.start || {};
+	if (!(heard.t > 5) || heard.at <= (opened.at || 0) || au.finished_at && !playingBook(au)) return;
+	if (Math.abs((read.f || 0) - (opened.f || 0)) > 2 * screenF(sess)) return;
+	var f = clamp(sess.sync.toF(heard.t), 0, 1), was = spot(read);
+	if (Math.abs(f - (read.f || 0)) < screenF(sess)) return;
+	if (sess.pdf || sess.cbz) {
+		var n = sess.pdf ? sess.pdf.n : sess.cbz.n;
+		goToSpot(sess, { f: f, page: clamp(Math.floor(f * n) + 1, 1, n), pages: n });
+	} else goToSpot(sess, { f: f });
+	toast((map ? "Picked up where you stopped listening" : "Picked up about where you stopped listening") + ", " + hours(heard.t) + " in.", {
+		label: "Undo", fn: function () { if (session === sess) goToSpot(sess, was); }
+	});
+}
+// Where Listen should start for an audiobook whose ebook was read more
+// recently than it was listened to: {t, rough}, or null.
+function readAhead(au) {
+	var e = ebookOf(au);
+	if (!e || !au.duration) return null;
+	var r = parsePos(e.position), heard = audioPlace(au);
+	if (!r || !(r.at > heard.at) || !(r.f > 0) || e.finished_at) return null;
+	var t = r.t != null ? r.t : r.f * au.duration;
+	if (Math.abs(t - heard.t) < 20) return null;
+	return { t: clamp(t, 0, Math.max(0, au.duration - 1)), rough: r.t == null, from: heard.t };
+}
+function readAheadToast(au, ahead) {
+	toast((ahead.rough ? "Starting about where you stopped reading" : "Starting where you stopped reading") + ", " + hours(ahead.t) + " in.", {
+		label: "Undo", fn: function () { if (playingBook(au)) abSeek(ahead.from, !$("pAudio").paused); }
+	});
 }
 
 // ---------- the player page
@@ -11530,7 +11707,7 @@ function chapterStep(by) {
 	$("lpPlay").addEventListener("click", function () {
 		var lp = state.listen;
 		if (!lp) return;
-		if (!playingBook(lp.au)) return listenTo(lp.au);
+		if (!playingBook(lp.au) || (audio.paused && readAhead(lp.au))) return listenTo(lp.au);
 		if (!audio.src) return playEpisode(player.ep, true).catch(fail);
 		if (audio.paused) audio.play().catch(playFailed); else audio.pause();
 	});
@@ -13005,6 +13182,7 @@ async function openBook(id) {
 		else await openTxt(sess, parsePos(book.position) || {});
 		if (sess.alive) updateMarks(sess);
 		if (book.type === "cbz") comicDetails(sess);
+		if (sess.alive) syncOpenBook(sess).catch(function () {});
 	} catch (e) {
 		if (!sess.alive) return;
 		body.textContent = "";
@@ -13047,6 +13225,8 @@ function savePosition(sess, pos, mark) {
 	if (!far || (pos.f > far.f && pos.f - far.f <= 3 * screenF(sess))) far = spot(pos);
 	if (mark === undefined) mark = prev.mark;
 	sess.pos = Object.assign(pos, { at: Date.now(), far: far }, mark ? { mark: mark } : {});
+	// Paired with an audiobook: the matching time in it, for Listen.
+	if (sess.sync && sess.sync.mapped) pos.t = Math.floor(sess.sync.toT(pos.f || 0)); else delete pos.t;
 	sess.dirty = true;
 	setProgress(posLabel(sess, pos));
 	clearTimeout(sess.timer);
