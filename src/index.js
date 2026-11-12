@@ -9368,15 +9368,20 @@ async function loadContinue() {
 	renderContinue();
 }
 var SHELF_MAX = 12;
+// Listening counts as reading: books is the Library's entries (an ebook with
+// its audiobook as b.audio, or an audiobook on its own), and an entry goes by
+// whichever format was opened or played last.
+function shelfOpened(b) { return Math.max(b.last_opened_at || 0, (b.audio && b.audio.last_opened_at) || 0); }
+function shelfListening(b) { return isAudiobook(b) ? b : b.audio && (b.audio.last_opened_at || 0) > (b.last_opened_at || 0) ? b.audio : null; }
 function shelfBooks(books) {
-	var reading = books.filter(function (b) { return b.last_opened_at && !b.finished_at; })
-		.sort(function (a, b) { return b.last_opened_at - a.last_opened_at || b.id - a.id; });
+	var reading = books.filter(function (b) { var on = shelfListening(b) || b; return shelfOpened(b) && !on.finished_at; })
+		.sort(function (a, b) { return shelfOpened(b) - shelfOpened(a) || b.id - a.id; });
 	var series = {}, next = [];
 	books.forEach(function (b) { if (b.series) (series[fold(b.series)] = series[fold(b.series)] || []).push(b); });
 	Object.keys(series).forEach(function (k) {
 		var vols = sortBooks(series[k], "series"), last = -1, at = 0;
 		vols.forEach(function (b, i) { if (b.finished_at) { last = i; at = Math.max(at, b.finished_at); } });
-		if (last < 0 || vols.some(function (b) { return b.last_opened_at && !b.finished_at; })) return;
+		if (last < 0 || vols.some(function (b) { return shelfOpened(b) && !b.finished_at; })) return;
 		var n = vols.slice(last + 1).filter(function (b) { return !b.finished_at; })[0];
 		if (n) next.push({ book: n, at: at });
 	});
@@ -9388,7 +9393,15 @@ function shelfCard(x) {
 	var b = x.book, li = h("li"), a = h("a"), pos = parsePos(b.position), pct = pos && pos.f ? Math.round(pos.f * 100) : 0;
 	var where = x.next ? "Up next" + (b.volume ? " · Vol. " + b.volume : "")
 		: pos && b.type !== "txt" && pos.page ? "p. " + pos.page + (pos.pages ? " of " + pos.pages : "") : pct ? pct + "%" : "Started";
-	a.href = "#/book/" + b.id;
+	// Last played as an audiobook: how far through the listening is. A pair
+	// still opens the ebook, which picks up where the listening stopped.
+	var au = !x.next && shelfListening(b);
+	if (au) {
+		var t = audioPos(au);
+		pct = au.duration ? Math.min(100, Math.round(t / au.duration * 100)) : 0;
+		where = t > 5 ? "Listening · " + hours(Math.max(0, (au.duration || 0) - t)) + " left" : "Listening";
+	}
+	a.href = (isAudiobook(b) ? "#/record/" : "#/book/") + b.id;
 	a.setAttribute("aria-label", (x.next ? "Up next: " : "Continue reading: ") + b.title + ", " + where);
 	var bar = h("div", "bar-prog"), fill = h("span");
 	fill.style.width = (x.next ? 0 : pct) + "%";
@@ -9400,7 +9413,7 @@ function shelfCard(x) {
 // The shelf into box (#contShelf on Unread and All, #libShelf in the Library); hidden when empty.
 function renderShelf(box) {
 	box.textContent = "";
-	var list = shelfBooks((state.books || []).filter(function (b) { return !isAudiobook(b); }));
+	var list = shelfBooks(libEntries(state.books || []));
 	if (!list.length) { show(box, false); return false; }
 	var ul = h("ul", "shelf");
 	list.forEach(function (x) { ul.append(shelfCard(x)); });
@@ -11446,6 +11459,9 @@ function keepListening(now, ended) {
 	if (!now && Date.now() - player.savedAt < 15000) return;
 	player.savedAt = Date.now();
 	var b = (state.books || []).filter(function (x) { return x.id === ep.book; })[0] || { id: ep.book };
+	// Still listening counts as opening it (every few minutes), so it stays
+	// first on the Continue reading shelf after a pause or a stretch of reading.
+	if (Date.now() - (b.last_opened_at || 0) > 5 * 60 * 1000) { b.last_opened_at = Date.now(); queueBook(b.id, { opened: 1 }); }
 	setPosition(b, JSON.stringify({ t: Math.floor(t), f: ab.total ? Math.min(1, t / ab.total) : 0, at: Date.now() }), true);
 	if (ended) setFinished(b, true).then(repaintRecord, function () {});
 }
