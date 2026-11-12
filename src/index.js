@@ -90,6 +90,9 @@
 //   GET    /api/books/lookup?q=    Open Library's matches for a title (and author) -> {hits: [{title, author, year, thumb, work, cover_id}]}
 //   GET    /api/books/lookup/covers?work=&title=&author=&cover_id=  -> {covers: [image URLs]} (Google Books, then Open Library's editions)
 //   GET    /api/books/lookup/image?url=  one of those covers, fetched for the page (Open Library and Google Books only)
+//   GET    /api/lookup?q=&context=  a word or name selected in a book -> {"q", "dict", "wiki", "ai"}: the Free Dictionary
+//                                  API's senses, Wikipedia's summary, and (when neither knows it) Workers AI's reading
+//                                  of it from context, the passage around it; any may be null (see "Looking up a word")
 //   GET    /api/books/:id/file     the file itself (?dl=1: saving it for offline, so not "opened")
 //   GET    /api/books/:id/part?at=&len=  len bytes of the file from byte at (up to 4 MB; for drawing a PDF's cover)
 //   GET    /api/books/:id/cover    the cover image (an EPUB's or a comic's first page is found the first time); 404 if none
@@ -344,6 +347,7 @@ async function api(request, env, url) {
 	if (p === "/api/books/lookup" && m === "GET") return lookupBooks(url);
 	if (p === "/api/books/lookup/covers" && m === "GET") return lookupCovers(url);
 	if (p === "/api/books/lookup/image" && m === "GET") return lookupImage(url);
+	if (p === "/api/lookup" && m === "GET") return lookupWord(request, env, url);
 	const file = p.match(/^\/api\/books\/(\d+)\/file$/);
 	if (file && m === "GET") return bookFile(env, toId(file[1]), url.searchParams.has("dl"));
 	const part = p.match(/^\/api\/books\/(\d+)\/part$/);
@@ -2170,6 +2174,76 @@ async function lookupImage(url) {
 	const kind = img.length <= MAX_COVER_BYTES && imageType(img);
 	if (!kind) throw new HttpError(502, "That cover isn't an image");
 	return new Response(img, { headers: { "Content-Type": kind, "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" } });
+}
+
+// ---------------------------------------------------------------------------
+// Looking up a word or name selected in a book: the Free Dictionary API
+// (dictionaryapi.dev, Wiktionary's data) for words and Wikipedia's page
+// summary for names, places and phrases, both asked at once. When neither
+// knows it (a word the story made up, or a character's name) and there's an
+// AI binding, Workers AI says what it seems to mean from the passage it came
+// from, marked as a guess. No keys needed; answers are cached for a day.
+const LOOKUP_AI_MODEL = COVERAGE_AI_MODEL;
+const LOOKUP_SYSTEM = `You explain a word or name a reader selected in a book. You get the selection and the passage around it. In one or two plain sentences, say what it means as used there. If it's a person, place or thing in the story, say who or what it seems to be from the passage. If the passage doesn't make it clear, say so briefly. No preamble.`;
+async function lookupCached(u) {
+	const res = await fetch(u, { headers: { "User-Agent": LOOKUP_UA, Accept: "application/json" }, cf: { cacheTtl: 86400, cacheEverything: true } });
+	if (!res.ok) { await res.body?.cancel(); return null; }
+	return res.json();
+}
+async function lookupWord(request, env, url) {
+	const q = str(url.searchParams.get("q"), 80)?.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "").replace(/\s+/g, " ");
+	if (!q) throw new HttpError(400, "q is needed");
+	const context = str(url.searchParams.get("context"), 1200) || "";
+	const single = !/\s/.test(q);
+	const [dict, wiki] = await Promise.all([
+		single ? within(async () => dictEntry(await lookupCached("https://api.dictionaryapi.dev/api/v2/entries/en/" + encodeURIComponent(q.toLowerCase()))), null, 5000) : null,
+		within(async () => wikiSummary(await lookupCached("https://en.wikipedia.org/api/rest_v1/page/summary/" + encodeURIComponent(q.replace(/ /g, "_")) + "?redirect=true")), null, 5000),
+	]);
+	let ai = null;
+	if (!dict && (!wiki || wiki.disambiguation) && env.AI && context) {
+		ai = await within(async () => {
+			const out = await env.AI.run(LOOKUP_AI_MODEL, {
+				messages: [{ role: "system", content: LOOKUP_SYSTEM }, { role: "user", content: `Selection: ${q}\n\n<passage>\n${context}\n</passage>` }],
+				max_tokens: 160,
+				temperature: 0.2,
+			});
+			const text = str(typeof out?.response === "string" ? out.response : "", 800);
+			return text ? { text, model: LOOKUP_AI_MODEL.replace(/^@cf\/[^/]+\//, "") } : null;
+		}, null, 12000);
+	}
+	return json({ q, dict, wiki, ai });
+}
+// The dictionary's entries for a word, merged: its pronunciation, and up to
+// three senses for each part of speech.
+function dictEntry(data) {
+	if (!Array.isArray(data) || !data.length) return null;
+	const byPos = new Map();
+	let phonetic = "", audio = "";
+	for (const e of data) {
+		phonetic ||= e.phonetic || (e.phonetics || []).map((p) => p.text).find(Boolean) || "";
+		audio ||= (e.phonetics || []).map((p) => p.audio).find((a) => /^https:\/\//.test(a || "")) || "";
+		for (const m of e.meanings || []) {
+			const pos = String(m.partOfSpeech || "");
+			const list = byPos.get(pos) || [];
+			for (const d of m.definitions || []) {
+				if (list.length >= 3 || !d.definition) continue;
+				list.push({ d: String(d.definition).slice(0, 500), ex: d.example ? String(d.example).slice(0, 300) : "" });
+			}
+			byPos.set(pos, list);
+		}
+	}
+	const meanings = [...byPos].filter(([, defs]) => defs.length).slice(0, 4).map(([pos, defs]) => ({ pos, defs }));
+	return meanings.length ? { word: String(data[0].word || ""), phonetic, audio, meanings } : null;
+}
+function wikiSummary(d) {
+	if (!d || !d.title || !d.extract || !/^(standard|disambiguation)$/.test(d.type)) return null;
+	return {
+		title: String(d.title),
+		description: d.description ? String(d.description).slice(0, 200) : "",
+		extract: String(d.extract).slice(0, 1500),
+		url: d.content_urls?.desktop?.page || `https://en.wikipedia.org/wiki/${encodeURIComponent(d.title.replace(/ /g, "_"))}`,
+		disambiguation: d.type === "disambiguation",
+	};
 }
 
 // A piece of a book's file, so the page can draw a PDF's first page without
@@ -6819,6 +6893,17 @@ const PAGE = String.raw`<!doctype html>
 	.hlq { font: 15px/1.4 var(--serif); display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; line-clamp: 4; overflow: hidden; border-left: 3px solid var(--hl-edge); padding-left: 8px; }
 	.hln { font-size: 14px; }
 	.hlm { font-size: 13px; color: var(--bad); }
+	.lookbody { font: 15px/1.45 var(--serif); overflow-wrap: anywhere; }
+	.lookbody p { margin: 0 0 8px; }
+	.lookph { color: var(--muted); font-family: var(--sans); font-size: 14px; }
+	.lookpos { font: italic 13px/1.3 var(--sans); color: var(--muted); margin: 10px 0 4px !important; }
+	.lookdefs { margin: 0 0 6px; padding-left: 22px; }
+	.lookdefs li + li { margin-top: 4px; }
+	.lookex { display: block; color: var(--muted); font-style: italic; }
+	.lookwiki { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 2px; }
+	.lookwiki:first-child { border-top: 0; margin-top: 0; }
+	.lookt { font-weight: 600; }
+	.lookwiki a { font-family: var(--sans); font-size: 14px; }
 	.findform { margin-bottom: 4px; }
 	.findq { font: 15px/1.4 var(--serif); overflow-wrap: anywhere; }
 	.findq mark { background: var(--hl); color: inherit; border-radius: 2px; }
@@ -7610,6 +7695,15 @@ const PAGE = String.raw`<!doctype html>
 <div id="hlBar" class="hlbar" hidden>
 	<button id="hlAdd" class="btn primary" type="button">Highlight</button>
 	<button id="hlNote" class="btn" type="button">Add note</button>
+	<button id="hlLook" class="btn" type="button" hidden>Look up</button>
+</div>
+<div id="lookPop" class="pop hlpop" role="dialog" aria-labelledby="lookWord" hidden>
+	<h2 id="lookWord"></h2>
+	<div id="lookBody" class="lookbody" aria-live="polite"></div>
+	<div class="hlrow">
+		<span></span>
+		<button id="lookClose" class="btn ghost" type="button">Close</button>
+	</div>
 </div>
 <div id="hlPop" class="pop hlpop" role="dialog" aria-label="Highlight" hidden>
 	<h2>Highlight</h2>
@@ -13751,10 +13845,10 @@ function hlSelection(sess) {
 }
 function hlWire(sess) {
 	var bar = $("hlBar"), hideTimer = null;
-	sess.cleanup.push(function () { show(bar, false); showHlPop(false); showHlList(false); });
+	sess.cleanup.push(function () { show(bar, false); showHlPop(false); showHlList(false); showLook(false); });
 	listen(sess, document, "selectionchange", function () {
 		var s = hlSelection(sess);
-		if (s) { clearTimeout(hideTimer); sess.hl.sel = s; show(bar, true); return; }
+		if (s) { clearTimeout(hideTimer); sess.hl.sel = s; show($("hlLook"), lookable(s.text)); show(bar, true); return; }
 		// Tapping the bar can clear the selection a moment before the tap lands.
 		clearTimeout(hideTimer);
 		hideTimer = setTimeout(function () { sess.hl.sel = null; show(bar, false); }, 400);
@@ -13838,6 +13932,109 @@ function hlRenumber(book, from, to) {
 	if (session && session.id === book) { cacheHl(session); hlRender(session); } else store(hlKey(book), JSON.stringify(list));
 }
 window.addEventListener("online", function () { if (hlPending.length && token()) flushHl().catch(function () {}); });
+
+// ---------- looking up a word
+// A short selection (a word, a name, a few words) also gets Look up on the
+// bar: the dictionary's senses, Wikipedia's summary, and when neither knows
+// it, Workers AI's guess from the paragraph it's in (/api/lookup). Answers
+// are kept for as long as the page is open.
+
+var lookCache = {};
+function lookable(text) {
+	return text.length <= 60 && text.split(/\s+/).length <= 4 && /[\p{L}]/u.test(text);
+}
+function showLook(on) { show($("lookPop"), on); }
+$("hlLook").addEventListener("pointerdown", function (e) { e.preventDefault(); });
+$("hlLook").addEventListener("mousedown", function (e) { e.preventDefault(); });
+$("hlLook").addEventListener("click", function (e) {
+	e.stopPropagation();
+	var sess = session;
+	if (!sess || !sess.hl || !sess.hl.sel) return;
+	var s = sess.hl.sel, t = sess.txt, para = t.paras[paraAt(t, s.start_pos)] || "";
+	var at = s.start_pos - t.starts[paraAt(t, s.start_pos)], from = Math.max(0, at - 500);
+	var context = para.slice(from, at + s.text.length + 500);
+	var sel = window.getSelection();
+	if (sel) sel.removeAllRanges();
+	sess.hl.sel = null;
+	show($("hlBar"), false);
+	lookUp(s.text.replace(/\s+/g, " "), context);
+});
+async function lookUp(q, context) {
+	var body = $("lookBody");
+	showHlPop(false);
+	showHlList(false);
+	openBookMenu(false);
+	$("lookWord").textContent = q;
+	body.textContent = "";
+	showLook(true);
+	var key = q.toLowerCase(), data = lookCache[key];
+	if (!data) {
+		if (state.libOffline || navigator.onLine === false) { body.append(h("p", "hint", "Look up needs a connection.")); return; }
+		body.append(h("p", "hint", "Looking it up…"));
+		try {
+			data = await apiJSON("/api/lookup?" + new URLSearchParams({ q: q, context: context || "" }));
+		} catch (e) {
+			if ($("lookWord").textContent !== q) return;
+			body.textContent = "";
+			body.append(h("p", "hint", e.message === UNAUTH ? "" : "Couldn't look it up: " + e.message));
+			return;
+		}
+		// Only keep a guess from context for this passage, not for the word.
+		if (!data.ai) lookCache[key] = data;
+	}
+	if ($("lookWord").textContent !== q || $("lookPop").hidden) return;
+	body.textContent = "";
+	lookRender(body, data);
+}
+function lookRender(body, data) {
+	var d = data.dict, w = data.wiki;
+	if (d) {
+		var head = h("p", "lookph");
+		if (d.word && d.word.toLowerCase() !== data.q.toLowerCase()) head.append(h("b", null, d.word + " "));
+		if (d.phonetic) head.append(d.phonetic + " ");
+		if (d.audio) {
+			head.append(button("▶", "btn ghost small", function () { new Audio(d.audio).play().catch(function () {}); }));
+			head.lastChild.setAttribute("aria-label", "Say it");
+		}
+		if (head.childNodes.length) body.append(head);
+		d.meanings.forEach(function (m) {
+			if (m.pos) body.append(h("p", "lookpos", m.pos));
+			var ol = h("ol", "lookdefs");
+			m.defs.forEach(function (x) {
+				var li = h("li", null, x.d);
+				if (x.ex) li.append(h("span", "lookex", "“" + x.ex + "”"));
+				ol.append(li);
+			});
+			body.append(ol);
+		});
+	}
+	if (w && !(w.disambiguation && d)) {
+		var box = h("div", "lookwiki");
+		box.append(h("p", "lookpos", "Wikipedia" + (w.description ? " · " + w.description : "")));
+		if (w.title.toLowerCase() !== data.q.toLowerCase()) box.append(h("p", "lookt", w.title));
+		box.append(h("p", null, w.disambiguation ? "Several pages go by this name." : w.extract));
+		var a = h("a", null, w.disambiguation ? "See them on Wikipedia" : "Read more on Wikipedia");
+		a.href = w.url;
+		a.target = "_blank";
+		a.rel = "noopener";
+		box.append(a);
+		body.append(box);
+	}
+	if (data.ai) {
+		var g = h("div", "lookwiki");
+		g.append(h("p", "lookpos", "From the passage (a guess by " + data.ai.model + ")"), h("p", null, data.ai.text));
+		body.append(g);
+	}
+	if (!d && !w && !data.ai) {
+		body.append(h("p", "hint", "Nothing found for “" + data.q + "”."));
+		var s = h("a", null, "Search Wiktionary");
+		s.href = "https://en.wiktionary.org/w/index.php?search=" + encodeURIComponent(data.q);
+		s.target = "_blank";
+		s.rel = "noopener";
+		body.append(s);
+	}
+}
+$("lookClose").addEventListener("click", function () { showLook(false); });
 
 // The panel for one highlight: its words, its note, Delete.
 var hlPop = { x: null };
@@ -13950,6 +14147,7 @@ $("bmHighlights").addEventListener("click", function (e) { e.stopPropagation(); 
 document.addEventListener("click", function (e) {
 	if (!$("hlPop").hidden && !$("hlPop").contains(e.target)) showHlPop(false);
 	if (!$("hlList").hidden && !$("hlList").contains(e.target)) showHlList(false);
+	if (!$("lookPop").hidden && !$("lookPop").contains(e.target)) showLook(false);
 });
 
 // ---------- search in a book
