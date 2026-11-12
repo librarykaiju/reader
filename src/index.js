@@ -7060,6 +7060,14 @@ const PAGE = String.raw`<!doctype html>
 	.hlbar { position: fixed; z-index: 16; left: 50%; transform: translateX(-50%); bottom: calc(16px + env(safe-area-inset-bottom) + var(--lost, 0px)); display: flex; gap: 8px;
 		background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 8px; box-shadow: 0 6px 20px rgba(0,0,0,.18); font-family: var(--sans); }
 	body.has-pbar .hlbar { bottom: calc(106px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
+	.ttsbar { align-items: center; padding: 6px; }
+	.ttsbar .btn { min-width: 44px; min-height: 44px; font-variant-numeric: tabular-nums; }
+	.ttsbar svg { width: 20px; height: 20px; fill: currentColor; display: block; margin: auto; }
+	body.has-tts { padding-bottom: calc(90px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
+	body.has-tts .hlbar:not(.ttsbar) { bottom: calc(84px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
+	body.has-tts.has-pbar .hlbar:not(.ttsbar) { bottom: calc(174px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
+	.speaking { background: var(--sel); box-shadow: 0 0 0 6px var(--sel); border-radius: 2px; }
+	#ttsVoice { width: 100%; }
 	.hlpop { font-family: var(--sans); width: min(400px, calc(100vw - 32px)); max-height: calc(100vh - 90px - env(safe-area-inset-top)); overflow: auto; }
 	.hlquote { margin: 0 0 10px; padding: 2px 0 2px 10px; border-left: 3px solid var(--hl-edge); font: 15px/1.45 var(--serif); white-space: pre-line; overflow-wrap: anywhere; }
 	.hlpop textarea { width: 100%; box-sizing: border-box; font: 15px/1.4 var(--sans); padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); resize: vertical; }
@@ -7636,6 +7644,10 @@ const PAGE = String.raw`<!doctype html>
 		<button type="button" data-font="serif">System serif</button>
 		<button type="button" data-font="fraunces" class="fraunces">Fraunces</button>
 	</div>
+	<div id="ttsVoiceBox" hidden>
+		<h2><label for="ttsVoice">Read aloud voice</label></h2>
+		<select id="ttsVoice"></select>
+	</div>
 	<h2>Mark read as I scroll</h2>
 	<div class="seg" id="scrollRead">
 		<button type="button" data-on="">Off</button>
@@ -7658,6 +7670,7 @@ const PAGE = String.raw`<!doctype html>
 		<button id="bmUnmark" class="btn" type="button" hidden>Remove bookmark</button>
 		<button id="bmContents" class="btn" type="button" hidden>Contents</button>
 		<button id="bmFind" class="btn" type="button" hidden>Search in book</button>
+		<button id="bmAloud" class="btn" type="button" hidden>Read aloud</button>
 		<button id="bmHighlights" class="btn" type="button" hidden>Highlights</button>
 		<div id="bmLayout" class="seg" role="group" aria-label="Layout" hidden>
 			<button type="button" data-layout="pages">Pages</button>
@@ -7716,6 +7729,7 @@ const PAGE = String.raw`<!doctype html>
 			<button id="aSave" class="btn small" type="button">Save</button>
 			<button id="aRead" class="btn small" type="button">Mark unread</button>
 			<button id="aShare" class="btn small" type="button">Share</button>
+			<button id="aAloud" class="btn small" type="button" aria-pressed="false">Read aloud</button>
 			<a id="aLink" class="btn small" target="_blank" rel="noopener noreferrer">Original &#8599;</a>
 		</div>
 		<div id="aEpisode" class="episode" hidden></div>
@@ -7939,6 +7953,13 @@ const PAGE = String.raw`<!doctype html>
 		<span></span>
 		<button id="lookClose" class="btn ghost" type="button">Close</button>
 	</div>
+</div>
+<div id="ttsBar" class="hlbar ttsbar" role="group" aria-label="Read aloud" hidden>
+	<button id="ttsPrev" class="btn ghost" type="button" aria-label="Previous paragraph"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h2.2v14H6zM19 5v14L9.5 12z"/></svg></button>
+	<button id="ttsPlay" class="btn primary" type="button" aria-label="Pause">&#10074;&#10074;</button>
+	<button id="ttsNext" class="btn ghost" type="button" aria-label="Next paragraph"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.8 5H18v14h-2.2zM5 5v14l9.5-7z"/></svg></button>
+	<button id="ttsRate" class="btn ghost" type="button" aria-label="Reading speed">1&times;</button>
+	<button id="ttsClose" class="btn ghost" type="button" aria-label="Stop reading aloud">&times;</button>
 </div>
 <div id="hlPop" class="pop hlpop" role="dialog" aria-label="Highlight" hidden>
 	<h2>Highlight</h2>
@@ -9640,6 +9661,7 @@ async function route() {
 	state.route = r;
 	videoBox.close();
 	closeBook();
+	ttsStop();
 	openSettings(false);
 	openBookMenu(false);
 	if (details) closeDetails();
@@ -13859,6 +13881,7 @@ function renderBookMenu() {
 	show($("bmContents"), b.type === "epub" && !!(session.epub && session.epub.toc.length));
 	show($("bmHighlights"), b.type === "txt" || b.type === "epub");
 	show($("bmFind"), b.type === "txt" || b.type === "epub" || b.type === "pdf");
+	show($("bmAloud"), (b.type === "txt" || b.type === "epub") && !!session.txt && ttsOK());
 	$("bmHighlights").textContent = n ? "Highlights (" + n + ")" : "Highlights";
 	show($("bmLayout"), b.type === "cbz" && !!session.cbz);
 	[].forEach.call($("bmLayout").children, function (x) { x.setAttribute("aria-pressed", String(x.dataset.layout === (b.layout || "pages"))); });
@@ -14619,6 +14642,219 @@ document.addEventListener("click", function (e) {
 	if (!$("hlPop").hidden && !$("hlPop").contains(e.target)) showHlPop(false);
 	if (!$("hlList").hidden && !$("hlList").contains(e.target)) showHlList(false);
 	if (!$("lookPop").hidden && !$("lookPop").contains(e.target)) showLook(false);
+});
+
+// ---------- read aloud
+// Read aloud (⋯ in a .txt or .epub book, or on an article) speaks the
+// text with the device's own voices (speechSynthesis), from the paragraph at
+// the top of the screen. The paragraph being read is tinted and kept in view
+// unless you've scrolled away from it. It goes a sentence at a time, since
+// some browsers cut off long utterances, and pausing cancels and remembers
+// the sentence, since pause() and resume() are unreliable on phones. The
+// voice (Settings) and speed are kept per device. It stops when you leave
+// the page.
+
+var TTS_RATES = [0.8, 1, 1.2, 1.5, 1.75, 2];
+var tts = { src: null, i: 0, k: 0, pieces: null, on: false, run: 0, el: null,
+	rate: TTS_RATES.indexOf(Number(read("readerTtsRate"))) >= 0 ? Number(read("readerTtsRate")) : 1 };
+function ttsOK() { return "speechSynthesis" in window && typeof SpeechSynthesisUtterance === "function"; }
+// A paragraph cut into sentences, joined back up to about 220 characters.
+function ttsPieces(text) {
+	var s = text.replace(/\s+/g, " ").trim(), out = [], parts;
+	if (!s) return out;
+	if (window.Intl && Intl.Segmenter) parts = Array.from(new Intl.Segmenter(undefined, { granularity: "sentence" }).segment(s), function (x) { return x.segment; });
+	else parts = s.match(/[^.!?…]+[.!?…]+["'”’)\]]*\s*|[^.!?…]+$/g) || [s];
+	parts.forEach(function (p) {
+		// A run-on "sentence" is cut at commas or spaces.
+		while (p.length > 300) {
+			var cut = p.lastIndexOf(", ", 220);
+			if (cut < 80) cut = p.lastIndexOf(" ", 220);
+			if (cut < 80) cut = 220;
+			out.push(p.slice(0, cut + 1));
+			p = p.slice(cut + 1);
+		}
+		var last = out[out.length - 1];
+		if (last != null && last.length + p.length <= 220) out[out.length - 1] = last + p; else out.push(p);
+	});
+	return out.map(function (x) { return x.trim(); }).filter(function (x) { return /[\p{L}\p{N}]/u.test(x); });
+}
+function ttsVoice() {
+	var want = read("readerTtsVoice"), vs = speechSynthesis.getVoices();
+	return vs.filter(function (v) { return v.voiceURI === want; })[0] || null;
+}
+// src: {count, text(i), el(i), start, follow(el)}.
+function ttsStart(src) {
+	if (!ttsOK()) { toast("This browser can't read aloud."); return; }
+	ttsStop();
+	if (!$("pAudio").paused) $("pAudio").pause();
+	tts.src = src;
+	tts.i = src.start;
+	tts.k = 0;
+	tts.pieces = null;
+	document.body.classList.add("has-tts");
+	show($("ttsBar"), true);
+	ttsPlay();
+}
+function ttsPlay() {
+	var src = tts.src;
+	if (!src) return;
+	tts.on = true;
+	var run = ++tts.run;
+	speechSynthesis.cancel();
+	// Past empty paragraphs (an EPUB's pictures) to one with words.
+	while (!tts.pieces || tts.k >= tts.pieces.length) {
+		if (tts.pieces) { tts.i++; tts.k = 0; }
+		if (tts.i >= src.count) { ttsStop(); toast("Finished reading aloud."); return; }
+		tts.pieces = ttsPieces(src.text(tts.i));
+		if (!tts.pieces.length) tts.pieces = null, tts.i++;
+		if (tts.i >= src.count) { ttsStop(); toast("Finished reading aloud."); return; }
+	}
+	ttsMark();
+	var u = new SpeechSynthesisUtterance(tts.pieces[tts.k]), v = ttsVoice();
+	if (v) { u.voice = v; u.lang = v.lang; } else u.lang = document.documentElement.lang || navigator.language || "en";
+	u.rate = tts.rate;
+	u.onend = function () {
+		if (run !== tts.run || !tts.on) return;
+		tts.k++;
+		ttsPlay();
+	};
+	u.onerror = function (e) {
+		if (run !== tts.run || e.error === "interrupted" || e.error === "canceled") return;
+		tts.on = false;
+		ttsPaint();
+		toast("Reading aloud stopped: " + (e.error || "the voice failed") + ".");
+	};
+	speechSynthesis.speak(u);
+	ttsPaint();
+}
+function ttsPause() {
+	tts.on = false;
+	tts.run++;
+	speechSynthesis.cancel();
+	ttsPaint();
+}
+function ttsStop() {
+	if (!tts.src) return;
+	tts.run++;
+	tts.on = false;
+	if (ttsOK()) speechSynthesis.cancel();
+	if (tts.el) tts.el.classList.remove("speaking");
+	tts.el = tts.src = tts.pieces = null;
+	document.body.classList.remove("has-tts");
+	show($("ttsBar"), false);
+	$("aAloud").setAttribute("aria-pressed", "false");
+}
+// Tint the paragraph being read; bring it into view when the one before was
+// on screen (so scrolling away to look at something isn't undone).
+function ttsMark() {
+	var el = tts.src.el(tts.i);
+	if (el === tts.el) return;
+	var was = tts.el, follow = !was || onScreen(was);
+	if (was) was.classList.remove("speaking");
+	tts.el = el;
+	if (!el) return;
+	el.classList.add("speaking");
+	if (follow && !onScreen(el, true)) tts.src.follow(el);
+}
+function onScreen(el, whole) {
+	var r = el.getBoundingClientRect(), top = headerBottom(), bottom = window.innerHeight - 90;
+	return whole ? r.top >= top && r.top < bottom - 40 : r.bottom > top && r.top < bottom;
+}
+function ttsPaint() {
+	$("aAloud").setAttribute("aria-pressed", "true");
+	$("ttsPlay").innerHTML = tts.on ? "&#10074;&#10074;" : "&#9654;";
+	$("ttsPlay").setAttribute("aria-label", tts.on ? "Pause" : "Play");
+	$("ttsRate").textContent = tts.rate + "×";
+}
+function ttsStep(by) {
+	if (!tts.src) return;
+	// Back: to this paragraph's start, or the one before when it's only just begun.
+	if (by < 0 && tts.k > 0) tts.k = 0;
+	else tts.i = clamp(tts.i + by, 0, tts.src.count - 1), tts.k = 0;
+	tts.pieces = null;
+	tts.pieces = ttsPieces(tts.src.text(tts.i));
+	if (!tts.pieces.length) tts.pieces = null;
+	if (tts.on) ttsPlay(); else ttsMark();
+}
+$("ttsPlay").addEventListener("click", function () { if (tts.on) ttsPause(); else ttsPlay(); });
+$("ttsPrev").addEventListener("click", function () { ttsStep(-1); });
+$("ttsNext").addEventListener("click", function () { ttsStep(1); });
+$("ttsClose").addEventListener("click", ttsStop);
+$("ttsRate").addEventListener("click", function () {
+	tts.rate = TTS_RATES[(TTS_RATES.indexOf(tts.rate) + 1) % TTS_RATES.length];
+	store("readerTtsRate", String(tts.rate));
+	ttsPaint();
+	// The new speed starts with the sentence being read.
+	if (tts.on) ttsPlay();
+});
+// The audiobook or a podcast starting stops it.
+$("pAudio").addEventListener("play", function () { if (tts.on) ttsPause(); });
+
+// The open book, from the paragraph at the top of the screen.
+function readBookAloud() {
+	var sess = session, t = sess && sess.txt;
+	openBookMenu(false);
+	if (!t || !t.paras.length) return;
+	ttsStart({
+		count: t.paras.length,
+		start: paraAt(t, txtFraction(t) * t.total),
+		text: function (i) { return t.paras[i]; },
+		el: function (i) { return paraEl(t, i); },
+		follow: function (el) {
+			aim(sess, function () { return window.scrollY + el.getBoundingClientRect().top - headerBottom() - window.innerHeight * 0.2; }, sess.track);
+		},
+	});
+}
+// The open article: its title, then each paragraph, heading, list item and
+// quote in its text.
+function readArticleAloud() {
+	var blocks = [$("aTitle")].concat([].slice.call($("aBody").querySelectorAll("p, h1, h2, h3, h4, h5, h6, li, blockquote, pre, figcaption")).filter(function (el) {
+		// Only the innermost: a <li> or <blockquote> holding paragraphs is read through them.
+		return !el.querySelector("p, h1, h2, h3, h4, h5, h6, li, blockquote, pre");
+	}));
+	if (blocks.length < 2) { toast("There's no text here to read."); return; }
+	var top = headerBottom(), start = 0;
+	blocks.some(function (el, i) { if (el.getBoundingClientRect().bottom > top + 1) { start = i; return true; } return false; });
+	ttsStart({
+		count: blocks.length,
+		start: start,
+		text: function (i) { return blocks[i].textContent; },
+		el: function (i) { return blocks[i]; },
+		follow: function (el) { window.scrollTo({ top: window.scrollY + el.getBoundingClientRect().top - top - window.innerHeight * 0.2, behavior: "smooth" }); },
+	});
+}
+$("bmAloud").addEventListener("click", function (e) { e.stopPropagation(); readBookAloud(); });
+$("aAloud").addEventListener("click", function () { if (tts.src) ttsStop(); else readArticleAloud(); });
+
+// Settings: the voice, from the device's own, this page's language first.
+function ttsVoices() {
+	var sel = $("ttsVoice");
+	if (!ttsOK()) { show($("ttsVoiceBox"), false); return; }
+	var vs = speechSynthesis.getVoices(), lang = (navigator.language || "en").slice(0, 2).toLowerCase(), want = read("readerTtsVoice") || "";
+	show($("ttsVoiceBox"), vs.length > 0);
+	if (!vs.length) return;
+	vs = vs.slice().sort(function (a, b) {
+		var la = a.lang.slice(0, 2).toLowerCase() === lang ? 0 : 1, lb = b.lang.slice(0, 2).toLowerCase() === lang ? 0 : 1;
+		return la - lb || a.lang.localeCompare(b.lang) || a.name.localeCompare(b.name);
+	});
+	sel.textContent = "";
+	var def = h("option", null, "Device default");
+	def.value = "";
+	sel.append(def);
+	vs.forEach(function (v) {
+		var o = h("option", null, v.name + " (" + v.lang + ")");
+		o.value = v.voiceURI;
+		sel.append(o);
+	});
+	sel.value = vs.some(function (v) { return v.voiceURI === want; }) ? want : "";
+}
+if (ttsOK()) {
+	ttsVoices();
+	speechSynthesis.addEventListener("voiceschanged", ttsVoices);
+} else show($("ttsVoiceBox"), false);
+$("ttsVoice").addEventListener("change", function () {
+	store("readerTtsVoice", this.value || null);
+	if (tts.on) ttsPlay();
 });
 
 // ---------- search in a book
