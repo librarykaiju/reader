@@ -110,6 +110,10 @@
 //   POST   /api/books/:id/highlights {start_pos, end_pos, text, note?} -> {"highlight"}
 //   PATCH  /api/highlights/:id     {note?, start_pos?, end_pos?} (note null or "" = no note)
 //   DELETE /api/highlights/:id
+//   GET    /api/books/:id/marks    an audiobook's bookmarks and clips -> {"marks": [{id, t, end_t, note, ...}]}, in order
+//   POST   /api/books/:id/marks    {t, end_t?, note?} -> {"mark"} (t: seconds into the whole book; end_t: a clip's end)
+//   PATCH  /api/marks/:id          {note?, t?, end_t?}
+//   DELETE /api/marks/:id
 //   GET    /api/people             -> {"people": [...each with signed_in, invite_expires_at, last_seen_at, downloads,
 //                                  requested_at, request_note and request_email (a library card request not yet answered)]}
 //   POST   /api/people             {name} -> {"person", "code"}: a new family member and their invite code
@@ -372,6 +376,15 @@ async function api(request, env, url) {
 	if ((id = matchId(p, "/api/highlights/"))) {
 		if (m === "PATCH") return updateHighlight(request, env, id);
 		if (m === "DELETE") return deleteHighlight(env, id);
+	}
+	const marks = p.match(/^\/api\/books\/(\d+)\/marks$/);
+	if (marks) {
+		if (m === "GET") return listMarks(env, toId(marks[1]));
+		if (m === "POST") return addMark(request, env, toId(marks[1]));
+	}
+	if ((id = matchId(p, "/api/marks/"))) {
+		if (m === "PATCH") return updateMark(request, env, id);
+		if (m === "DELETE") return deleteMark(env, id);
 	}
 
 	if (p === "/api/people") {
@@ -3022,6 +3035,61 @@ async function deleteHighlight(env, id) {
 	return json({ ok: true });
 }
 
+// Bookmarks and clips in audiobooks (migration 0022): t is seconds into the
+// whole book; a clip runs from t to end_t. Only the owner's: the family
+// library keeps its own on each device.
+const MARK_COLUMNS = "id, book_id, t, end_t, note, created_at, updated_at";
+const MAX_CLIP_SECONDS = 600;
+function markSpan(body, book) {
+	const t = body.t, end = body.end_t ?? null;
+	if (typeof t !== "number" || !Number.isFinite(t) || t < 0) throw new HttpError(400, "t must be a time in seconds");
+	if (end !== null && (typeof end !== "number" || !Number.isFinite(end) || end <= t || end - t > MAX_CLIP_SECONDS)) {
+		throw new HttpError(400, `end_t must come after t, at most ${MAX_CLIP_SECONDS / 60} minutes on`);
+	}
+	const most = book?.duration || Infinity;
+	return [Math.min(t, most), end === null ? null : Math.min(end, most)];
+}
+async function listMarks(env, bookId) {
+	const { results } = await env.DB.prepare(`SELECT ${MARK_COLUMNS} FROM audio_marks WHERE book_id = ? ORDER BY t, id`).bind(bookId).all();
+	return json({ marks: results });
+}
+async function addMark(request, env, bookId) {
+	const body = await readJSON(request);
+	const book = await getBook(env, bookId);
+	if (bookType(book) !== "audiobook") throw new HttpError(400, "Bookmarks here are for audiobooks");
+	const [t, end] = markSpan(body, book);
+	const now = Date.now();
+	const mark = await env.DB.prepare(
+		`INSERT INTO audio_marks (book_id, t, end_t, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING ${MARK_COLUMNS}`,
+	)
+		.bind(bookId, t, end, noteOf(body.note), now, now)
+		.first();
+	return json({ mark });
+}
+async function updateMark(request, env, id) {
+	const body = await readJSON(request);
+	const sets = [], params = [];
+	if (body.note !== undefined) {
+		sets.push("note = ?");
+		params.push(noteOf(body.note));
+	}
+	if (body.t !== undefined || body.end_t !== undefined) {
+		sets.push("t = ?", "end_t = ?");
+		params.push(...markSpan(body, null));
+	}
+	if (!sets.length) throw new HttpError(400, "Nothing to change");
+	const mark = await env.DB.prepare(`UPDATE audio_marks SET ${sets.join(", ")}, updated_at = ? WHERE id = ? RETURNING ${MARK_COLUMNS}`)
+		.bind(...params, Date.now(), id)
+		.first();
+	if (!mark) throw new HttpError(404, "No such bookmark");
+	return json({ mark });
+}
+async function deleteMark(env, id) {
+	const del = await env.DB.prepare("DELETE FROM audio_marks WHERE id = ?").bind(id).run();
+	if (!del.meta.changes) throw new HttpError(404, "No such bookmark");
+	return json({ ok: true });
+}
+
 // ---------------------------------------------------------------------------
 // Family library. Family members browse the Library and download books;
 // nothing else of the owner's (feeds, places, highlights, Edit details) is
@@ -4836,6 +4904,17 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.chapters button { appearance: none; display: flex; width: 100%; justify-content: space-between; gap: 12px; border: 0; background: transparent; color: inherit; padding: 10px 14px; text-align: left; font: inherit; font-size: 15px; cursor: pointer; }
 	.chapters button[aria-current=true] { background: var(--sel); color: var(--accent); font-weight: 600; }
 	.chapters .chtime { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+	.marks .markrow { display: flex; align-items: stretch; }
+	.marks .markgo { flex: 1; min-width: 0; flex-direction: column; justify-content: flex-start; gap: 2px; }
+	.marktop { display: flex; justify-content: space-between; gap: 12px; width: 100%; }
+	.marknote { color: var(--muted); font-size: 14px; white-space: pre-line; overflow-wrap: anywhere; }
+	.marks .markedit { flex: none; width: 44px; justify-content: center; color: var(--accent); }
+	.markdlg textarea { width: 100%; box-sizing: border-box; margin-top: 10px; font: inherit; font-size: 15px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); resize: vertical; }
+	.markdlg .lpsleep button[aria-pressed=true] { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+	.markdlg .markrowbtns { justify-content: space-between; }
+	.markdlg .markrowbtns .danger { color: #a33; }
+	.markdlg .markrowbtns .primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+	.markat { margin: 10px 0 0; font-variant-numeric: tabular-nums; }
 	/* The chapter picker over the page. */
 	.chapdlg { width: min(480px, calc(100vw - 32px)); max-height: min(560px, calc(100vh - 80px)); padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); color: var(--fg); box-shadow: 0 10px 30px rgba(0,0,0,.25); }
 	.chapdlg[open] { display: flex; flex-direction: column; }
@@ -5972,8 +6051,105 @@ function previewAudio(sess, b, d) {
 		voiceBtn.classList.toggle("on", voice.level > 0);
 	};
 	paintVoice();
+	// Bookmarks and clips, kept on this device like the place: Bookmark marks
+	// the place playing at once, the list under the player plays from one,
+	// and its ✎ opens it for a note or Clip (the last 15, 30 or 60 seconds up
+	// to that place, which plays and then pauses at its end).
+	var markKey = "marks:" + b.id, clipStop = null, markOpen = null;
+	var marks = (function () { try { return JSON.parse(read(markKey) || "[]") || []; } catch (e) { return []; } })();
+	var saveMarks = function () { store(markKey, JSON.stringify(marks)); };
+	var markLabel = function (m) { return clock(m.t) + (m.end_t != null ? "–" + clock(m.end_t) : ""); };
+	var markBtn = btn("small", "Bookmark", null, function () {
+		var t = Math.floor(now() * 10) / 10;
+		marks.push({ id: Date.now(), t: t, end_t: null, note: null, created_at: Date.now() });
+		saveMarks();
+		paintMarks();
+		markBtn.textContent = "Bookmarked " + clock(t);
+		clearTimeout(markBtn.timer);
+		markBtn.timer = setTimeout(function () { markBtn.textContent = "Bookmark"; }, 2500);
+	});
+	var markSec = h("section", "lpchaps marksec"), markList = h("ol", "chapters marks");
+	markSec.append(h("h2", null, "Bookmarks"), markList);
+	var paintMarks = function () {
+		markList.textContent = "";
+		marks.sort(function (x, y) { return x.t - y.t || x.id - y.id; }).forEach(function (m) {
+			var li = h("li", "markrow"), go = h("button", "markgo"), top = h("span", "marktop"), ci = chapterAt(m.end_t != null ? m.end_t : m.t).i, c = chapters[ci];
+			go.type = "button";
+			top.append(h("span", null, (m.end_t != null ? "Clip · " : "") + (c ? c.title || "Chapter " + (ci + 1) : "Bookmark")), h("span", "chtime", markLabel(m)));
+			go.append(top);
+			if (m.note) go.append(h("span", "marknote", m.note));
+			go.addEventListener("click", function () {
+				seek(m.t, true);
+				clipStop = m.end_t != null ? { t: m.t, end: m.end_t } : null;
+			});
+			li.append(go, btn("markedit", "&#9998;", "Edit bookmark at " + markLabel(m), function () { openMark(m); }));
+			markList.append(li);
+		});
+		markSec.hidden = !marks.length;
+	};
+	// Its panel. A clip is kept by its end (where Bookmark was tapped):
+	// picking a length moves its start back from there.
+	var markDlg = h("dialog", "chapdlg markdlg"), markHd = h("div", "chapdlghd"), markAt = h("p", "markat");
+	markDlg.setAttribute("aria-label", "Bookmark");
+	markHd.append(h("h2", null, "Bookmark"), btn("x", "&times;", "Close", function () { markDlg.close(); }));
+	var clipRow = h("div", "lpsleep");
+	clipRow.setAttribute("role", "group");
+	clipRow.setAttribute("aria-label", "Clip");
+	[[0, "Just this spot"], [15, "Last 15 s"], [30, "Last 30 s"], [60, "Last 60 s"]].forEach(function (o) {
+		var x = btn("small", o[1], null, function () { markOpen.clip = o[0]; paintMarkDlg(); });
+		x.dataset.clip = o[0];
+		clipRow.append(x);
+	});
+	var markNote = h("textarea");
+	markNote.rows = 3;
+	markNote.placeholder = "Add a note";
+	markNote.setAttribute("aria-label", "Note");
+	var markRow = h("div", "lpsleep markrowbtns");
+	markRow.append(btn("small danger", "Delete", null, function () {
+		if (!markOpen) return markDlg.close();
+		if (markOpen.m.note && !confirm("Delete this bookmark and its note?")) return;
+		var gone = markOpen.m;
+		marks = marks.filter(function (x) { return x !== gone; });
+		saveMarks();
+		markDlg.close();
+		paintMarks();
+	}), btn("small primary", "Save", null, function () {
+		var o = markOpen;
+		if (!o) return markDlg.close();
+		var at = o.m.end_t != null ? o.m.end_t : o.m.t;
+		o.m.note = markNote.value.trim() || null;
+		if (o.clip) { o.m.t = Math.max(0, Math.round((at - o.clip) * 10) / 10); o.m.end_t = at; } else { o.m.t = at; o.m.end_t = null; }
+		saveMarks();
+		markDlg.close();
+		paintMarks();
+	}));
+	markDlg.append(markHd, markAt, clipRow, markNote, markRow);
+	markDlg.addEventListener("close", function () { markOpen = null; });
+	markDlg.addEventListener("click", function (e) {
+		var r = markDlg.getBoundingClientRect();
+		if (e.target === markDlg && (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom)) markDlg.close();
+	});
+	var paintMarkDlg = function () {
+		var o = markOpen, at = o.m.end_t != null ? o.m.end_t : o.m.t;
+		markAt.textContent = o.clip ? "Clip: " + clock(Math.max(0, at - o.clip)) + " to " + clock(at) : "At " + clock(at);
+		clipRow.querySelectorAll("button").forEach(function (x) { x.setAttribute("aria-pressed", String(Number(x.dataset.clip) === o.clip)); });
+	};
+	var openMark = function (m) {
+		markOpen = { m: m, clip: m.end_t != null ? Math.round(m.end_t - m.t) : 0 };
+		markNote.value = m.note || "";
+		paintMarkDlg();
+		markDlg.showModal();
+	};
+	// A clip pauses at its end; skipping out of it lets it play on.
+	audio.addEventListener("timeupdate", function () {
+		var c = clipStop;
+		if (!c || audio.paused) return;
+		var t = now();
+		if (t < c.t - 2 || t > c.end + 2) { clipStop = null; return; }
+		if (t >= c.end - 0.2) { clipStop = null; audio.pause(); }
+	});
 	var info = h("span", "lpinfo"), more = h("div", "lpmore");
-	more.append(rateBtn, chapsBtn, sleepBtn, voiceBtn, info);
+	more.append(rateBtn, chapsBtn, sleepBtn, voiceBtn, markBtn, info);
 	var sleepOpts = h("div", "lpsleep");
 	sleepOpts.setAttribute("role", "group");
 	sleepOpts.setAttribute("aria-label", "Sleep timer");
@@ -5990,7 +6166,7 @@ function previewAudio(sess, b, d) {
 	cov.append(fillCover(h("div", "cover"), b));
 	main.append(chap, seekBar, times, ctl, more, sleepOpts, part);
 	box.append(cov, main);
-	$("pvBody").append(box);
+	$("pvBody").append(box, markSec, markDlg);
 
 	// Every chapter: a list under the player, and the same list in a picker
 	// over the page, opened from the chapter's name or the Chapters button.
@@ -6131,6 +6307,7 @@ function previewAudio(sess, b, d) {
 		}).catch(function () {});
 	};
 
+	paintMarks();
 	var from = parseFloat(read("listen:" + b.id)) || 0;
 	seek(from, false);
 	showPlaying();
@@ -6139,13 +6316,14 @@ function previewAudio(sess, b, d) {
 	// Leaving the page: the book in the bar plays on; one never played stops here.
 	var detach = function () {
 		if (dlg && dlg.open) dlg.close();
+		if (markDlg.open) markDlg.close();
 		if (nowPlaying !== eng) return eng.teardown();
 		keep();
 		paintBar();
 	};
 	eng.attach = function (s) {
 		$("pvNote").textContent = eng.note;
-		$("pvBody").append(box);
+		$("pvBody").append(box, markSec, markDlg);
 		if (sec) $("pvBody").append(sec, dlg);
 		render(now());
 		paintVoice();
@@ -7032,6 +7210,14 @@ const PAGE = String.raw`<!doctype html>
 	.sleepbtn.on, .voicebtn.on { border-color: var(--accent); color: var(--accent); }
 	.lpsleep { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 	#lpChapters { max-height: 420px; }
+	.marks .markrow { display: flex; align-items: stretch; }
+	.marks .markgo { flex: 1; min-width: 0; flex-direction: column; justify-content: flex-start; gap: 2px; }
+	.marktop { display: flex; justify-content: space-between; gap: 12px; width: 100%; }
+	.marknote { color: var(--muted); font-size: 14px; white-space: pre-line; overflow-wrap: anywhere; }
+	.marks .markedit { flex: none; width: 44px; justify-content: center; color: var(--accent); }
+	.markdlg textarea { width: 100%; box-sizing: border-box; margin-top: 10px; font: 15px/1.4 var(--sans); padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); resize: vertical; }
+	.markdlg .seg { margin-top: 8px; }
+	.markat { margin: 10px 0 0; font-variant-numeric: tabular-nums; }
 	@media (max-width: 640px) {
 		.lplay { grid-template-columns: minmax(0, 1fr); gap: 20px; margin-top: 8px; }
 		.lpcov { width: 80%; max-width: 340px; margin: 0 auto; }
@@ -7560,6 +7746,7 @@ const PAGE = String.raw`<!doctype html>
 				<button id="lpChapBtn" class="btn small" type="button" aria-haspopup="dialog" hidden>Chapters</button>
 				<button id="lpSleep" class="btn small sleepbtn" type="button" aria-controls="lpSleepOpts">Sleep</button>
 				<button id="lpVoice" class="btn small voicebtn" type="button" aria-label="Voice boost: off">Voice</button>
+				<button id="lpMark" class="btn small" type="button">Bookmark</button>
 				<span id="lpBook"></span>
 				<a id="lpRecord" href="#/library">Record</a>
 			</div>
@@ -7573,6 +7760,27 @@ const PAGE = String.raw`<!doctype html>
 			</div>
 		</div>
 	</div>
+	<section id="lpMarkSec" class="rsec" hidden>
+		<h3>Bookmarks</h3>
+		<ol id="lpMarks" class="chapters marks"></ol>
+	</section>
+	<dialog id="lpMarkDlg" class="chapdlg markdlg" aria-labelledby="lpMarkDlgH">
+		<div class="chapdlghd"><h2 id="lpMarkDlgH">Bookmark</h2><button id="lpMarkClose" class="btn ghost" type="button" aria-label="Close">&times;</button></div>
+		<p id="lpMarkAt" class="markat"></p>
+		<div id="lpMarkClip" class="seg" role="group" aria-label="Clip">
+			<button type="button" data-clip="0">Just this spot</button>
+			<button type="button" data-clip="15">Last 15 s</button>
+			<button type="button" data-clip="30">Last 30 s</button>
+			<button type="button" data-clip="60">Last 60 s</button>
+		</div>
+		<label class="vh" for="lpMarkNote">Note</label>
+		<textarea id="lpMarkNote" rows="3" placeholder="Add a note"></textarea>
+		<div class="hlrow">
+			<button id="lpMarkDel" class="btn danger" type="button">Delete</button>
+			<span></span>
+			<button id="lpMarkSave" class="btn primary" type="button">Save</button>
+		</div>
+	</dialog>
 	<section id="lpChapSec" class="rsec" hidden>
 		<h3>Chapters</h3>
 		<ol id="lpChapters" class="chapters"></ol>
@@ -11657,7 +11865,10 @@ async function showListen(id) {
 		location.replace("#/library");
 		return;
 	}
-	var lp = state.listen = { au: au, chapters: [], cur: -1 };
+	var lp = state.listen = { au: au, chapters: [], cur: -1, marks: null };
+	$("lpMarks").textContent = "";
+	$("lpMarkSec").hidden = true;
+	loadMarks(lp);
 	document.title = au.title + " — Reader";
 	$("lpCover").textContent = "";
 	$("lpCover").append(coverBox(au));
@@ -11676,6 +11887,7 @@ async function showListen(id) {
 	try { d = await listenInfo(au.id); } catch (e) { return; }
 	if (state.listen !== lp) return;
 	lp.chapters = d.chapters || [];
+	renderMarks();
 	if (lp.chapters.length > 1) {
 		// The same list twice: under the controls, and in the picker.
 		[$("lpChapters"), $("lpChapPick")].forEach(function (ol) {
@@ -11798,6 +12010,128 @@ function chapterStep(by) {
 	$("lpSeek").addEventListener("change", function () {
 		state.lpSeeking = false;
 		if (state.listen) listenGo(at(this.value).t);
+	});
+})();
+
+// ---------- audiobook bookmarks and clips
+// Bookmark on the player page marks the place playing at once (a toast
+// offers Add note); the list under the controls plays from one. Its ✎ opens
+// the mark: a note, and Clip to make it the last 15, 30 or 60 seconds up to
+// that place, which plays and then pauses at its end. They're kept on the
+// server (/api/books/:id/marks), so every device has them.
+
+var clipStop = null;
+async function loadMarks(lp) {
+	try {
+		var d = await apiJSON("/api/books/" + lp.au.id + "/marks");
+		if (state.listen !== lp) return;
+		lp.marks = d.marks;
+	} catch (e) { if (state.listen === lp) lp.marks = lp.marks || []; }
+	renderMarks();
+}
+function markLabel(m) { return clock(m.t) + (m.end_t != null ? "–" + clock(m.end_t) : ""); }
+function renderMarks() {
+	var lp = state.listen;
+	if (!lp) return;
+	var ol = $("lpMarks"), list = (lp.marks || []).slice().sort(function (a, b) { return a.t - b.t || a.id - b.id; });
+	ol.textContent = "";
+	list.forEach(function (m) {
+		var li = h("li", "markrow"), go = h("button", "markgo"), ch = listenChapter(m.end_t != null ? m.end_t : m.t, Infinity), c = lp.chapters[ch.i];
+		go.type = "button";
+		var top = h("span", "marktop");
+		top.append(h("span", null, (m.end_t != null ? "Clip · " : "") + (c ? c.title || "Chapter " + (ch.i + 1) : "Bookmark")), h("span", "chtime", markLabel(m)));
+		go.append(top);
+		if (m.note) go.append(h("span", "marknote", m.note));
+		go.addEventListener("click", function () { playMark(m); });
+		var ed = button("✎", "markedit", function () { openMark(m); });
+		ed.setAttribute("aria-label", "Edit bookmark at " + markLabel(m));
+		li.append(go, ed);
+		ol.append(li);
+	});
+	$("lpMarkSec").hidden = !list.length;
+}
+function playMark(m) {
+	var lp = state.listen;
+	if (!lp) return;
+	listenGo(m.t, true);
+	clipStop = m.end_t != null ? { book: lp.au.id, t: m.t, end: m.end_t } : null;
+}
+async function addMark() {
+	var lp = state.listen;
+	if (!lp) return;
+	var t = Math.floor(audioPos(lp.au) * 10) / 10;
+	try {
+		var d = await apiJSON("/api/books/" + lp.au.id + "/marks", { method: "POST", json: { t: t } });
+		if (state.listen !== lp) return;
+		lp.marks = (lp.marks || []).concat([d.mark]);
+		renderMarks();
+		toast("Bookmarked at " + clock(t) + ".", { label: "Add note", fn: function () { if (state.listen === lp) openMark(d.mark, true); } });
+	} catch (e) { fail(e); }
+}
+// The bookmark's panel. A clip is kept by its end (where Bookmark was
+// tapped): picking a length moves its start back from there.
+var markOpen = null;
+function openMark(m, focus) {
+	markOpen = { m: m, clip: m.end_t != null ? Math.round(m.end_t - m.t) : 0 };
+	$("lpMarkNote").value = m.note || "";
+	paintMarkDlg();
+	$("lpMarkDlg").showModal();
+	if (focus) $("lpMarkNote").focus();
+}
+function paintMarkDlg() {
+	var o = markOpen, at = o.m.end_t != null ? o.m.end_t : o.m.t;
+	$("lpMarkAt").textContent = o.clip ? "Clip: " + clock(Math.max(0, at - o.clip)) + " to " + clock(at) : "At " + clock(at);
+	$("lpMarkClip").querySelectorAll("button").forEach(function (b) { b.setAttribute("aria-pressed", String(Number(b.dataset.clip) === o.clip)); });
+}
+(function () {
+	var dlg = $("lpMarkDlg");
+	$("lpMark").addEventListener("click", addMark);
+	$("lpMarkClip").addEventListener("click", function (e) {
+		var b = e.target.closest("button");
+		if (!b || !markOpen) return;
+		markOpen.clip = Number(b.dataset.clip);
+		paintMarkDlg();
+	});
+	$("lpMarkSave").addEventListener("click", async function () {
+		var o = markOpen, lp = state.listen;
+		if (!o || !lp) return dlg.close();
+		var at = o.m.end_t != null ? o.m.end_t : o.m.t;
+		var body = { note: $("lpMarkNote").value.trim() || null };
+		if (o.clip) { body.t = Math.max(0, Math.round((at - o.clip) * 10) / 10); body.end_t = at; } else { body.t = at; body.end_t = null; }
+		dlg.close();
+		try {
+			var d = await apiJSON("/api/marks/" + o.m.id, { method: "PATCH", json: body });
+			if (state.listen !== lp) return;
+			lp.marks = lp.marks.map(function (x) { return x.id === d.mark.id ? d.mark : x; });
+			renderMarks();
+		} catch (e) { fail(e); }
+	});
+	$("lpMarkDel").addEventListener("click", async function () {
+		var o = markOpen, lp = state.listen;
+		if (!o || !lp) return dlg.close();
+		if (o.m.note && !confirm("Delete this bookmark and its note?")) return;
+		dlg.close();
+		try {
+			await apiJSON("/api/marks/" + o.m.id, { method: "DELETE" }).catch(function (e) { if (!/No such/.test(e.message)) throw e; });
+			if (state.listen !== lp) return;
+			lp.marks = lp.marks.filter(function (x) { return x.id !== o.m.id; });
+			renderMarks();
+		} catch (e) { fail(e); }
+	});
+	$("lpMarkClose").addEventListener("click", function () { dlg.close(); });
+	dlg.addEventListener("close", function () { markOpen = null; });
+	dlg.addEventListener("click", function (e) {
+		var r = dlg.getBoundingClientRect();
+		if (e.target === dlg && (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom)) dlg.close();
+	});
+	// A clip pauses at its end; skipping out of it lets it play on.
+	var audio = $("pAudio");
+	audio.addEventListener("timeupdate", function () {
+		var c = clipStop;
+		if (!c || !player.ab || !player.ep || player.ep.book !== c.book || audio.paused) return;
+		var t = abNow();
+		if (t < c.t - 2 || t > c.end + 2) { clipStop = null; return; }
+		if (t >= c.end - 0.2) { clipStop = null; audio.pause(); }
 	});
 })();
 
