@@ -117,6 +117,8 @@
 //   POST   /api/books/:id/marks    {t, end_t?, note?} -> {"mark"} (t: seconds into the whole book; end_t: a clip's end)
 //   PATCH  /api/marks/:id          {note?, t?, end_t?}
 //   DELETE /api/marks/:id
+//   GET    /api/export             -> {"books": [...each book with highlights or bookmarks, with its highlights, marks
+//                                  and chapters]}: what "Export notes" makes its Markdown from
 //   GET    /api/people             -> {"people": [...each with signed_in, invite_expires_at, last_seen_at, downloads,
 //                                  requested_at, request_note and request_email (a library card request not yet answered)]}
 //   POST   /api/people             {name} -> {"person", "code"}: a new family member and their invite code
@@ -386,6 +388,7 @@ async function api(request, env, url) {
 		if (m === "GET") return listMarks(env, toId(marks[1]));
 		if (m === "POST") return addMark(request, env, toId(marks[1]));
 	}
+	if (p === "/api/export" && m === "GET") return exportNotes(env);
 	if ((id = matchId(p, "/api/marks/"))) {
 		if (m === "PATCH") return updateMark(request, env, id);
 		if (m === "DELETE") return deleteMark(env, id);
@@ -3162,6 +3165,27 @@ async function deleteMark(env, id) {
 	const del = await env.DB.prepare("DELETE FROM audio_marks WHERE id = ?").bind(id).run();
 	if (!del.meta.changes) throw new HttpError(404, "No such bookmark");
 	return json({ ok: true });
+}
+
+// Every book with highlights or audiobook bookmarks, for "Export notes"
+// (the page turns it into Markdown files): the book's details, its
+// highlights in the order they come, and its bookmarks with the chapter
+// each is in (from the chapters kept once it's been played).
+async function exportNotes(env) {
+	const [books, hls, marks] = await env.DB.batch([
+		env.DB.prepare(`SELECT ${BOOK_COLUMNS}, abs_media FROM books WHERE id IN (SELECT book_id FROM highlights UNION SELECT book_id FROM audio_marks)`),
+		env.DB.prepare(`SELECT ${HIGHLIGHT_COLUMNS} FROM highlights ORDER BY book_id, start_pos, id`),
+		env.DB.prepare(`SELECT ${MARK_COLUMNS} FROM audio_marks ORDER BY book_id, t, id`),
+	]);
+	const byId = new Map();
+	for (const { abs_media, ...b } of books.results) {
+		let chapters = [];
+		try { chapters = (JSON.parse(abs_media || "null")?.chapters || []).map((c) => ({ start: c.start, title: c.title || "" })); } catch {}
+		byId.set(b.id, { ...b, chapters, highlights: [], marks: [] });
+	}
+	for (const x of hls.results) byId.get(x.book_id)?.highlights.push(x);
+	for (const x of marks.results) byId.get(x.book_id)?.marks.push(x);
+	return json({ books: [...byId.values()] });
 }
 
 // ---------------------------------------------------------------------------
@@ -7617,6 +7641,9 @@ const PAGE = String.raw`<!doctype html>
 		<button type="button" data-on="">Off</button>
 		<button type="button" data-on="1">On</button>
 	</div>
+	<h2>Notes</h2>
+	<button id="exportNotes" class="btn small" type="button">Export notes</button>
+	<p class="hint">Every book's highlights and audiobook bookmarks, one Markdown file per book, in a zip for an Obsidian vault.</p>
 	<a href="#/family" id="familyLink" class="btn small">Family library<span class="reqn" hidden></span></a>
 	<button id="forget" class="btn ghost small" type="button">Forget token on this device</button>
 </div>
@@ -14448,34 +14475,144 @@ function hlJump(sess, x) {
 	}, sess.track);
 	setTimeout(function () { if (sess.alive && sess.track) sess.track(); }, 400);
 }
-// Markdown, for pasting into Obsidian (or anywhere): the words as quotes,
-// notes under them.
-function hlMarkdown(sess) {
-	var b = sess.book, out = ["# " + b.title, ""];
-	if (b.author) out.push("*" + b.author + "*", "");
-	hlSorted(sess.hl.list).forEach(function (x) {
-		out.push(x.text.split("\n").map(function (l) { return "> " + l; }).join("\n"), "");
-		if (x.note) out.push(x.note, "");
-		out.push("---", "");
+// Markdown for Obsidian (or anywhere): YAML properties up top (title,
+// author, series, formats, status, a link back), then the highlights as
+// quotes with their notes under them, then an audiobook's bookmarks. The
+// same shape for one book's Export Markdown and for Export notes.
+// parts: [{book, highlights, marks, chapters}], one per format of the book.
+function notesMarkdown(entry, parts) {
+	var yaml = function (v) { return JSON.stringify(String(v)); };
+	var hls = [], marks = [], formats = [];
+	parts.forEach(function (p) {
+		formats.push(p.book.type);
+		hls = hls.concat(p.highlights.slice().sort(function (a, b) { return a.start_pos - b.start_pos || a.id - b.id; }));
+		marks = marks.concat(p.marks.map(function (m) { return { m: m, chapters: p.chapters || [] }; }));
 	});
+	var fin = parts.some(function (p) { return p.book.finished_at; });
+	var out = ["---", "title: " + yaml(entry.title)];
+	if (entry.author) out.push("author: " + yaml(entry.author));
+	if (entry.series) out.push("series: " + yaml(entry.series));
+	if (entry.volume != null && entry.volume !== "") out.push("volume: " + yaml(entry.volume));
+	out.push("formats: [" + formats.filter(function (f, i) { return formats.indexOf(f) === i; }).join(", ") + "]",
+		"status: " + (fin ? "finished" : "reading"),
+		"reader: " + location.origin + "/#/" + (parts.some(function (p) { return p.book.type === "audiobook"; }) ? "record" : "book") + "/" + entry.id,
+		"exported: " + new Date().toISOString().slice(0, 10),
+		"tags: [book-notes]", "---", "", "# " + entry.title, "");
+	var by = [entry.author, entry.series ? entry.series + (entry.volume != null && entry.volume !== "" ? " #" + entry.volume : "") : ""].filter(Boolean);
+	if (by.length) out.push("*" + by.join(" · ") + "*", "");
+	if (hls.length) {
+		out.push("## Highlights", "");
+		hls.forEach(function (x, i) {
+			if (i) out.push("---", "");
+			out.push(x.text.split("\n").map(function (l) { return "> " + l; }).join("\n"), "");
+			if (x.note) out.push(x.note, "");
+		});
+	}
+	if (marks.length) {
+		out.push("## Bookmarks", "");
+		marks.sort(function (a, b) { return a.m.t - b.m.t; }).forEach(function (o) {
+			var m = o.m, at = m.end_t != null ? m.end_t : m.t, ch = null;
+			o.chapters.forEach(function (c, i) { if (c.start <= at + 0.5) ch = c.title || "Chapter " + (i + 1); });
+			var line = "- **" + (m.end_t != null ? "Clip " + clock(m.t) + "–" + clock(m.end_t) : clock(m.t)) + "**" + (ch ? " · " + ch : "");
+			if (m.note) line += " — " + m.note.replace(/\n+/g, " ");
+			out.push(line);
+		});
+		out.push("");
+	}
 	return out.join("\n");
 }
-$("hlExport").addEventListener("click", async function () {
-	var sess = session;
-	if (!sess) return;
-	var md = hlMarkdown(sess), name = (sess.book.title || "Highlights").replace(/[\\/:*?"<>|]+/g, " ").trim() + " highlights.md";
-	var file = typeof File === "function" ? new File([md], name, { type: "text/markdown" }) : null;
+function fileName(s) { return String(s || "Untitled").replace(/[\\/:*?"<>|#^\[\]]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 120) || "Untitled"; }
+// Share it (a phone's share sheet, so it can go straight to Obsidian or
+// Files), or else download it.
+async function saveFile(blob, name) {
+	var file = typeof File === "function" ? new File([blob], name, { type: blob.type }) : null;
 	if (file && navigator.canShare && navigator.canShare({ files: [file] })) {
 		try { await navigator.share({ files: [file], title: name }); return; } catch (e) { if (e.name === "AbortError") return; }
 	}
 	var a = h("a");
-	a.href = URL.createObjectURL(new Blob([md], { type: "text/markdown" }));
+	a.href = URL.createObjectURL(blob);
 	a.download = name;
 	document.body.append(a);
 	a.click();
 	a.remove();
 	setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+}
+$("hlExport").addEventListener("click", function () {
+	var sess = session;
+	if (!sess) return;
+	var b = sess.book, md = notesMarkdown(b, [{ book: b, highlights: sess.hl.list, marks: [], chapters: [] }]);
+	saveFile(new Blob([md], { type: "text/markdown" }), fileName(b.title) + ".md");
 });
+
+// ---------- export notes
+// Settings → Export notes: every book with highlights or audiobook
+// bookmarks, one Markdown file each (a book in both formats is one file),
+// in a zip to unpack into an Obsidian vault. A file is named after the
+// book, so a new export replaces the old one's files.
+
+var CRC_TABLE = null;
+function crc32(u8) {
+	if (!CRC_TABLE) {
+		CRC_TABLE = new Uint32Array(256);
+		for (var n = 0; n < 256; n++) { var c = n; for (var k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; CRC_TABLE[n] = c >>> 0; }
+	}
+	var crc = 0xffffffff;
+	for (var i = 0; i < u8.length; i++) crc = CRC_TABLE[(crc ^ u8[i]) & 0xff] ^ (crc >>> 8);
+	return (crc ^ 0xffffffff) >>> 0;
+}
+// A zip with the files stored as they are (Markdown is small): [{name, text}] -> Blob.
+function makeZip(files) {
+	var enc = new TextEncoder(), parts = [], central = [], at = 0, d = new Date();
+	var time = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+	var date = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+	files.forEach(function (f) {
+		var name = enc.encode(f.name), data = enc.encode(f.text), crc = crc32(data);
+		var head = new DataView(new ArrayBuffer(30));
+		[[0, 0x04034b50, 4], [4, 20, 2], [6, 0x0800, 2], [8, 0, 2], [10, time, 2], [12, date, 2], [14, crc, 4], [18, data.length, 4], [22, data.length, 4], [26, name.length, 2], [28, 0, 2]]
+			.forEach(function (x) { if (x[2] === 4) head.setUint32(x[0], x[1], true); else head.setUint16(x[0], x[1], true); });
+		var cd = new DataView(new ArrayBuffer(46));
+		[[0, 0x02014b50, 4], [4, 20, 2], [6, 20, 2], [8, 0x0800, 2], [10, 0, 2], [12, time, 2], [14, date, 2], [16, crc, 4], [20, data.length, 4], [24, data.length, 4], [28, name.length, 2], [42, at, 4]]
+			.forEach(function (x) { if (x[2] === 4) cd.setUint32(x[0], x[1], true); else cd.setUint16(x[0], x[1], true); });
+		parts.push(head, name, data);
+		central.push(cd, name);
+		at += 30 + name.length + data.length;
+	});
+	var size = central.reduce(function (n, x) { return n + x.byteLength; }, 0), end = new DataView(new ArrayBuffer(22));
+	end.setUint32(0, 0x06054b50, true);
+	end.setUint16(8, files.length, true);
+	end.setUint16(10, files.length, true);
+	end.setUint32(12, size, true);
+	end.setUint32(16, at, true);
+	return new Blob(parts.concat(central, [end]), { type: "application/zip" });
+}
+async function exportNotes() {
+	var btn = $("exportNotes");
+	btn.disabled = true;
+	btn.textContent = "Exporting…";
+	try {
+		var d = await apiJSON("/api/export");
+		if (!state.books) await loadBooks().catch(function () {});
+		// A book in both formats (one Library entry) is one file.
+		var groups = {}, order = [];
+		d.books.forEach(function (b) {
+			var e = libEntry(b.id) || b, key = e.id;
+			if (!groups[key]) { groups[key] = { entry: e, parts: [] }; order.push(key); }
+			groups[key].parts.push({ book: b, highlights: b.highlights, marks: b.marks, chapters: b.chapters });
+		});
+		if (!order.length) { toast("No highlights or bookmarks yet."); return; }
+		var used = {}, files = order.map(function (k) {
+			var g = groups[k], name = fileName(g.entry.title), n = 2;
+			while (used[name.toLowerCase()]) name = fileName(g.entry.title) + " (" + n++ + ")";
+			used[name.toLowerCase()] = true;
+			return { name: "Reader notes/" + name + ".md", text: notesMarkdown(g.entry, g.parts) };
+		});
+		await saveFile(makeZip(files), "Reader notes " + new Date().toISOString().slice(0, 10) + ".zip");
+	} catch (e) { fail(e); } finally {
+		btn.disabled = false;
+		btn.textContent = "Export notes";
+	}
+}
+$("exportNotes").addEventListener("click", exportNotes);
 $("hlListClose").addEventListener("click", function () { showHlList(false); });
 $("bmHighlights").addEventListener("click", function (e) { e.stopPropagation(); openHlList(); });
 document.addEventListener("click", function (e) {
