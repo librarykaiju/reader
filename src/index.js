@@ -90,6 +90,9 @@
 //   GET    /api/books/lookup?q=    Open Library's matches for a title (and author) -> {hits: [{title, author, year, thumb, work, cover_id}]}
 //   GET    /api/books/lookup/covers?work=&title=&author=&cover_id=  -> {covers: [image URLs]} (Google Books, then Open Library's editions)
 //   GET    /api/books/lookup/image?url=  one of those covers, fetched for the page (Open Library and Google Books only)
+//   GET    /api/lookup?q=&context=  a word or name selected in a book -> {"q", "dict", "wiki", "ai"}: the Free Dictionary
+//                                  API's senses, Wikipedia's summary, and (when neither knows it) Workers AI's reading
+//                                  of it from context, the passage around it; any may be null (see "Looking up a word")
 //   GET    /api/books/:id/file     the file itself (?dl=1: saving it for offline, so not "opened")
 //   GET    /api/books/:id/part?at=&len=  len bytes of the file from byte at (up to 4 MB; for drawing a PDF's cover)
 //   GET    /api/books/:id/cover    the cover image (an EPUB's or a comic's first page is found the first time); 404 if none
@@ -110,6 +113,12 @@
 //   POST   /api/books/:id/highlights {start_pos, end_pos, text, note?} -> {"highlight"}
 //   PATCH  /api/highlights/:id     {note?, start_pos?, end_pos?} (note null or "" = no note)
 //   DELETE /api/highlights/:id
+//   GET    /api/books/:id/marks    an audiobook's bookmarks and clips -> {"marks": [{id, t, end_t, note, ...}]}, in order
+//   POST   /api/books/:id/marks    {t, end_t?, note?} -> {"mark"} (t: seconds into the whole book; end_t: a clip's end)
+//   PATCH  /api/marks/:id          {note?, t?, end_t?}
+//   DELETE /api/marks/:id
+//   GET    /api/export             -> {"books": [...each book with highlights or bookmarks, with its highlights, marks
+//                                  and chapters]}: what "Export notes" makes its Markdown from
 //   GET    /api/people             -> {"people": [...each with signed_in, invite_expires_at, last_seen_at, downloads,
 //                                  requested_at, request_note and request_email (a library card request not yet answered)]}
 //   POST   /api/people             {name} -> {"person", "code"}: a new family member and their invite code
@@ -344,6 +353,7 @@ async function api(request, env, url) {
 	if (p === "/api/books/lookup" && m === "GET") return lookupBooks(url);
 	if (p === "/api/books/lookup/covers" && m === "GET") return lookupCovers(url);
 	if (p === "/api/books/lookup/image" && m === "GET") return lookupImage(url);
+	if (p === "/api/lookup" && m === "GET") return lookupWord(request, env, url);
 	const file = p.match(/^\/api\/books\/(\d+)\/file$/);
 	if (file && m === "GET") return bookFile(env, toId(file[1]), url.searchParams.has("dl"));
 	const part = p.match(/^\/api\/books\/(\d+)\/part$/);
@@ -372,6 +382,16 @@ async function api(request, env, url) {
 	if ((id = matchId(p, "/api/highlights/"))) {
 		if (m === "PATCH") return updateHighlight(request, env, id);
 		if (m === "DELETE") return deleteHighlight(env, id);
+	}
+	const marks = p.match(/^\/api\/books\/(\d+)\/marks$/);
+	if (marks) {
+		if (m === "GET") return listMarks(env, toId(marks[1]));
+		if (m === "POST") return addMark(request, env, toId(marks[1]));
+	}
+	if (p === "/api/export" && m === "GET") return exportNotes(env);
+	if ((id = matchId(p, "/api/marks/"))) {
+		if (m === "PATCH") return updateMark(request, env, id);
+		if (m === "DELETE") return deleteMark(env, id);
 	}
 
 	if (p === "/api/people") {
@@ -2172,6 +2192,76 @@ async function lookupImage(url) {
 	return new Response(img, { headers: { "Content-Type": kind, "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" } });
 }
 
+// ---------------------------------------------------------------------------
+// Looking up a word or name selected in a book: the Free Dictionary API
+// (dictionaryapi.dev, Wiktionary's data) for words and Wikipedia's page
+// summary for names, places and phrases, both asked at once. When neither
+// knows it (a word the story made up, or a character's name) and there's an
+// AI binding, Workers AI says what it seems to mean from the passage it came
+// from, marked as a guess. No keys needed; answers are cached for a day.
+const LOOKUP_AI_MODEL = COVERAGE_AI_MODEL;
+const LOOKUP_SYSTEM = `You explain a word or name a reader selected in a book. You get the selection and the passage around it. In one or two plain sentences, say what it means as used there. If it's a person, place or thing in the story, say who or what it seems to be from the passage. If the passage doesn't make it clear, say so briefly. No preamble.`;
+async function lookupCached(u) {
+	const res = await fetch(u, { headers: { "User-Agent": LOOKUP_UA, Accept: "application/json" }, cf: { cacheTtl: 86400, cacheEverything: true } });
+	if (!res.ok) { await res.body?.cancel(); return null; }
+	return res.json();
+}
+async function lookupWord(request, env, url) {
+	const q = str(url.searchParams.get("q"), 80)?.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "").replace(/\s+/g, " ");
+	if (!q) throw new HttpError(400, "q is needed");
+	const context = str(url.searchParams.get("context"), 1200) || "";
+	const single = !/\s/.test(q);
+	const [dict, wiki] = await Promise.all([
+		single ? within(async () => dictEntry(await lookupCached("https://api.dictionaryapi.dev/api/v2/entries/en/" + encodeURIComponent(q.toLowerCase()))), null, 5000) : null,
+		within(async () => wikiSummary(await lookupCached("https://en.wikipedia.org/api/rest_v1/page/summary/" + encodeURIComponent(q.replace(/ /g, "_")) + "?redirect=true")), null, 5000),
+	]);
+	let ai = null;
+	if (!dict && (!wiki || wiki.disambiguation) && env.AI && context) {
+		ai = await within(async () => {
+			const out = await env.AI.run(LOOKUP_AI_MODEL, {
+				messages: [{ role: "system", content: LOOKUP_SYSTEM }, { role: "user", content: `Selection: ${q}\n\n<passage>\n${context}\n</passage>` }],
+				max_tokens: 160,
+				temperature: 0.2,
+			});
+			const text = str(typeof out?.response === "string" ? out.response : "", 800);
+			return text ? { text, model: LOOKUP_AI_MODEL.replace(/^@cf\/[^/]+\//, "") } : null;
+		}, null, 12000);
+	}
+	return json({ q, dict, wiki, ai });
+}
+// The dictionary's entries for a word, merged: its pronunciation, and up to
+// three senses for each part of speech.
+function dictEntry(data) {
+	if (!Array.isArray(data) || !data.length) return null;
+	const byPos = new Map();
+	let phonetic = "", audio = "";
+	for (const e of data) {
+		phonetic ||= e.phonetic || (e.phonetics || []).map((p) => p.text).find(Boolean) || "";
+		audio ||= (e.phonetics || []).map((p) => p.audio).find((a) => /^https:\/\//.test(a || "")) || "";
+		for (const m of e.meanings || []) {
+			const pos = String(m.partOfSpeech || "");
+			const list = byPos.get(pos) || [];
+			for (const d of m.definitions || []) {
+				if (list.length >= 3 || !d.definition) continue;
+				list.push({ d: String(d.definition).slice(0, 500), ex: d.example ? String(d.example).slice(0, 300) : "" });
+			}
+			byPos.set(pos, list);
+		}
+	}
+	const meanings = [...byPos].filter(([, defs]) => defs.length).slice(0, 4).map(([pos, defs]) => ({ pos, defs }));
+	return meanings.length ? { word: String(data[0].word || ""), phonetic, audio, meanings } : null;
+}
+function wikiSummary(d) {
+	if (!d || !d.title || !d.extract || !/^(standard|disambiguation)$/.test(d.type)) return null;
+	return {
+		title: String(d.title),
+		description: d.description ? String(d.description).slice(0, 200) : "",
+		extract: String(d.extract).slice(0, 1500),
+		url: d.content_urls?.desktop?.page || `https://en.wikipedia.org/wiki/${encodeURIComponent(d.title.replace(/ /g, "_"))}`,
+		disambiguation: d.type === "disambiguation",
+	};
+}
+
 // A piece of a book's file, so the page can draw a PDF's first page without
 // downloading all of it (pdf.js asks for the pieces it needs).
 async function bookPart(env, id, url) {
@@ -3020,6 +3110,82 @@ async function deleteHighlight(env, id) {
 	const del = await env.DB.prepare("DELETE FROM highlights WHERE id = ?").bind(id).run();
 	if (!del.meta.changes) throw new HttpError(404, "No such highlight");
 	return json({ ok: true });
+}
+
+// Bookmarks and clips in audiobooks (migration 0022): t is seconds into the
+// whole book; a clip runs from t to end_t. Only the owner's: the family
+// library keeps its own on each device.
+const MARK_COLUMNS = "id, book_id, t, end_t, note, created_at, updated_at";
+const MAX_CLIP_SECONDS = 600;
+function markSpan(body, book) {
+	const t = body.t, end = body.end_t ?? null;
+	if (typeof t !== "number" || !Number.isFinite(t) || t < 0) throw new HttpError(400, "t must be a time in seconds");
+	if (end !== null && (typeof end !== "number" || !Number.isFinite(end) || end <= t || end - t > MAX_CLIP_SECONDS)) {
+		throw new HttpError(400, `end_t must come after t, at most ${MAX_CLIP_SECONDS / 60} minutes on`);
+	}
+	const most = book?.duration || Infinity;
+	return [Math.min(t, most), end === null ? null : Math.min(end, most)];
+}
+async function listMarks(env, bookId) {
+	const { results } = await env.DB.prepare(`SELECT ${MARK_COLUMNS} FROM audio_marks WHERE book_id = ? ORDER BY t, id`).bind(bookId).all();
+	return json({ marks: results });
+}
+async function addMark(request, env, bookId) {
+	const body = await readJSON(request);
+	const book = await getBook(env, bookId);
+	if (bookType(book) !== "audiobook") throw new HttpError(400, "Bookmarks here are for audiobooks");
+	const [t, end] = markSpan(body, book);
+	const now = Date.now();
+	const mark = await env.DB.prepare(
+		`INSERT INTO audio_marks (book_id, t, end_t, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING ${MARK_COLUMNS}`,
+	)
+		.bind(bookId, t, end, noteOf(body.note), now, now)
+		.first();
+	return json({ mark });
+}
+async function updateMark(request, env, id) {
+	const body = await readJSON(request);
+	const sets = [], params = [];
+	if (body.note !== undefined) {
+		sets.push("note = ?");
+		params.push(noteOf(body.note));
+	}
+	if (body.t !== undefined || body.end_t !== undefined) {
+		sets.push("t = ?", "end_t = ?");
+		params.push(...markSpan(body, null));
+	}
+	if (!sets.length) throw new HttpError(400, "Nothing to change");
+	const mark = await env.DB.prepare(`UPDATE audio_marks SET ${sets.join(", ")}, updated_at = ? WHERE id = ? RETURNING ${MARK_COLUMNS}`)
+		.bind(...params, Date.now(), id)
+		.first();
+	if (!mark) throw new HttpError(404, "No such bookmark");
+	return json({ mark });
+}
+async function deleteMark(env, id) {
+	const del = await env.DB.prepare("DELETE FROM audio_marks WHERE id = ?").bind(id).run();
+	if (!del.meta.changes) throw new HttpError(404, "No such bookmark");
+	return json({ ok: true });
+}
+
+// Every book with highlights or audiobook bookmarks, for "Export notes"
+// (the page turns it into Markdown files): the book's details, its
+// highlights in the order they come, and its bookmarks with the chapter
+// each is in (from the chapters kept once it's been played).
+async function exportNotes(env) {
+	const [books, hls, marks] = await env.DB.batch([
+		env.DB.prepare(`SELECT ${BOOK_COLUMNS}, abs_media FROM books WHERE id IN (SELECT book_id FROM highlights UNION SELECT book_id FROM audio_marks)`),
+		env.DB.prepare(`SELECT ${HIGHLIGHT_COLUMNS} FROM highlights ORDER BY book_id, start_pos, id`),
+		env.DB.prepare(`SELECT ${MARK_COLUMNS} FROM audio_marks ORDER BY book_id, t, id`),
+	]);
+	const byId = new Map();
+	for (const { abs_media, ...b } of books.results) {
+		let chapters = [];
+		try { chapters = (JSON.parse(abs_media || "null")?.chapters || []).map((c) => ({ start: c.start, title: c.title || "" })); } catch {}
+		byId.set(b.id, { ...b, chapters, highlights: [], marks: [] });
+	}
+	for (const x of hls.results) byId.get(x.book_id)?.highlights.push(x);
+	for (const x of marks.results) byId.get(x.book_id)?.marks.push(x);
+	return json({ books: [...byId.values()] });
 }
 
 // ---------------------------------------------------------------------------
@@ -4836,6 +5002,17 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.chapters button { appearance: none; display: flex; width: 100%; justify-content: space-between; gap: 12px; border: 0; background: transparent; color: inherit; padding: 10px 14px; text-align: left; font: inherit; font-size: 15px; cursor: pointer; }
 	.chapters button[aria-current=true] { background: var(--sel); color: var(--accent); font-weight: 600; }
 	.chapters .chtime { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+	.marks .markrow { display: flex; align-items: stretch; }
+	.marks .markgo { flex: 1; min-width: 0; flex-direction: column; justify-content: flex-start; gap: 2px; }
+	.marktop { display: flex; justify-content: space-between; gap: 12px; width: 100%; }
+	.marknote { color: var(--muted); font-size: 14px; white-space: pre-line; overflow-wrap: anywhere; }
+	.marks .markedit { flex: none; width: 44px; justify-content: center; color: var(--accent); }
+	.markdlg textarea { width: 100%; box-sizing: border-box; margin-top: 10px; font: inherit; font-size: 15px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); resize: vertical; }
+	.markdlg .lpsleep button[aria-pressed=true] { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+	.markdlg .markrowbtns { justify-content: space-between; }
+	.markdlg .markrowbtns .danger { color: #a33; }
+	.markdlg .markrowbtns .primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+	.markat { margin: 10px 0 0; font-variant-numeric: tabular-nums; }
 	/* The chapter picker over the page. */
 	.chapdlg { width: min(480px, calc(100vw - 32px)); max-height: min(560px, calc(100vh - 80px)); padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); color: var(--fg); box-shadow: 0 10px 30px rgba(0,0,0,.25); }
 	.chapdlg[open] { display: flex; flex-direction: column; }
@@ -5972,8 +6149,105 @@ function previewAudio(sess, b, d) {
 		voiceBtn.classList.toggle("on", voice.level > 0);
 	};
 	paintVoice();
+	// Bookmarks and clips, kept on this device like the place: Bookmark marks
+	// the place playing at once, the list under the player plays from one,
+	// and its ✎ opens it for a note or Clip (the last 15, 30 or 60 seconds up
+	// to that place, which plays and then pauses at its end).
+	var markKey = "marks:" + b.id, clipStop = null, markOpen = null;
+	var marks = (function () { try { return JSON.parse(read(markKey) || "[]") || []; } catch (e) { return []; } })();
+	var saveMarks = function () { store(markKey, JSON.stringify(marks)); };
+	var markLabel = function (m) { return clock(m.t) + (m.end_t != null ? "–" + clock(m.end_t) : ""); };
+	var markBtn = btn("small", "Bookmark", null, function () {
+		var t = Math.floor(now() * 10) / 10;
+		marks.push({ id: Date.now(), t: t, end_t: null, note: null, created_at: Date.now() });
+		saveMarks();
+		paintMarks();
+		markBtn.textContent = "Bookmarked " + clock(t);
+		clearTimeout(markBtn.timer);
+		markBtn.timer = setTimeout(function () { markBtn.textContent = "Bookmark"; }, 2500);
+	});
+	var markSec = h("section", "lpchaps marksec"), markList = h("ol", "chapters marks");
+	markSec.append(h("h2", null, "Bookmarks"), markList);
+	var paintMarks = function () {
+		markList.textContent = "";
+		marks.sort(function (x, y) { return x.t - y.t || x.id - y.id; }).forEach(function (m) {
+			var li = h("li", "markrow"), go = h("button", "markgo"), top = h("span", "marktop"), ci = chapterAt(m.end_t != null ? m.end_t : m.t).i, c = chapters[ci];
+			go.type = "button";
+			top.append(h("span", null, (m.end_t != null ? "Clip · " : "") + (c ? c.title || "Chapter " + (ci + 1) : "Bookmark")), h("span", "chtime", markLabel(m)));
+			go.append(top);
+			if (m.note) go.append(h("span", "marknote", m.note));
+			go.addEventListener("click", function () {
+				seek(m.t, true);
+				clipStop = m.end_t != null ? { t: m.t, end: m.end_t } : null;
+			});
+			li.append(go, btn("markedit", "&#9998;", "Edit bookmark at " + markLabel(m), function () { openMark(m); }));
+			markList.append(li);
+		});
+		markSec.hidden = !marks.length;
+	};
+	// Its panel. A clip is kept by its end (where Bookmark was tapped):
+	// picking a length moves its start back from there.
+	var markDlg = h("dialog", "chapdlg markdlg"), markHd = h("div", "chapdlghd"), markAt = h("p", "markat");
+	markDlg.setAttribute("aria-label", "Bookmark");
+	markHd.append(h("h2", null, "Bookmark"), btn("x", "&times;", "Close", function () { markDlg.close(); }));
+	var clipRow = h("div", "lpsleep");
+	clipRow.setAttribute("role", "group");
+	clipRow.setAttribute("aria-label", "Clip");
+	[[0, "Just this spot"], [15, "Last 15 s"], [30, "Last 30 s"], [60, "Last 60 s"]].forEach(function (o) {
+		var x = btn("small", o[1], null, function () { markOpen.clip = o[0]; paintMarkDlg(); });
+		x.dataset.clip = o[0];
+		clipRow.append(x);
+	});
+	var markNote = h("textarea");
+	markNote.rows = 3;
+	markNote.placeholder = "Add a note";
+	markNote.setAttribute("aria-label", "Note");
+	var markRow = h("div", "lpsleep markrowbtns");
+	markRow.append(btn("small danger", "Delete", null, function () {
+		if (!markOpen) return markDlg.close();
+		if (markOpen.m.note && !confirm("Delete this bookmark and its note?")) return;
+		var gone = markOpen.m;
+		marks = marks.filter(function (x) { return x !== gone; });
+		saveMarks();
+		markDlg.close();
+		paintMarks();
+	}), btn("small primary", "Save", null, function () {
+		var o = markOpen;
+		if (!o) return markDlg.close();
+		var at = o.m.end_t != null ? o.m.end_t : o.m.t;
+		o.m.note = markNote.value.trim() || null;
+		if (o.clip) { o.m.t = Math.max(0, Math.round((at - o.clip) * 10) / 10); o.m.end_t = at; } else { o.m.t = at; o.m.end_t = null; }
+		saveMarks();
+		markDlg.close();
+		paintMarks();
+	}));
+	markDlg.append(markHd, markAt, clipRow, markNote, markRow);
+	markDlg.addEventListener("close", function () { markOpen = null; });
+	markDlg.addEventListener("click", function (e) {
+		var r = markDlg.getBoundingClientRect();
+		if (e.target === markDlg && (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom)) markDlg.close();
+	});
+	var paintMarkDlg = function () {
+		var o = markOpen, at = o.m.end_t != null ? o.m.end_t : o.m.t;
+		markAt.textContent = o.clip ? "Clip: " + clock(Math.max(0, at - o.clip)) + " to " + clock(at) : "At " + clock(at);
+		clipRow.querySelectorAll("button").forEach(function (x) { x.setAttribute("aria-pressed", String(Number(x.dataset.clip) === o.clip)); });
+	};
+	var openMark = function (m) {
+		markOpen = { m: m, clip: m.end_t != null ? Math.round(m.end_t - m.t) : 0 };
+		markNote.value = m.note || "";
+		paintMarkDlg();
+		markDlg.showModal();
+	};
+	// A clip pauses at its end; skipping out of it lets it play on.
+	audio.addEventListener("timeupdate", function () {
+		var c = clipStop;
+		if (!c || audio.paused) return;
+		var t = now();
+		if (t < c.t - 2 || t > c.end + 2) { clipStop = null; return; }
+		if (t >= c.end - 0.2) { clipStop = null; audio.pause(); }
+	});
 	var info = h("span", "lpinfo"), more = h("div", "lpmore");
-	more.append(rateBtn, chapsBtn, sleepBtn, voiceBtn, info);
+	more.append(rateBtn, chapsBtn, sleepBtn, voiceBtn, markBtn, info);
 	var sleepOpts = h("div", "lpsleep");
 	sleepOpts.setAttribute("role", "group");
 	sleepOpts.setAttribute("aria-label", "Sleep timer");
@@ -5990,7 +6264,7 @@ function previewAudio(sess, b, d) {
 	cov.append(fillCover(h("div", "cover"), b));
 	main.append(chap, seekBar, times, ctl, more, sleepOpts, part);
 	box.append(cov, main);
-	$("pvBody").append(box);
+	$("pvBody").append(box, markSec, markDlg);
 
 	// Every chapter: a list under the player, and the same list in a picker
 	// over the page, opened from the chapter's name or the Chapters button.
@@ -6131,6 +6405,7 @@ function previewAudio(sess, b, d) {
 		}).catch(function () {});
 	};
 
+	paintMarks();
 	var from = parseFloat(read("listen:" + b.id)) || 0;
 	seek(from, false);
 	showPlaying();
@@ -6139,13 +6414,14 @@ function previewAudio(sess, b, d) {
 	// Leaving the page: the book in the bar plays on; one never played stops here.
 	var detach = function () {
 		if (dlg && dlg.open) dlg.close();
+		if (markDlg.open) markDlg.close();
 		if (nowPlaying !== eng) return eng.teardown();
 		keep();
 		paintBar();
 	};
 	eng.attach = function (s) {
 		$("pvNote").textContent = eng.note;
-		$("pvBody").append(box);
+		$("pvBody").append(box, markSec, markDlg);
 		if (sec) $("pvBody").append(sec, dlg);
 		render(now());
 		paintVoice();
@@ -6827,6 +7103,17 @@ const PAGE = String.raw`<!doctype html>
 	.hlq { font: 15px/1.4 var(--serif); display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; line-clamp: 4; overflow: hidden; border-left: 3px solid var(--hl-edge); padding-left: 8px; }
 	.hln { font-size: 14px; }
 	.hlm { font-size: 13px; color: var(--bad); }
+	.lookbody { font: 15px/1.45 var(--serif); overflow-wrap: anywhere; }
+	.lookbody p { margin: 0 0 8px; }
+	.lookph { color: var(--muted); font-family: var(--sans); font-size: 14px; }
+	.lookpos { font: italic 13px/1.3 var(--sans); color: var(--muted); margin: 10px 0 4px !important; }
+	.lookdefs { margin: 0 0 6px; padding-left: 22px; }
+	.lookdefs li + li { margin-top: 4px; }
+	.lookex { display: block; color: var(--muted); font-style: italic; }
+	.lookwiki { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 2px; }
+	.lookwiki:first-child { border-top: 0; margin-top: 0; }
+	.lookt { font-weight: 600; }
+	.lookwiki a { font-family: var(--sans); font-size: 14px; }
 	.findform { margin-bottom: 4px; }
 	.findq { font: 15px/1.4 var(--serif); overflow-wrap: anywhere; }
 	.findq mark { background: var(--hl); color: inherit; border-radius: 2px; }
@@ -7040,6 +7327,14 @@ const PAGE = String.raw`<!doctype html>
 	.sleepbtn.on, .voicebtn.on { border-color: var(--accent); color: var(--accent); }
 	.lpsleep { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 	#lpChapters { max-height: 420px; }
+	.marks .markrow { display: flex; align-items: stretch; }
+	.marks .markgo { flex: 1; min-width: 0; flex-direction: column; justify-content: flex-start; gap: 2px; }
+	.marktop { display: flex; justify-content: space-between; gap: 12px; width: 100%; }
+	.marknote { color: var(--muted); font-size: 14px; white-space: pre-line; overflow-wrap: anywhere; }
+	.marks .markedit { flex: none; width: 44px; justify-content: center; color: var(--accent); }
+	.markdlg textarea { width: 100%; box-sizing: border-box; margin-top: 10px; font: 15px/1.4 var(--sans); padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); resize: vertical; }
+	.markdlg .seg { margin-top: 8px; }
+	.markat { margin: 10px 0 0; font-variant-numeric: tabular-nums; }
 	@media (max-width: 640px) {
 		.lplay { grid-template-columns: minmax(0, 1fr); gap: 20px; margin-top: 8px; }
 		.lpcov { width: 80%; max-width: 340px; margin: 0 auto; }
@@ -7358,6 +7653,9 @@ const PAGE = String.raw`<!doctype html>
 		<button type="button" data-on="">Off</button>
 		<button type="button" data-on="1">On</button>
 	</div>
+	<h2>Notes</h2>
+	<button id="exportNotes" class="btn small" type="button">Export notes</button>
+	<p class="hint">Every book's highlights and audiobook bookmarks, one Markdown file per book, in a zip for an Obsidian vault.</p>
 	<a href="#/family" id="familyLink" class="btn small">Family library<span class="reqn" hidden></span></a>
 	<button id="forget" class="btn ghost small" type="button">Forget token on this device</button>
 </div>
@@ -7574,6 +7872,7 @@ const PAGE = String.raw`<!doctype html>
 				<button id="lpChapBtn" class="btn small" type="button" aria-haspopup="dialog" hidden>Chapters</button>
 				<button id="lpSleep" class="btn small sleepbtn" type="button" aria-controls="lpSleepOpts">Sleep</button>
 				<button id="lpVoice" class="btn small voicebtn" type="button" aria-label="Voice boost: off">Voice</button>
+				<button id="lpMark" class="btn small" type="button">Bookmark</button>
 				<span id="lpBook"></span>
 				<a id="lpRecord" href="#/library">Record</a>
 			</div>
@@ -7587,6 +7886,27 @@ const PAGE = String.raw`<!doctype html>
 			</div>
 		</div>
 	</div>
+	<section id="lpMarkSec" class="rsec" hidden>
+		<h3>Bookmarks</h3>
+		<ol id="lpMarks" class="chapters marks"></ol>
+	</section>
+	<dialog id="lpMarkDlg" class="chapdlg markdlg" aria-labelledby="lpMarkDlgH">
+		<div class="chapdlghd"><h2 id="lpMarkDlgH">Bookmark</h2><button id="lpMarkClose" class="btn ghost" type="button" aria-label="Close">&times;</button></div>
+		<p id="lpMarkAt" class="markat"></p>
+		<div id="lpMarkClip" class="seg" role="group" aria-label="Clip">
+			<button type="button" data-clip="0">Just this spot</button>
+			<button type="button" data-clip="15">Last 15 s</button>
+			<button type="button" data-clip="30">Last 30 s</button>
+			<button type="button" data-clip="60">Last 60 s</button>
+		</div>
+		<label class="vh" for="lpMarkNote">Note</label>
+		<textarea id="lpMarkNote" rows="3" placeholder="Add a note"></textarea>
+		<div class="hlrow">
+			<button id="lpMarkDel" class="btn danger" type="button">Delete</button>
+			<span></span>
+			<button id="lpMarkSave" class="btn primary" type="button">Save</button>
+		</div>
+	</dialog>
 	<section id="lpChapSec" class="rsec" hidden>
 		<h3>Chapters</h3>
 		<ol id="lpChapters" class="chapters"></ol>
@@ -7624,6 +7944,15 @@ const PAGE = String.raw`<!doctype html>
 <div id="hlBar" class="hlbar" hidden>
 	<button id="hlAdd" class="btn primary" type="button">Highlight</button>
 	<button id="hlNote" class="btn" type="button">Add note</button>
+	<button id="hlLook" class="btn" type="button" hidden>Look up</button>
+</div>
+<div id="lookPop" class="pop hlpop" role="dialog" aria-labelledby="lookWord" hidden>
+	<h2 id="lookWord"></h2>
+	<div id="lookBody" class="lookbody" aria-live="polite"></div>
+	<div class="hlrow">
+		<span></span>
+		<button id="lookClose" class="btn ghost" type="button">Close</button>
+	</div>
 </div>
 <div id="ttsBar" class="hlbar ttsbar" role="group" aria-label="Read aloud" hidden>
 	<button id="ttsPrev" class="btn ghost" type="button" aria-label="Previous paragraph"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h2.2v14H6zM19 5v14L9.5 12z"/></svg></button>
@@ -11679,7 +12008,10 @@ async function showListen(id) {
 		location.replace("#/library");
 		return;
 	}
-	var lp = state.listen = { au: au, chapters: [], cur: -1 };
+	var lp = state.listen = { au: au, chapters: [], cur: -1, marks: null };
+	$("lpMarks").textContent = "";
+	$("lpMarkSec").hidden = true;
+	loadMarks(lp);
 	document.title = au.title + " — Reader";
 	$("lpCover").textContent = "";
 	$("lpCover").append(coverBox(au));
@@ -11698,6 +12030,7 @@ async function showListen(id) {
 	try { d = await listenInfo(au.id); } catch (e) { return; }
 	if (state.listen !== lp) return;
 	lp.chapters = d.chapters || [];
+	renderMarks();
 	if (lp.chapters.length > 1) {
 		// The same list twice: under the controls, and in the picker.
 		[$("lpChapters"), $("lpChapPick")].forEach(function (ol) {
@@ -11820,6 +12153,128 @@ function chapterStep(by) {
 	$("lpSeek").addEventListener("change", function () {
 		state.lpSeeking = false;
 		if (state.listen) listenGo(at(this.value).t);
+	});
+})();
+
+// ---------- audiobook bookmarks and clips
+// Bookmark on the player page marks the place playing at once (a toast
+// offers Add note); the list under the controls plays from one. Its ✎ opens
+// the mark: a note, and Clip to make it the last 15, 30 or 60 seconds up to
+// that place, which plays and then pauses at its end. They're kept on the
+// server (/api/books/:id/marks), so every device has them.
+
+var clipStop = null;
+async function loadMarks(lp) {
+	try {
+		var d = await apiJSON("/api/books/" + lp.au.id + "/marks");
+		if (state.listen !== lp) return;
+		lp.marks = d.marks;
+	} catch (e) { if (state.listen === lp) lp.marks = lp.marks || []; }
+	renderMarks();
+}
+function markLabel(m) { return clock(m.t) + (m.end_t != null ? "–" + clock(m.end_t) : ""); }
+function renderMarks() {
+	var lp = state.listen;
+	if (!lp) return;
+	var ol = $("lpMarks"), list = (lp.marks || []).slice().sort(function (a, b) { return a.t - b.t || a.id - b.id; });
+	ol.textContent = "";
+	list.forEach(function (m) {
+		var li = h("li", "markrow"), go = h("button", "markgo"), ch = listenChapter(m.end_t != null ? m.end_t : m.t, Infinity), c = lp.chapters[ch.i];
+		go.type = "button";
+		var top = h("span", "marktop");
+		top.append(h("span", null, (m.end_t != null ? "Clip · " : "") + (c ? c.title || "Chapter " + (ch.i + 1) : "Bookmark")), h("span", "chtime", markLabel(m)));
+		go.append(top);
+		if (m.note) go.append(h("span", "marknote", m.note));
+		go.addEventListener("click", function () { playMark(m); });
+		var ed = button("✎", "markedit", function () { openMark(m); });
+		ed.setAttribute("aria-label", "Edit bookmark at " + markLabel(m));
+		li.append(go, ed);
+		ol.append(li);
+	});
+	$("lpMarkSec").hidden = !list.length;
+}
+function playMark(m) {
+	var lp = state.listen;
+	if (!lp) return;
+	listenGo(m.t, true);
+	clipStop = m.end_t != null ? { book: lp.au.id, t: m.t, end: m.end_t } : null;
+}
+async function addMark() {
+	var lp = state.listen;
+	if (!lp) return;
+	var t = Math.floor(audioPos(lp.au) * 10) / 10;
+	try {
+		var d = await apiJSON("/api/books/" + lp.au.id + "/marks", { method: "POST", json: { t: t } });
+		if (state.listen !== lp) return;
+		lp.marks = (lp.marks || []).concat([d.mark]);
+		renderMarks();
+		toast("Bookmarked at " + clock(t) + ".", { label: "Add note", fn: function () { if (state.listen === lp) openMark(d.mark, true); } });
+	} catch (e) { fail(e); }
+}
+// The bookmark's panel. A clip is kept by its end (where Bookmark was
+// tapped): picking a length moves its start back from there.
+var markOpen = null;
+function openMark(m, focus) {
+	markOpen = { m: m, clip: m.end_t != null ? Math.round(m.end_t - m.t) : 0 };
+	$("lpMarkNote").value = m.note || "";
+	paintMarkDlg();
+	$("lpMarkDlg").showModal();
+	if (focus) $("lpMarkNote").focus();
+}
+function paintMarkDlg() {
+	var o = markOpen, at = o.m.end_t != null ? o.m.end_t : o.m.t;
+	$("lpMarkAt").textContent = o.clip ? "Clip: " + clock(Math.max(0, at - o.clip)) + " to " + clock(at) : "At " + clock(at);
+	$("lpMarkClip").querySelectorAll("button").forEach(function (b) { b.setAttribute("aria-pressed", String(Number(b.dataset.clip) === o.clip)); });
+}
+(function () {
+	var dlg = $("lpMarkDlg");
+	$("lpMark").addEventListener("click", addMark);
+	$("lpMarkClip").addEventListener("click", function (e) {
+		var b = e.target.closest("button");
+		if (!b || !markOpen) return;
+		markOpen.clip = Number(b.dataset.clip);
+		paintMarkDlg();
+	});
+	$("lpMarkSave").addEventListener("click", async function () {
+		var o = markOpen, lp = state.listen;
+		if (!o || !lp) return dlg.close();
+		var at = o.m.end_t != null ? o.m.end_t : o.m.t;
+		var body = { note: $("lpMarkNote").value.trim() || null };
+		if (o.clip) { body.t = Math.max(0, Math.round((at - o.clip) * 10) / 10); body.end_t = at; } else { body.t = at; body.end_t = null; }
+		dlg.close();
+		try {
+			var d = await apiJSON("/api/marks/" + o.m.id, { method: "PATCH", json: body });
+			if (state.listen !== lp) return;
+			lp.marks = lp.marks.map(function (x) { return x.id === d.mark.id ? d.mark : x; });
+			renderMarks();
+		} catch (e) { fail(e); }
+	});
+	$("lpMarkDel").addEventListener("click", async function () {
+		var o = markOpen, lp = state.listen;
+		if (!o || !lp) return dlg.close();
+		if (o.m.note && !confirm("Delete this bookmark and its note?")) return;
+		dlg.close();
+		try {
+			await apiJSON("/api/marks/" + o.m.id, { method: "DELETE" }).catch(function (e) { if (!/No such/.test(e.message)) throw e; });
+			if (state.listen !== lp) return;
+			lp.marks = lp.marks.filter(function (x) { return x.id !== o.m.id; });
+			renderMarks();
+		} catch (e) { fail(e); }
+	});
+	$("lpMarkClose").addEventListener("click", function () { dlg.close(); });
+	dlg.addEventListener("close", function () { markOpen = null; });
+	dlg.addEventListener("click", function (e) {
+		var r = dlg.getBoundingClientRect();
+		if (e.target === dlg && (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom)) dlg.close();
+	});
+	// A clip pauses at its end; skipping out of it lets it play on.
+	var audio = $("pAudio");
+	audio.addEventListener("timeupdate", function () {
+		var c = clipStop;
+		if (!c || !player.ab || !player.ep || player.ep.book !== c.book || audio.paused) return;
+		var t = abNow();
+		if (t < c.t - 2 || t > c.end + 2) { clipStop = null; return; }
+		if (t >= c.end - 0.2) { clipStop = null; audio.pause(); }
 	});
 })();
 
@@ -13774,10 +14229,10 @@ function hlSelection(sess) {
 }
 function hlWire(sess) {
 	var bar = $("hlBar"), hideTimer = null;
-	sess.cleanup.push(function () { show(bar, false); showHlPop(false); showHlList(false); });
+	sess.cleanup.push(function () { show(bar, false); showHlPop(false); showHlList(false); showLook(false); });
 	listen(sess, document, "selectionchange", function () {
 		var s = hlSelection(sess);
-		if (s) { clearTimeout(hideTimer); sess.hl.sel = s; show(bar, true); return; }
+		if (s) { clearTimeout(hideTimer); sess.hl.sel = s; show($("hlLook"), lookable(s.text)); show(bar, true); return; }
 		// Tapping the bar can clear the selection a moment before the tap lands.
 		clearTimeout(hideTimer);
 		hideTimer = setTimeout(function () { sess.hl.sel = null; show(bar, false); }, 400);
@@ -13862,6 +14317,109 @@ function hlRenumber(book, from, to) {
 }
 window.addEventListener("online", function () { if (hlPending.length && token()) flushHl().catch(function () {}); });
 
+// ---------- looking up a word
+// A short selection (a word, a name, a few words) also gets Look up on the
+// bar: the dictionary's senses, Wikipedia's summary, and when neither knows
+// it, Workers AI's guess from the paragraph it's in (/api/lookup). Answers
+// are kept for as long as the page is open.
+
+var lookCache = {};
+function lookable(text) {
+	return text.length <= 60 && text.split(/\s+/).length <= 4 && /[\p{L}]/u.test(text);
+}
+function showLook(on) { show($("lookPop"), on); }
+$("hlLook").addEventListener("pointerdown", function (e) { e.preventDefault(); });
+$("hlLook").addEventListener("mousedown", function (e) { e.preventDefault(); });
+$("hlLook").addEventListener("click", function (e) {
+	e.stopPropagation();
+	var sess = session;
+	if (!sess || !sess.hl || !sess.hl.sel) return;
+	var s = sess.hl.sel, t = sess.txt, para = t.paras[paraAt(t, s.start_pos)] || "";
+	var at = s.start_pos - t.starts[paraAt(t, s.start_pos)], from = Math.max(0, at - 500);
+	var context = para.slice(from, at + s.text.length + 500);
+	var sel = window.getSelection();
+	if (sel) sel.removeAllRanges();
+	sess.hl.sel = null;
+	show($("hlBar"), false);
+	lookUp(s.text.replace(/\s+/g, " "), context);
+});
+async function lookUp(q, context) {
+	var body = $("lookBody");
+	showHlPop(false);
+	showHlList(false);
+	openBookMenu(false);
+	$("lookWord").textContent = q;
+	body.textContent = "";
+	showLook(true);
+	var key = q.toLowerCase(), data = lookCache[key];
+	if (!data) {
+		if (state.libOffline || navigator.onLine === false) { body.append(h("p", "hint", "Look up needs a connection.")); return; }
+		body.append(h("p", "hint", "Looking it up…"));
+		try {
+			data = await apiJSON("/api/lookup?" + new URLSearchParams({ q: q, context: context || "" }));
+		} catch (e) {
+			if ($("lookWord").textContent !== q) return;
+			body.textContent = "";
+			body.append(h("p", "hint", e.message === UNAUTH ? "" : "Couldn't look it up: " + e.message));
+			return;
+		}
+		// Only keep a guess from context for this passage, not for the word.
+		if (!data.ai) lookCache[key] = data;
+	}
+	if ($("lookWord").textContent !== q || $("lookPop").hidden) return;
+	body.textContent = "";
+	lookRender(body, data);
+}
+function lookRender(body, data) {
+	var d = data.dict, w = data.wiki;
+	if (d) {
+		var head = h("p", "lookph");
+		if (d.word && d.word.toLowerCase() !== data.q.toLowerCase()) head.append(h("b", null, d.word + " "));
+		if (d.phonetic) head.append(d.phonetic + " ");
+		if (d.audio) {
+			head.append(button("▶", "btn ghost small", function () { new Audio(d.audio).play().catch(function () {}); }));
+			head.lastChild.setAttribute("aria-label", "Say it");
+		}
+		if (head.childNodes.length) body.append(head);
+		d.meanings.forEach(function (m) {
+			if (m.pos) body.append(h("p", "lookpos", m.pos));
+			var ol = h("ol", "lookdefs");
+			m.defs.forEach(function (x) {
+				var li = h("li", null, x.d);
+				if (x.ex) li.append(h("span", "lookex", "“" + x.ex + "”"));
+				ol.append(li);
+			});
+			body.append(ol);
+		});
+	}
+	if (w && !(w.disambiguation && d)) {
+		var box = h("div", "lookwiki");
+		box.append(h("p", "lookpos", "Wikipedia" + (w.description ? " · " + w.description : "")));
+		if (w.title.toLowerCase() !== data.q.toLowerCase()) box.append(h("p", "lookt", w.title));
+		box.append(h("p", null, w.disambiguation ? "Several pages go by this name." : w.extract));
+		var a = h("a", null, w.disambiguation ? "See them on Wikipedia" : "Read more on Wikipedia");
+		a.href = w.url;
+		a.target = "_blank";
+		a.rel = "noopener";
+		box.append(a);
+		body.append(box);
+	}
+	if (data.ai) {
+		var g = h("div", "lookwiki");
+		g.append(h("p", "lookpos", "From the passage (a guess by " + data.ai.model + ")"), h("p", null, data.ai.text));
+		body.append(g);
+	}
+	if (!d && !w && !data.ai) {
+		body.append(h("p", "hint", "Nothing found for “" + data.q + "”."));
+		var s = h("a", null, "Search Wiktionary");
+		s.href = "https://en.wiktionary.org/w/index.php?search=" + encodeURIComponent(data.q);
+		s.target = "_blank";
+		s.rel = "noopener";
+		body.append(s);
+	}
+}
+$("lookClose").addEventListener("click", function () { showLook(false); });
+
 // The panel for one highlight: its words, its note, Delete.
 var hlPop = { x: null };
 function showHlPop(on) { show($("hlPop"), on); if (!on) hlPop.x = null; }
@@ -13940,39 +14498,150 @@ function hlJump(sess, x) {
 	}, sess.track);
 	setTimeout(function () { if (sess.alive && sess.track) sess.track(); }, 400);
 }
-// Markdown, for pasting into Obsidian (or anywhere): the words as quotes,
-// notes under them.
-function hlMarkdown(sess) {
-	var b = sess.book, out = ["# " + b.title, ""];
-	if (b.author) out.push("*" + b.author + "*", "");
-	hlSorted(sess.hl.list).forEach(function (x) {
-		out.push(x.text.split("\n").map(function (l) { return "> " + l; }).join("\n"), "");
-		if (x.note) out.push(x.note, "");
-		out.push("---", "");
+// Markdown for Obsidian (or anywhere): YAML properties up top (title,
+// author, series, formats, status, a link back), then the highlights as
+// quotes with their notes under them, then an audiobook's bookmarks. The
+// same shape for one book's Export Markdown and for Export notes.
+// parts: [{book, highlights, marks, chapters}], one per format of the book.
+function notesMarkdown(entry, parts) {
+	var yaml = function (v) { return JSON.stringify(String(v)); };
+	var hls = [], marks = [], formats = [];
+	parts.forEach(function (p) {
+		formats.push(p.book.type);
+		hls = hls.concat(p.highlights.slice().sort(function (a, b) { return a.start_pos - b.start_pos || a.id - b.id; }));
+		marks = marks.concat(p.marks.map(function (m) { return { m: m, chapters: p.chapters || [] }; }));
 	});
+	var fin = parts.some(function (p) { return p.book.finished_at; });
+	var out = ["---", "title: " + yaml(entry.title)];
+	if (entry.author) out.push("author: " + yaml(entry.author));
+	if (entry.series) out.push("series: " + yaml(entry.series));
+	if (entry.volume != null && entry.volume !== "") out.push("volume: " + yaml(entry.volume));
+	out.push("formats: [" + formats.filter(function (f, i) { return formats.indexOf(f) === i; }).join(", ") + "]",
+		"status: " + (fin ? "finished" : "reading"),
+		"reader: " + location.origin + "/#/" + (parts.some(function (p) { return p.book.type === "audiobook"; }) ? "record" : "book") + "/" + entry.id,
+		"exported: " + new Date().toISOString().slice(0, 10),
+		"tags: [book-notes]", "---", "", "# " + entry.title, "");
+	var by = [entry.author, entry.series ? entry.series + (entry.volume != null && entry.volume !== "" ? " #" + entry.volume : "") : ""].filter(Boolean);
+	if (by.length) out.push("*" + by.join(" · ") + "*", "");
+	if (hls.length) {
+		out.push("## Highlights", "");
+		hls.forEach(function (x, i) {
+			if (i) out.push("---", "");
+			out.push(x.text.split("\n").map(function (l) { return "> " + l; }).join("\n"), "");
+			if (x.note) out.push(x.note, "");
+		});
+	}
+	if (marks.length) {
+		out.push("## Bookmarks", "");
+		marks.sort(function (a, b) { return a.m.t - b.m.t; }).forEach(function (o) {
+			var m = o.m, at = m.end_t != null ? m.end_t : m.t, ch = null;
+			o.chapters.forEach(function (c, i) { if (c.start <= at + 0.5) ch = c.title || "Chapter " + (i + 1); });
+			var line = "- **" + (m.end_t != null ? "Clip " + clock(m.t) + "–" + clock(m.end_t) : clock(m.t)) + "**" + (ch ? " · " + ch : "");
+			if (m.note) line += " — " + m.note.replace(/\n+/g, " ");
+			out.push(line);
+		});
+		out.push("");
+	}
 	return out.join("\n");
 }
-$("hlExport").addEventListener("click", async function () {
-	var sess = session;
-	if (!sess) return;
-	var md = hlMarkdown(sess), name = (sess.book.title || "Highlights").replace(/[\\/:*?"<>|]+/g, " ").trim() + " highlights.md";
-	var file = typeof File === "function" ? new File([md], name, { type: "text/markdown" }) : null;
+function fileName(s) { return String(s || "Untitled").replace(/[\\/:*?"<>|#^\[\]]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 120) || "Untitled"; }
+// Share it (a phone's share sheet, so it can go straight to Obsidian or
+// Files), or else download it.
+async function saveFile(blob, name) {
+	var file = typeof File === "function" ? new File([blob], name, { type: blob.type }) : null;
 	if (file && navigator.canShare && navigator.canShare({ files: [file] })) {
 		try { await navigator.share({ files: [file], title: name }); return; } catch (e) { if (e.name === "AbortError") return; }
 	}
 	var a = h("a");
-	a.href = URL.createObjectURL(new Blob([md], { type: "text/markdown" }));
+	a.href = URL.createObjectURL(blob);
 	a.download = name;
 	document.body.append(a);
 	a.click();
 	a.remove();
 	setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+}
+$("hlExport").addEventListener("click", function () {
+	var sess = session;
+	if (!sess) return;
+	var b = sess.book, md = notesMarkdown(b, [{ book: b, highlights: sess.hl.list, marks: [], chapters: [] }]);
+	saveFile(new Blob([md], { type: "text/markdown" }), fileName(b.title) + ".md");
 });
+
+// ---------- export notes
+// Settings → Export notes: every book with highlights or audiobook
+// bookmarks, one Markdown file each (a book in both formats is one file),
+// in a zip to unpack into an Obsidian vault. A file is named after the
+// book, so a new export replaces the old one's files.
+
+var CRC_TABLE = null;
+function crc32(u8) {
+	if (!CRC_TABLE) {
+		CRC_TABLE = new Uint32Array(256);
+		for (var n = 0; n < 256; n++) { var c = n; for (var k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; CRC_TABLE[n] = c >>> 0; }
+	}
+	var crc = 0xffffffff;
+	for (var i = 0; i < u8.length; i++) crc = CRC_TABLE[(crc ^ u8[i]) & 0xff] ^ (crc >>> 8);
+	return (crc ^ 0xffffffff) >>> 0;
+}
+// A zip with the files stored as they are (Markdown is small): [{name, text}] -> Blob.
+function makeZip(files) {
+	var enc = new TextEncoder(), parts = [], central = [], at = 0, d = new Date();
+	var time = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+	var date = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+	files.forEach(function (f) {
+		var name = enc.encode(f.name), data = enc.encode(f.text), crc = crc32(data);
+		var head = new DataView(new ArrayBuffer(30));
+		[[0, 0x04034b50, 4], [4, 20, 2], [6, 0x0800, 2], [8, 0, 2], [10, time, 2], [12, date, 2], [14, crc, 4], [18, data.length, 4], [22, data.length, 4], [26, name.length, 2], [28, 0, 2]]
+			.forEach(function (x) { if (x[2] === 4) head.setUint32(x[0], x[1], true); else head.setUint16(x[0], x[1], true); });
+		var cd = new DataView(new ArrayBuffer(46));
+		[[0, 0x02014b50, 4], [4, 20, 2], [6, 20, 2], [8, 0x0800, 2], [10, 0, 2], [12, time, 2], [14, date, 2], [16, crc, 4], [20, data.length, 4], [24, data.length, 4], [28, name.length, 2], [42, at, 4]]
+			.forEach(function (x) { if (x[2] === 4) cd.setUint32(x[0], x[1], true); else cd.setUint16(x[0], x[1], true); });
+		parts.push(head, name, data);
+		central.push(cd, name);
+		at += 30 + name.length + data.length;
+	});
+	var size = central.reduce(function (n, x) { return n + x.byteLength; }, 0), end = new DataView(new ArrayBuffer(22));
+	end.setUint32(0, 0x06054b50, true);
+	end.setUint16(8, files.length, true);
+	end.setUint16(10, files.length, true);
+	end.setUint32(12, size, true);
+	end.setUint32(16, at, true);
+	return new Blob(parts.concat(central, [end]), { type: "application/zip" });
+}
+async function exportNotes() {
+	var btn = $("exportNotes");
+	btn.disabled = true;
+	btn.textContent = "Exporting…";
+	try {
+		var d = await apiJSON("/api/export");
+		if (!state.books) await loadBooks().catch(function () {});
+		// A book in both formats (one Library entry) is one file.
+		var groups = {}, order = [];
+		d.books.forEach(function (b) {
+			var e = libEntry(b.id) || b, key = e.id;
+			if (!groups[key]) { groups[key] = { entry: e, parts: [] }; order.push(key); }
+			groups[key].parts.push({ book: b, highlights: b.highlights, marks: b.marks, chapters: b.chapters });
+		});
+		if (!order.length) { toast("No highlights or bookmarks yet."); return; }
+		var used = {}, files = order.map(function (k) {
+			var g = groups[k], name = fileName(g.entry.title), n = 2;
+			while (used[name.toLowerCase()]) name = fileName(g.entry.title) + " (" + n++ + ")";
+			used[name.toLowerCase()] = true;
+			return { name: "Reader notes/" + name + ".md", text: notesMarkdown(g.entry, g.parts) };
+		});
+		await saveFile(makeZip(files), "Reader notes " + new Date().toISOString().slice(0, 10) + ".zip");
+	} catch (e) { fail(e); } finally {
+		btn.disabled = false;
+		btn.textContent = "Export notes";
+	}
+}
+$("exportNotes").addEventListener("click", exportNotes);
 $("hlListClose").addEventListener("click", function () { showHlList(false); });
 $("bmHighlights").addEventListener("click", function (e) { e.stopPropagation(); openHlList(); });
 document.addEventListener("click", function (e) {
 	if (!$("hlPop").hidden && !$("hlPop").contains(e.target)) showHlPop(false);
 	if (!$("hlList").hidden && !$("hlList").contains(e.target)) showHlList(false);
+	if (!$("lookPop").hidden && !$("lookPop").contains(e.target)) showLook(false);
 });
 
 // ---------- read aloud
