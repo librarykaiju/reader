@@ -7349,14 +7349,14 @@ const PAGE = String.raw`<!doctype html>
 		<button type="button" data-font="serif">System serif</button>
 		<button type="button" data-font="fraunces" class="fraunces">Fraunces</button>
 	</div>
+	<div id="ttsVoiceBox" hidden>
+		<h2><label for="ttsVoice">Read aloud voice</label></h2>
+		<select id="ttsVoice"></select>
+	</div>
 	<h2>Mark read as I scroll</h2>
 	<div class="seg" id="scrollRead">
 		<button type="button" data-on="">Off</button>
 		<button type="button" data-on="1">On</button>
-	</div>
-	<div id="ttsVoiceBox" hidden>
-		<h2><label for="ttsVoice">Read aloud voice</label></h2>
-		<select id="ttsVoice"></select>
 	</div>
 	<a href="#/family" id="familyLink" class="btn small">Family library<span class="reqn" hidden></span></a>
 	<button id="forget" class="btn ghost small" type="button">Forget token on this device</button>
@@ -13976,7 +13976,7 @@ document.addEventListener("click", function (e) {
 });
 
 // ---------- read aloud
-// Read aloud (⋯ in a .txt or .epub book, or Listen on an article) speaks the
+// Read aloud (⋯ in a .txt or .epub book, or on an article) speaks the
 // text with the device's own voices (speechSynthesis), from the paragraph at
 // the top of the screen. The paragraph being read is tinted and kept in view
 // unless you've scrolled away from it. It goes a sentence at a time, since
