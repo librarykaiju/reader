@@ -7350,6 +7350,37 @@ const PAGE = String.raw`<!doctype html>
 	.sleepbtn.on, .voicebtn.on { border-color: var(--accent); color: var(--accent); }
 	.lpsleep { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 	#lpChapters { max-height: 420px; }
+	/* Car mode: the player page over everything, in buttons big enough to hit
+	   without looking long. */
+	.car { position: fixed; inset: 0; z-index: 30; display: flex; flex-direction: column; gap: 14px; background: var(--bg); color: var(--fg);
+		padding: max(14px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) max(14px, env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left)); box-sizing: border-box; }
+	.car[hidden] { display: none; }
+	body.car-on { overflow: hidden; }
+	.carhd { display: flex; align-items: center; justify-content: space-between; gap: 12px; font: 15px/1.3 var(--sans); color: var(--muted); }
+	.carhd span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.carhd button { flex: none; min-height: 52px; padding: 0 20px; border-radius: 14px; font: 600 18px var(--sans); }
+	.carnow { text-align: center; }
+	#carChap { margin: 0; font: 700 clamp(26px, min(7vw, 8vh), 56px)/1.15 var(--sans); overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+	#carTime { margin: 8px 0 0; font: 500 clamp(16px, min(4vw, 4.5vh), 26px)/1.3 var(--sans); color: var(--muted); font-variant-numeric: tabular-nums; }
+	.carctl { flex: 1; min-height: 0; display: grid; grid-template-columns: 1fr 1.25fr 1fr; grid-template-rows: 3fr 2fr; gap: 12px; }
+	.carctl button { appearance: none; min-height: 72px; border: 1px solid var(--line); border-radius: 22px; background: var(--card); color: var(--fg);
+		font: 700 clamp(24px, 6vw, 40px) var(--sans); font-variant-numeric: tabular-nums; cursor: pointer; display: grid; place-items: center; }
+	.carctl button:disabled { opacity: .35; cursor: default; }
+	.carctl button:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+	.carctl svg { width: clamp(34px, 8vw, 56px); height: clamp(34px, 8vw, 56px); fill: currentColor; }
+	#carPlay { grid-column: 2; grid-row: 1 / 3; background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-size: clamp(40px, min(12vw, 16vh), 80px); line-height: 1; }
+	#carPrev { grid-column: 1 / 2; }
+	#carNext { grid-column: 3 / 4; }
+	#carPrev, #carNext { grid-row: 2; }
+	@media (max-aspect-ratio: 3/4) {
+		.carctl { grid-template-columns: 1fr 1fr; grid-template-rows: 2fr 1.4fr 1fr; }
+		#carPlay { grid-column: 1 / 3; grid-row: 1; }
+		#carBack { grid-row: 2; grid-column: 1; }
+		#carFwd { grid-row: 2; grid-column: 2; }
+		#carPrev, #carNext { grid-row: 3; }
+		#carPrev { grid-column: 1; }
+		#carNext { grid-column: 2; }
+	}
 	.marks .markrow { display: flex; align-items: stretch; }
 	.marks .markgo { flex: 1; min-width: 0; flex-direction: column; justify-content: flex-start; gap: 2px; }
 	.marktop { display: flex; justify-content: space-between; gap: 12px; width: 100%; }
@@ -7676,6 +7707,12 @@ const PAGE = String.raw`<!doctype html>
 		<button type="button" data-on="">Off</button>
 		<button type="button" data-on="1">On</button>
 	</div>
+	<h2>Keep screen on</h2>
+	<div class="seg" id="awake">
+		<button type="button" data-on="">Off</button>
+		<button type="button" data-on="1">On</button>
+	</div>
+	<p class="hint">While a book or the audiobook player is open, so it doesn't dim and lock as you read or listen. Car mode always keeps it on.</p>
 	<h2>Notes</h2>
 	<button id="exportNotes" class="btn small" type="button">Export notes</button>
 	<p class="hint">Every book's highlights and audiobook bookmarks, one Markdown file per book, in a zip for an Obsidian vault.</p>
@@ -7896,6 +7933,7 @@ const PAGE = String.raw`<!doctype html>
 				<button id="lpSleep" class="btn small sleepbtn" type="button" aria-controls="lpSleepOpts">Sleep</button>
 				<button id="lpVoice" class="btn small voicebtn" type="button" aria-label="Voice boost: off">Voice</button>
 				<button id="lpMark" class="btn small" type="button">Bookmark</button>
+				<button id="lpCar" class="btn small" type="button" aria-haspopup="dialog">Car mode</button>
 				<span id="lpBook"></span>
 				<a id="lpRecord" href="#/library">Record</a>
 			</div>
@@ -7938,6 +7976,17 @@ const PAGE = String.raw`<!doctype html>
 		<div class="chapdlghd"><h2 id="lpChapDlgH">Chapters</h2><button id="lpChapClose" class="btn ghost" type="button" aria-label="Close">&times;</button></div>
 		<ol id="lpChapPick" class="chapters"></ol>
 	</dialog>
+	<div id="carMode" class="car" role="dialog" aria-modal="true" aria-label="Car mode" hidden>
+		<div class="carhd"><span id="carBook"></span><button id="carExit" class="btn" type="button">Exit</button></div>
+		<div class="carnow"><p id="carChap"></p><p id="carTime"></p></div>
+		<div class="carctl">
+			<button id="carBack" type="button" aria-label="Back 30 seconds">&#8634;30</button>
+			<button id="carPlay" type="button" aria-label="Play">&#9654;</button>
+			<button id="carFwd" type="button" aria-label="Forward 30 seconds">30&#8635;</button>
+			<button id="carPrev" type="button" aria-label="Previous chapter"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h2.2v14H6zM19 5v14L9.5 12z"/></svg></button>
+			<button id="carNext" type="button" aria-label="Next chapter"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.8 5H18v14h-2.2zM5 5v14l9.5-7z"/></svg></button>
+		</div>
+	</div>
 </section>
 
 <section id="familyView" class="wrap" hidden>
@@ -9660,6 +9709,7 @@ function parseHash() {
 }
 function showView(name) {
 	["list", "article", "podcasts", "library", "book", "record", "listen", "family"].forEach(function (v) { show($(v + "View"), v === name); });
+	if (name !== "listen") carMode(false);
 	if ($("lpChapDlg").open) $("lpChapDlg").close();
 	var top = name === "list" || name === "podcasts" || name === "library";
 	show($("tabs"), top);
@@ -9682,6 +9732,7 @@ async function route() {
 	}
 	state.prev = prev;
 	state.route = r;
+	keepAwake();
 	videoBox.close();
 	closeBook();
 	ttsStop();
@@ -12149,6 +12200,14 @@ function renderListen() {
 	$("lpRate").textContent = player.rate + "×";
 	paintSleep();
 	$("lpBook").textContent = (n > 1 && ch.i >= 0 ? "Chapter " + (ch.i + 1) + " of " + n + " · " : "") + hours(Math.max(0, total - t)) + " left";
+	if (!$("carMode").hidden) {
+		$("carBook").textContent = au.title + (au.author ? " · " + au.author : "");
+		$("carChap").textContent = n > 1 && c ? c.title || "Chapter " + (ch.i + 1) : au.title;
+		$("carTime").textContent = (n > 1 && ch.i >= 0 ? "Chapter " + (ch.i + 1) + " of " + n + " · " : "") + clock(Math.max(0, ch.end - t)) + " left";
+		$("carPlay").innerHTML = $("lpPlay").innerHTML;
+		$("carPlay").setAttribute("aria-label", playing ? "Pause" : "Play");
+		$("carNext").disabled = $("lpNext").disabled;
+	}
 	if (ch.i !== lp.cur) {
 		lp.cur = ch.i;
 		[$("lpChapters"), $("lpChapPick")].forEach(function (ol) {
@@ -12166,8 +12225,64 @@ function chapterStep(by) {
 	if (by < 0) listenGo(t - ch.start > 3 || ch.i <= 0 ? ch.start : cs[ch.i - 1].start);
 	else if (cs[ch.i + 1]) listenGo(cs[ch.i + 1].start);
 }
+// Car mode: the player page full screen, with the chapter's name in big
+// type and five big buttons (back 30, play, forward 30, previous and next
+// chapter). It runs the same player; Exit or leaving the page ends it.
+// The screen stays on while it shows, whatever the setting.
+function carMode(on) {
+	var el = $("carMode");
+	if (on === !el.hidden) return;
+	el.hidden = !on;
+	document.body.classList.toggle("car-on", on);
+	var fs = document.documentElement;
+	if (on) {
+		if (fs.requestFullscreen && !document.fullscreenElement) fs.requestFullscreen().catch(function () {});
+		renderListen();
+		$("carPlay").focus();
+	} else {
+		if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(function () {});
+		if (onListen()) $("lpCar").focus();
+	}
+	keepAwake();
+}
+// Keep the screen on (Wake Lock) while a book or the audiobook player page
+// is open, unless turned off in settings; always in car mode. The browser
+// lets it go when the app is in the background, so it's asked for again on
+// coming back.
+var awake = { on: read("readerAwake") !== "off", lock: null };
+function keepAwake() {
+	if (!awake || !("wakeLock" in navigator)) return;
+	var r = state.route;
+	var want = document.visibilityState === "visible" && (!$("carMode").hidden || (awake.on && !!r && (r.name === "book" || r.name === "listen")));
+	if (want && !awake.lock) {
+		awake.lock = "asking";
+		navigator.wakeLock.request("screen").then(function (l) {
+			if (awake.lock !== "asking") return l.release().catch(function () {});
+			awake.lock = l;
+			l.addEventListener("release", function () { if (awake.lock === l) awake.lock = null; });
+		}, function () { if (awake.lock === "asking") awake.lock = null; });
+	} else if (!want && awake.lock) {
+		var l = awake.lock;
+		awake.lock = null;
+		if (l !== "asking") l.release().catch(function () {});
+	}
+}
+function applyAwake(on) {
+	awake.on = on;
+	document.querySelectorAll("#awake button").forEach(function (b) { b.setAttribute("aria-pressed", String(!!b.dataset.on === on)); });
+	keepAwake();
+}
+document.addEventListener("visibilitychange", keepAwake);
 (function () {
 	var audio = $("pAudio");
+	$("lpCar").addEventListener("click", function () { carMode(true); });
+	$("carExit").addEventListener("click", function () { carMode(false); });
+	$("carPlay").addEventListener("click", function () { $("lpPlay").click(); });
+	$("carBack").addEventListener("click", function () { if (state.listen) listenGo(audioPos(state.listen.au) - 30); });
+	$("carFwd").addEventListener("click", function () { if (state.listen) listenGo(audioPos(state.listen.au) + 30); });
+	$("carPrev").addEventListener("click", function () { chapterStep(-1); });
+	$("carNext").addEventListener("click", function () { chapterStep(1); });
+	document.addEventListener("keydown", function (e) { if (e.key === "Escape" && !$("carMode").hidden) carMode(false); });
 	$("lpPlay").addEventListener("click", function () {
 		var lp = state.listen;
 		if (!lp) return;
@@ -16271,6 +16386,12 @@ $("scrollRead").addEventListener("click", function (e) {
 	store("readerScrollRead", b.dataset.on || null);
 	applyScrollRead(!!b.dataset.on);
 });
+$("awake").addEventListener("click", function (e) {
+	var b = e.target.closest("button");
+	if (!b) return;
+	store("readerAwake", b.dataset.on ? null : "off");
+	applyAwake(!!b.dataset.on);
+});
 $("forget").addEventListener("click", function () { store("readerToken", null); openSettings(false); askToken(); });
 $("addForm").addEventListener("submit", addFeed);
 $("addTag").addEventListener("change", async function () {
@@ -16436,6 +16557,7 @@ applyTheme(read("readerTheme"));
 applySize(fontSize);
 applyFont(readFont);
 applyScrollRead(scrollRead);
+applyAwake(awake.on);
 if (token()) start(); else askToken();
 </script>
 </body>
