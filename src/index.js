@@ -6004,6 +6004,12 @@ function voiceLabel() { return ["Voice", "Voice +", "Voice ++"][voice.level]; }
 document.addEventListener("click", function (e) {
 	if (voice.level && e.target.closest && e.target.closest(".lplay, #lbar")) voiceCtx();
 }, true);
+// Smart rewind: play after a pause backs up a little, more the longer it
+// was paused (none under a minute, 10 seconds up to 10 minutes, 20 up to an
+// hour, 30 after that), so the sentence that was cut off is heard again.
+// The pause is kept on the device, so it counts across a reload; and only
+// when the place is still where it paused (not after a jump to a chapter).
+function rewindFor(away) { return away < 60e3 ? 0 : away < 600e3 ? 10 : away < 3600e3 ? 20 : 30; }
 function previewAudio(sess, b, d) {
 	$("pvNote").textContent = [b.narrator ? "Read by " + b.narrator : "", hours(d.duration || b.duration)].filter(Boolean).join(" · ");
 	var files = d.files || [], starts = [], total = 0;
@@ -6063,8 +6069,25 @@ function previewAudio(sess, b, d) {
 		render(t);
 		if (nowPlaying === eng) paintBar();
 	});
-	audio.addEventListener("play", function () { voiceWire(audio); playing(); showPlaying(); position(now()); paintBar(); });
-	audio.addEventListener("pause", function () { showPlaying(); position(now()); paintBar(); });
+	// Smart rewind (rewindFor): the pause kept, and on play the place backs up.
+	var pauseKey = "listenPause:" + b.id;
+	var placeNow = function () { return cur < 0 ? 0 : starts[cur] + (pending != null ? pending : audio.currentTime || 0); };
+	var rewind = function () {
+		var p = null;
+		try { p = JSON.parse(read(pauseKey) || "null"); } catch (e) {}
+		store(pauseKey, "");
+		if (!p || !p.at) return;
+		var by = rewindFor(Date.now() - p.at), t = placeNow();
+		if (!by || Math.abs(t - p.pos) > 3) return;
+		// Still loading the file: it starts back there instead.
+		if (pending != null && pending >= by) pending -= by;
+		else seek(t - by, true);
+	};
+	audio.addEventListener("play", function () { rewind(); voiceWire(audio); playing(); showPlaying(); position(now()); paintBar(); });
+	audio.addEventListener("pause", function () {
+		if (!audio.ended && cur >= 0) store(pauseKey, JSON.stringify({ at: Date.now(), pos: placeNow() }));
+		showPlaying(); position(now()); paintBar();
+	});
 	audio.addEventListener("pause", keep);
 	audio.addEventListener("error", function () {
 		if (onPage() && audio.error) $("pvNote").textContent = "This audiobook couldn't play just now. The home server may be offline, so try again later.";
@@ -11317,6 +11340,39 @@ function keepPos(who, pos, len, ended, now) {
 	api("/api/items/" + ep.id, { method: "PATCH", json: patch, keepalive: true }).catch(function () {});
 }
 function findListed(id) { return state.episodes.filter(function (e) { return e.id === id; })[0] || null; }
+// Smart rewind, for audiobooks and podcasts: play after a pause backs up a
+// little, more the longer it was paused (none under a minute, 10 seconds up
+// to 10 minutes, 20 up to an hour, 30 after that), so the sentence that was
+// cut off is heard again. The pause is kept on this device, so it counts
+// across a reload; and only when the place is still where it paused (not
+// after a jump to a chapter, or listening on another device since).
+function rewindFor(away) { return away < 60e3 ? 0 : away < 600e3 ? 10 : away < 3600e3 ? 20 : 30; }
+function placeNow() {
+	var audio = $("pAudio"), ep = player.ep;
+	if (!ep) return 0;
+	if (ep.book) return abNow();
+	return audio.readyState ? audio.currentTime || 0 : epPos(ep);
+}
+function keepPause() {
+	var audio = $("pAudio");
+	if (!player.ep || audio.ended || !audio.src) return;
+	store("readerPause", JSON.stringify({ id: player.ep.id, at: Date.now(), pos: placeNow() }));
+}
+function smartRewind() {
+	var audio = $("pAudio"), ep = player.ep, p = null;
+	try { p = JSON.parse(read("readerPause") || "null"); } catch (e) {}
+	store("readerPause", null);
+	if (!p || !ep || p.id !== ep.id) return;
+	var by = rewindFor(Date.now() - p.at), t = placeNow();
+	if (!by || Math.abs(t - p.pos) > 3) return;
+	if (ep.book) return abSeek(t - by, true);
+	if (audio.readyState) { audio.currentTime = Math.max(0, t - by); return; }
+	// Not loaded yet: once it is, after it's gone to the place.
+	audio.addEventListener("loadedmetadata", function once() {
+		audio.removeEventListener("loadedmetadata", once);
+		audio.currentTime = Math.max(0, audio.currentTime - by);
+	});
+}
 
 (function () {
 	var audio = $("pAudio");
@@ -11332,7 +11388,8 @@ function findListed(id) { return state.episodes.filter(function (e) { return e.i
 		if (player.ab && audio.error) playFailed();
 	});
 	audio.addEventListener("timeupdate", function () { renderPlayer(); saveEpisodePos(false); });
-	audio.addEventListener("pause", function () { saveEpisodePos(true); });
+	audio.addEventListener("pause", function () { saveEpisodePos(true); keepPause(); });
+	audio.addEventListener("play", smartRewind);
 	audio.addEventListener("ended", function () {
 		var ab = player.ab;
 		if (ab && player.ep && player.ep.book) {
