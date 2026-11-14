@@ -153,6 +153,7 @@
 //                                  {"type": "audiobook", "files", "chapters", "duration"}
 //   GET    /api/family/books/:id/preview/page/:n  a comic's page n (from 0)
 //   GET    /api/family/books/:id/preview/part?at=&len=  len bytes of a PDF from byte at, for pdf.js
+//   GET    /api/family/lookup?q=&context=  as /api/lookup, for a word selected while reading online
 //   GET    /api/family/places  -> {"places": [{book, kind, place, pct, at}]}: where this family member is in the
 //                                  books they read online (kind "read") or listen to ("listen"), newest first.
 //                                  The shelf (see "The shelf") is for family sign-ins only: 403 for the owner
@@ -3278,6 +3279,8 @@ async function familyApi(request, env, url, who) {
 		return res;
 	}
 	if (p === "/api/family/books") return familyBooks(env);
+	// Look up a word or name selected while reading online (as /api/lookup).
+	if (p === "/api/family/lookup") return lookupWord(request, env, url);
 	const record = p.match(/^\/api\/family\/books\/(\d+)$/);
 	if (record) return familyRecord(env, toId(record[1]));
 	const cover = p.match(/^\/api\/family\/books\/(\d+)\/cover$/);
@@ -5081,13 +5084,13 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.pvby { font: italic 400 18px/1.35 var(--display); margin: 0 0 6px; }
 	.pvnote { font-size: 14px; margin: 0 0 22px; }
 	.pvnote:empty { margin-bottom: 18px; }
-	.pvtext { font: 400 19px/1.65 var(--display); background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 34px clamp(18px, 6vw, 56px) 30px;
+	.pvtext { font: 400 var(--rsize, 19px)/var(--rline, 1.65) var(--rfont, var(--display)); background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 34px var(--rpad, clamp(18px, 6vw, 56px)) 30px;
 		box-shadow: 0 1px 3px rgba(0,0,0,.06); overflow-wrap: break-word; }
 	.pvtext p { margin: 0; text-indent: 1.4em; white-space: pre-line; }
 	.pvtext h2 + p, .pvtext hr + p, .pvtext p:first-child, .pvtext blockquote + p { text-indent: 0; }
-	.pvtext h2 { font: 600 23px/1.3 var(--display); text-align: center; margin: 10px 0 18px; }
+	.pvtext h2 { font: 600 1.2em/1.3 var(--rfont, var(--display)); text-align: center; margin: 10px 0 18px; }
 	.pvtext h2 + h2 { margin-top: -10px; font-size: 18px; font-weight: 400; font-style: italic; }
-	.pvtext blockquote { margin: 12px 1.4em; font-size: 17px; white-space: pre-line; }
+	.pvtext blockquote { margin: 12px 1.4em; font-size: .9em; white-space: pre-line; }
 	.pvtext hr { border: 0; margin: 34px 0; text-align: center; height: 1em; }
 	.pvtext hr::before { content: "\2042"; color: var(--muted); font-size: 18px; }
 	.pvpages { display: flex; flex-direction: column; align-items: center; gap: 14px; }
@@ -5217,6 +5220,84 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.listbox input[type=checkbox] { width: 20px; height: 20px; accent-color: var(--accent); flex: none; }
 	.listbox .newlist { margin-top: 8px; }
 	.shnote { font-size: 14px; }
+	/* Light and Dark (Sepia is :root). */
+	:root[data-theme=light] { --bg: #fbfaf7; --fg: #1f1d1a; --muted: #6b665e; --line: #e4e0d8; --card: #ffffff; --sel: #ece8df; --accent: #8a4b14; --on-accent: #fff; }
+	:root[data-theme=dark] { --bg: #1b1814; --fg: #e9e1d3; --muted: #a69a87; --line: #3a332a; --card: #241f1a; --sel: #3a3128; --accent: #e0a066; --on-accent: #1b1814; color-scheme: dark; }
+	:root[data-theme=dark] .pvpages img, :root[data-theme=dark] .pvpages .pvpdf { filter: brightness(.88); }
+	@font-face { font-family: "Atkinson Hyperlegible"; src: url(/fonts/atkinson-400.woff2) format("woff2"); font-weight: 400; font-display: swap; }
+	@font-face { font-family: "Atkinson Hyperlegible"; src: url(/fonts/atkinson-700.woff2) format("woff2"); font-weight: 700; font-display: swap; }
+	@font-face { font-family: "Atkinson Hyperlegible"; src: url(/fonts/atkinson-400-italic.woff2) format("woff2"); font-weight: 400; font-style: italic; font-display: swap; }
+	@font-face { font-family: "Atkinson Hyperlegible"; src: url(/fonts/atkinson-700-italic.woff2) format("woff2"); font-weight: 700; font-style: italic; font-display: swap; }
+	/* Stays at the top while reading, so Display and Read aloud are a tap away from any page. */
+	.pvtools { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 8px; margin: 4px -16px 10px; padding: max(8px, env(safe-area-inset-top)) 16px 8px; background: var(--bg); }
+	.pvtools button { appearance: none; border: 1px solid var(--line); background: var(--card); color: var(--fg); border-radius: 999px; padding: 6px 14px; min-height: 38px; font: 14px var(--sans); cursor: pointer; }
+	.pvtools button[aria-pressed=true] { border-color: var(--accent); color: var(--accent); }
+	.pvtools button span { font: 600 15px var(--display); margin-right: 2px; }
+	.dispdlg { max-height: calc(100vh - 40px); overflow-y: auto; font-family: var(--sans); }
+	.dispdlg h3 { font: 600 13px/1.3 var(--sans); margin: 16px 0 6px; }
+	.dispdlg h3 .muted { font-weight: 400; }
+	.dhint { font-size: 13px; margin: 6px 0 0; }
+	.seg { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+	.seg button { appearance: none; flex: 1 1 0; min-width: 0; min-height: 42px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); border-radius: 10px; font: 15px var(--sans); cursor: pointer; padding: 0 8px; }
+	.seg button[aria-pressed=true] { border-color: var(--accent); color: var(--accent); font-weight: 600; box-shadow: inset 0 0 0 1px var(--accent); }
+	.seg button:disabled { opacity: .4; cursor: default; }
+	.seg .f-serif { font-family: var(--display); }
+	.seg .f-atk { font-family: "Atkinson Hyperlegible", var(--sans); }
+	.sizes #dSizeVal { flex: none; min-width: 3ch; text-align: center; font-variant-numeric: tabular-nums; }
+	/* Bars at the bottom over the book: Look up, and the read-aloud controls (above the player bar when one shows). */
+	.fbar { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(14px + env(safe-area-inset-bottom) + var(--lost, 0px)); z-index: 16; display: flex; align-items: center; gap: 4px;
+		background: var(--card); border: 1px solid var(--line); border-radius: 999px; padding: 6px; box-shadow: 0 6px 22px rgba(0,0,0,.2); font-family: var(--sans); }
+	.fbar[hidden] { display: none; }
+	.fbar button { appearance: none; min-width: 44px; min-height: 44px; border: 0; border-radius: 999px; background: none; color: var(--accent); font: 600 15px var(--sans); font-variant-numeric: tabular-nums; cursor: pointer; padding: 0 12px; }
+	.fbar svg { width: 20px; height: 20px; fill: currentColor; display: block; margin: auto; }
+	.fbar .pplay { background: var(--accent); color: var(--on-accent); width: 46px; padding: 0; }
+	body.has-lbar .fbar { bottom: calc(86px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
+	body.has-tts .lookbar { bottom: calc(80px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
+	body.has-tts.has-lbar .lookbar { bottom: calc(152px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
+	body.has-tts { padding-bottom: calc(80px + env(safe-area-inset-bottom)); }
+	.speaking { background: var(--sel); box-shadow: 0 0 0 6px var(--sel); border-radius: 2px; }
+	.lookdlg { font-family: var(--sans); }
+	.lookdlg .chapdlghd h2 { text-transform: none; letter-spacing: 0; font: 600 20px/1.25 var(--display); color: var(--fg); }
+	.lookbody { overflow-y: auto; font-size: 15px; line-height: 1.45; }
+	.lookph { color: var(--muted); margin: 6px 0; }
+	.lookpos { font: 600 12px/1.3 var(--sans); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 12px 0 4px; }
+	.lookdefs { margin: 0; padding-left: 22px; }
+	.lookdefs li + li { margin-top: 4px; }
+	.lookex { display: block; color: var(--muted); font-style: italic; }
+	.lookwiki { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 4px; }
+	.lookwiki p { margin: 4px 0 8px; }
+	.lookt { font-weight: 600; }
+	/* Car mode: the Listen page over everything, in buttons big enough to hit without looking long. */
+	.car { position: fixed; inset: 0; z-index: 30; display: flex; flex-direction: column; gap: 14px; background: var(--bg); color: var(--fg); font-family: var(--sans);
+		padding: max(14px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) max(14px, env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left)); box-sizing: border-box; }
+	.car[hidden] { display: none; }
+	body.car-on { overflow: hidden; }
+	.carhd { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 15px; color: var(--muted); }
+	.carhd span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.carhd button { appearance: none; flex: none; min-height: 52px; padding: 0 20px; border-radius: 14px; border: 1px solid var(--line); background: var(--card); color: var(--fg); font: 600 18px var(--sans); cursor: pointer; }
+	.carnow { text-align: center; }
+	#carChap { margin: 0; font: 700 clamp(26px, min(7vw, 8vh), 56px)/1.15 var(--sans); overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+	#carTime { margin: 8px 0 0; font: 500 clamp(16px, min(4vw, 4.5vh), 26px)/1.3 var(--sans); color: var(--muted); font-variant-numeric: tabular-nums; }
+	.carctl { flex: 1; min-height: 0; display: grid; grid-template-columns: 1fr 1.25fr 1fr; grid-template-rows: 3fr 2fr; gap: 12px; }
+	.carctl button { appearance: none; min-height: 72px; border: 1px solid var(--line); border-radius: 22px; background: var(--card); color: var(--fg);
+		font: 700 clamp(24px, 6vw, 40px) var(--sans); font-variant-numeric: tabular-nums; cursor: pointer; display: grid; place-items: center; }
+	.carctl button:disabled { opacity: .35; cursor: default; }
+	.carctl button:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+	.carctl svg { width: clamp(34px, 8vw, 56px); height: clamp(34px, 8vw, 56px); fill: currentColor; }
+	#carPlay { grid-column: 2; grid-row: 1 / 3; background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+	#carPlay svg { width: clamp(44px, min(12vw, 16vh), 84px); height: clamp(44px, min(12vw, 16vh), 84px); }
+	#carPrev { grid-column: 1 / 2; }
+	#carNext { grid-column: 3 / 4; }
+	#carPrev, #carNext { grid-row: 2; }
+	@media (max-aspect-ratio: 3/4) {
+		.carctl { grid-template-columns: 1fr 1fr; grid-template-rows: 2fr 1.4fr 1fr; }
+		#carPlay { grid-column: 1 / 3; grid-row: 1; }
+		#carBack { grid-row: 2; grid-column: 1; }
+		#carFwd { grid-row: 2; grid-column: 2; }
+		#carPrev, #carNext { grid-row: 3; }
+		#carPrev { grid-column: 1; }
+		#carNext { grid-column: 2; }
+	}
 	@media (max-width: 380px) { #lbBack, #lbFwd { display: none; } }
 	@media (max-width: 600px) {
 		.lplay { grid-template-columns: minmax(0, 1fr); gap: 18px; padding: 18px 14px; }
@@ -5357,6 +5438,10 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 			<p id="pvEye" class="eyebrow pveye">Read online</p>
 			<h1 id="pvTitle" tabindex="-1"></h1>
 			<p id="pvBy" class="pvby"></p>
+			<div class="pvtools">
+				<button id="pvAa" type="button" aria-haspopup="dialog" aria-label="Display: colors, text size and font"><span aria-hidden="true">Aa</span> Display</button>
+				<button id="pvAloud" type="button" aria-pressed="false" hidden>Read aloud</button>
+			</div>
 			<p id="pvNote" class="pvnote muted"></p>
 			<div id="pvBody"></div>
 			<div id="pvEnd" class="pvend" hidden>
@@ -5371,10 +5456,50 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 			<h1 id="shTitle" tabindex="-1"></h1>
 			<div id="shBody"></div>
 		</article>
-		<footer><a id="howLink" href="#">How to save this page</a></footer>
+		<footer><a id="howLink" href="#">How to save this page</a> · <a id="dispLink" href="#">Display</a></footer>
 	</div>
 </main>
 <div id="lbAudio" hidden></div>
+<dialog id="disp" class="chapdlg dispdlg" aria-labelledby="dispH">
+	<div class="chapdlghd"><h2 id="dispH">Display</h2><button id="dClose" class="x" type="button" aria-label="Close">&times;</button></div>
+	<h3>Colors</h3>
+	<div class="seg" role="group" aria-label="Colors"><button type="button" data-k="theme" data-v="light">Light</button><button type="button" data-k="theme" data-v="sepia">Sepia</button><button type="button" data-k="theme" data-v="dark">Dark</button></div>
+	<h3>Text size <span class="muted">(reading online)</span></h3>
+	<div class="seg sizes"><button id="dSmaller" type="button" aria-label="Smaller text">A&minus;</button><span id="dSizeVal" aria-live="polite"></span><button id="dBigger" type="button" aria-label="Bigger text">A+</button></div>
+	<h3>Font</h3>
+	<div class="seg" role="group" aria-label="Font"><button type="button" data-k="font" data-v="serif" class="f-serif">Serif</button><button type="button" data-k="font" data-v="atkinson" class="f-atk">Easy to read</button></div>
+	<p class="dhint muted">Easy to read is Atkinson Hyperlegible, made so letters are easy to tell apart, for low vision and dyslexia.</p>
+	<h3>Line spacing</h3>
+	<div class="seg" role="group" aria-label="Line spacing"><button type="button" data-k="line" data-v="tight">Tight</button><button type="button" data-k="line" data-v="normal">Normal</button><button type="button" data-k="line" data-v="loose">Loose</button></div>
+	<h3>Margins</h3>
+	<div class="seg" role="group" aria-label="Margins"><button type="button" data-k="margin" data-v="narrow">Narrow</button><button type="button" data-k="margin" data-v="normal">Normal</button><button type="button" data-k="margin" data-v="wide">Wide</button></div>
+	<h3>Keep screen on</h3>
+	<div class="seg" role="group" aria-label="Keep screen on"><button type="button" data-k="awake" data-v="on">On</button><button type="button" data-k="awake" data-v="off">Off</button></div>
+	<p class="dhint muted">While a book is open to read or listen to, so it doesn't dim and lock. Car mode always keeps it on.</p>
+</dialog>
+<dialog id="look" class="chapdlg lookdlg" aria-labelledby="lookWord">
+	<div class="chapdlghd"><h2 id="lookWord"></h2><button id="lookClose" class="x" type="button" aria-label="Close">&times;</button></div>
+	<div id="lookBody" class="lookbody"></div>
+</dialog>
+<div id="lookBar" class="fbar lookbar" hidden><button id="lookGo" type="button">Look up</button></div>
+<div id="ttsBar" class="fbar ttsbar" role="group" aria-label="Read aloud" hidden>
+	<button id="ttsPrev" type="button" aria-label="Previous paragraph"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h2.2v14H6zM19 5v14L9.5 12z"/></svg></button>
+	<button id="ttsPlay" class="pplay" type="button" aria-label="Pause"></button>
+	<button id="ttsNext" type="button" aria-label="Next paragraph"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.8 5H18v14h-2.2zM5 5v14l9.5-7z"/></svg></button>
+	<button id="ttsRate" type="button" aria-label="Reading speed">1&times;</button>
+	<button id="ttsClose" type="button" aria-label="Stop reading aloud">&times;</button>
+</div>
+<div id="carMode" class="car" role="dialog" aria-modal="true" aria-label="Car mode" hidden>
+	<div class="carhd"><span id="carBook"></span><button id="carExit" type="button">Exit</button></div>
+	<div class="carnow"><p id="carChap"></p><p id="carTime"></p></div>
+	<div class="carctl">
+		<button id="carBack" type="button" aria-label="Back 30 seconds">&#8634;30</button>
+		<button id="carPlay" type="button" aria-label="Play"></button>
+		<button id="carFwd" type="button" aria-label="Forward 30 seconds">30&#8635;</button>
+		<button id="carPrev" type="button" aria-label="Previous chapter"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h2.2v14H6zM19 5v14L9.5 12z"/></svg></button>
+		<button id="carNext" type="button" aria-label="Next chapter"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.8 5H18v14h-2.2zM5 5v14l9.5-7z"/></svg></button>
+	</div>
+</div>
 <div id="lbar" class="lbar" hidden>
 	<div class="lbprog"><span id="lbProg"></span></div>
 	<div class="lbrow">
@@ -6026,6 +6151,370 @@ function recordDetails(b, rec) {
 		box.innerHTML = '<p class="muted">Nothing more on this one yet.</p>';
 	}
 }
+// ---------- display (per device): colors, text and keep screen on
+// Light, Sepia (the library's own colors, and the default) or Dark, on the
+// whole page once signed in. Reading online also takes a text size, a font
+// (the serif, or Atkinson Hyperlegible, made so letters are easy to tell
+// apart, for low vision and dyslexia), line spacing and margins. Changing
+// the text keeps the paragraph a third of the way down the screen in place.
+var DISP_THEMES = { light: "#fbfaf7", sepia: "#f4ecd8", dark: "#1b1814" };
+var DISP_FONTS = { serif: "var(--display)", atkinson: '"Atkinson Hyperlegible", var(--sans)' };
+var DISP_LINES = { tight: 1.4, normal: 1.65, loose: 1.95 };
+var DISP_MARGINS = { narrow: "12px", normal: "clamp(18px, 6vw, 56px)", wide: "clamp(28px, 12vw, 104px)" };
+var disp = {
+	theme: DISP_THEMES[read("dispTheme")] ? read("dispTheme") : "sepia",
+	size: Math.min(28, Math.max(15, Number(read("dispSize")) || 19)),
+	font: DISP_FONTS[read("dispFont")] ? read("dispFont") : "serif",
+	line: DISP_LINES[read("dispLine")] ? read("dispLine") : "normal",
+	margin: DISP_MARGINS[read("dispMargin")] ? read("dispMargin") : "normal",
+	awake: read("dispAwake") !== "off"
+};
+function applyTheme() {
+	var root = document.documentElement;
+	if (disp.theme === "sepia") root.removeAttribute("data-theme"); else root.setAttribute("data-theme", disp.theme);
+	document.querySelector("meta[name=theme-color]").content = DISP_THEMES[disp.theme];
+	document.querySelector("meta[name=color-scheme]").content = disp.theme === "dark" ? "dark" : "light";
+}
+// The paragraph (or page) a third of the way down, so a change to the text can keep it there.
+function placeOnScreen() {
+	var box = document.querySelector("#pvBody .pvtext");
+	if (!box) return null;
+	var r = box.getBoundingClientRect(), el = document.elementFromPoint(r.left + r.width / 2, window.innerHeight / 3);
+	return el && el.closest("[data-place]");
+}
+function applyText() {
+	var keep = placeOnScreen(), s = document.documentElement.style;
+	s.setProperty("--rsize", disp.size + "px");
+	s.setProperty("--rfont", DISP_FONTS[disp.font]);
+	s.setProperty("--rline", String(DISP_LINES[disp.line]));
+	s.setProperty("--rpad", DISP_MARGINS[disp.margin]);
+	if (keep) goToPlace(keep);
+	paintDisp();
+}
+function setDisp(k, v) {
+	disp[k] = v;
+	store({ theme: "dispTheme", size: "dispSize", font: "dispFont", line: "dispLine", margin: "dispMargin", awake: "dispAwake" }[k],
+		k === "awake" ? (v ? "on" : "off") : String(v));
+	if (k === "theme") applyTheme();
+	else if (k === "awake") keepAwake();
+	applyText();
+}
+function paintDisp() {
+	$("dSizeVal").textContent = disp.size;
+	$("dSmaller").disabled = disp.size <= 15;
+	$("dBigger").disabled = disp.size >= 28;
+	document.querySelectorAll("#disp [data-k]").forEach(function (b) {
+		var v = disp[b.dataset.k];
+		b.setAttribute("aria-pressed", String(b.dataset.k === "awake" ? (b.dataset.v === "on") === v : b.dataset.v === v));
+	});
+}
+function openDisp() {
+	paintDisp();
+	$("disp").showModal();
+}
+$("dSmaller").addEventListener("click", function () { setDisp("size", Math.max(15, disp.size - 1)); });
+$("dBigger").addEventListener("click", function () { setDisp("size", Math.min(28, disp.size + 1)); });
+document.querySelectorAll("#disp [data-k]").forEach(function (b) {
+	b.addEventListener("click", function () { setDisp(b.dataset.k, b.dataset.k === "awake" ? b.dataset.v === "on" : b.dataset.v); });
+});
+$("dClose").addEventListener("click", function () { $("disp").close(); });
+$("pvAa").addEventListener("click", openDisp);
+$("dispLink").addEventListener("click", function (e) { e.preventDefault(); openDisp(); });
+// A tap on the dimmed page around a panel closes it.
+["disp", "look"].forEach(function (id) {
+	var dlg = $(id);
+	dlg.addEventListener("click", function (e) {
+		var r = dlg.getBoundingClientRect();
+		if (e.target === dlg && (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom)) dlg.close();
+	});
+});
+applyText();
+
+// Keep the screen on (Wake Lock) while a book is open to read or listen to,
+// unless turned off in Display; always in car mode. The browser lets it go
+// when the page is in the background, so it's asked for again on coming back.
+var awake = { lock: null };
+function keepAwake() {
+	if (!("wakeLock" in navigator)) return;
+	var want = document.visibilityState === "visible" && (!$("carMode").hidden || (disp.awake && !!openPreview()));
+	if (want && !awake.lock) {
+		awake.lock = "asking";
+		navigator.wakeLock.request("screen").then(function (l) {
+			if (awake.lock !== "asking") return l.release().catch(function () {});
+			awake.lock = l;
+			l.addEventListener("release", function () { if (awake.lock === l) awake.lock = null; });
+		}, function () { if (awake.lock === "asking") awake.lock = null; });
+	} else if (!want && awake.lock) {
+		var l = awake.lock;
+		awake.lock = null;
+		if (l !== "asking") l.release().catch(function () {});
+	}
+}
+document.addEventListener("visibilitychange", keepAwake);
+window.addEventListener("hashchange", keepAwake);
+
+// ---------- read aloud (EPUB and text)
+// Read aloud speaks the book with the device's own voices (speechSynthesis),
+// from the paragraph a third of the way down the screen, as the app does: a
+// sentence at a time (some browsers cut off long ones), the paragraph being
+// read tinted and kept in view unless they've scrolled away from it, and the
+// next piece of the book loaded when it gets there. Pausing cancels and
+// remembers the sentence, since pause() and resume() are unreliable on
+// phones. The speed is kept on the device. It stops on leaving the book or
+// when an audiobook plays.
+var TTS_RATES = [0.8, 1, 1.2, 1.5, 1.75, 2];
+var tts = { src: null, i: 0, k: 0, pieces: null, on: false, run: 0, el: null,
+	rate: TTS_RATES.indexOf(Number(read("ttsRate"))) >= 0 ? Number(read("ttsRate")) : 1 };
+function ttsOK() { return "speechSynthesis" in window && typeof SpeechSynthesisUtterance === "function"; }
+function ttsPieces(text) {
+	var s = text.replace(/\s+/g, " ").trim(), out = [], parts;
+	if (!s) return out;
+	if (window.Intl && Intl.Segmenter) parts = Array.from(new Intl.Segmenter(undefined, { granularity: "sentence" }).segment(s), function (x) { return x.segment; });
+	else parts = s.match(/[^.!?…]+[.!?…]+["'”’)\]]*\s*|[^.!?…]+$/g) || [s];
+	parts.forEach(function (p) {
+		while (p.length > 300) {
+			var cut = p.lastIndexOf(", ", 220);
+			if (cut < 80) cut = p.lastIndexOf(" ", 220);
+			if (cut < 80) cut = 220;
+			out.push(p.slice(0, cut + 1));
+			p = p.slice(cut + 1);
+		}
+		var last = out[out.length - 1];
+		if (last != null && last.length + p.length <= 220) out[out.length - 1] = last + p; else out.push(p);
+	});
+	return out.map(function (x) { return x.trim(); }).filter(function (x) { return /[\p{L}\p{N}]/u.test(x); });
+}
+// src: {els(): the paragraphs there now, more(): a promise of more (false at the end)}.
+function ttsStart(src, start) {
+	if (!ttsOK()) { $("pvNote").textContent = "This browser can't read aloud."; return; }
+	ttsStop();
+	if (nowPlaying && !nowPlaying.paused()) nowPlaying.toggle();
+	tts.src = src;
+	tts.i = Math.max(0, start);
+	tts.k = 0;
+	tts.pieces = null;
+	document.body.classList.add("has-tts");
+	$("ttsBar").hidden = false;
+	ttsPlay();
+}
+function ttsPlay() {
+	var src = tts.src;
+	if (!src) return;
+	tts.on = true;
+	var run = ++tts.run;
+	speechSynthesis.cancel();
+	var els = src.els();
+	while (!tts.pieces || tts.k >= tts.pieces.length) {
+		if (tts.pieces) { tts.i++; tts.k = 0; tts.pieces = null; }
+		if (tts.i >= els.length) {
+			// The end of what's loaded: the next piece of the book, then on.
+			ttsPaint();
+			src.more().then(function (any) {
+				if (run !== tts.run || !tts.on) return;
+				if (any) ttsPlay(); else ttsStop();
+			}, function () { if (run === tts.run) { tts.on = false; ttsPaint(); } });
+			return;
+		}
+		tts.pieces = ttsPieces(els[tts.i].textContent);
+		if (!tts.pieces.length) { tts.pieces = null; tts.i++; }
+	}
+	ttsMark(els[tts.i]);
+	var u = new SpeechSynthesisUtterance(tts.pieces[tts.k]);
+	u.lang = document.documentElement.lang || navigator.language || "en";
+	u.rate = tts.rate;
+	u.onend = function () {
+		if (run !== tts.run || !tts.on) return;
+		tts.k++;
+		ttsPlay();
+	};
+	u.onerror = function (e) {
+		if (run !== tts.run || e.error === "interrupted" || e.error === "canceled") return;
+		tts.on = false;
+		ttsPaint();
+	};
+	speechSynthesis.speak(u);
+	ttsPaint();
+}
+function ttsPause() {
+	tts.on = false;
+	tts.run++;
+	speechSynthesis.cancel();
+	ttsPaint();
+}
+function ttsStop() {
+	if (!tts.src) return;
+	tts.run++;
+	tts.on = false;
+	if (ttsOK()) speechSynthesis.cancel();
+	if (tts.el) tts.el.classList.remove("speaking");
+	tts.el = tts.src = tts.pieces = null;
+	document.body.classList.remove("has-tts");
+	$("ttsBar").hidden = true;
+	$("pvAloud").setAttribute("aria-pressed", "false");
+}
+function ttsMark(el) {
+	if (el === tts.el) return;
+	var was = tts.el, follow = !was || ttsVisible(was);
+	if (was) was.classList.remove("speaking");
+	tts.el = el;
+	el.classList.add("speaking");
+	if (follow && !ttsVisible(el, true)) goToPlace(el);
+}
+function ttsVisible(el, whole) {
+	var r = el.getBoundingClientRect(), bottom = window.innerHeight - 140;
+	return whole ? r.top >= 0 && r.top < bottom - 40 : r.bottom > 0 && r.top < bottom;
+}
+function ttsPaint() {
+	$("pvAloud").setAttribute("aria-pressed", "true");
+	$("ttsPlay").innerHTML = tts.on ? SVG_PAUSE : SVG_PLAY;
+	$("ttsPlay").setAttribute("aria-label", tts.on ? "Pause" : "Play");
+	$("ttsRate").textContent = tts.rate + "×";
+}
+function ttsStep(by) {
+	if (!tts.src) return;
+	var n = tts.src.els().length;
+	if (by < 0 && tts.k > 0) tts.k = 0;
+	else { tts.i = Math.max(0, Math.min(n - 1, tts.i + by)); tts.k = 0; }
+	tts.pieces = null;
+	if (tts.on) ttsPlay(); else if (tts.src.els()[tts.i]) ttsMark(tts.src.els()[tts.i]);
+}
+$("ttsPlay").addEventListener("click", function () { if (tts.on) ttsPause(); else ttsPlay(); });
+$("ttsPrev").addEventListener("click", function () { ttsStep(-1); });
+$("ttsNext").addEventListener("click", function () { ttsStep(1); });
+$("ttsClose").addEventListener("click", ttsStop);
+$("ttsRate").addEventListener("click", function () {
+	tts.rate = TTS_RATES[(TTS_RATES.indexOf(tts.rate) + 1) % TTS_RATES.length];
+	store("ttsRate", String(tts.rate));
+	ttsPaint();
+	if (tts.on) ttsPlay();
+});
+
+// ---------- looking up a word (EPUB and text)
+// Selecting a word, a name or a few words in a book shows Look up at the
+// bottom: the dictionary's senses, Wikipedia's summary, and when neither
+// knows it, an AI guess from the paragraph it's in (/api/family/lookup, the
+// same lookup as the app's). Answers are kept while the page is open.
+var lookCache = {}, lookSel = null;
+function lookable(text) { return text.length <= 60 && text.split(/\s+/).length <= 4 && /[\p{L}]/u.test(text); }
+document.addEventListener("selectionchange", function () {
+	var sel = window.getSelection(), box = document.querySelector("#pvBody .pvtext"), text = sel ? String(sel).trim() : "";
+	var node = sel && sel.rangeCount ? sel.getRangeAt(0).commonAncestorContainer : null;
+	var ok = !!(box && node && box.contains(node) && text && lookable(text));
+	lookSel = ok ? { q: text.replace(/\s+/g, " "), el: (node.nodeType === 1 ? node : node.parentNode).closest("[data-place]") } : null;
+	$("lookBar").hidden = !ok;
+});
+// The button keeps the selection (a tap would otherwise clear it first).
+["pointerdown", "mousedown"].forEach(function (ev) { $("lookGo").addEventListener(ev, function (e) { e.preventDefault(); }); });
+$("lookGo").addEventListener("click", function () {
+	var s = lookSel;
+	if (!s) return;
+	var para = s.el ? s.el.textContent : "", at = Math.max(0, para.indexOf(s.q));
+	var sel = window.getSelection();
+	if (sel) sel.removeAllRanges();
+	$("lookBar").hidden = true;
+	lookUp(s.q, para.slice(Math.max(0, at - 500), at + s.q.length + 500));
+});
+$("lookClose").addEventListener("click", function () { $("look").close(); });
+function lookUp(q, context) {
+	var body = $("lookBody"), key = q.toLowerCase();
+	$("lookWord").textContent = q;
+	body.textContent = "";
+	if (!$("look").open) $("look").showModal();
+	if (lookCache[key]) return lookRender(body, lookCache[key]);
+	body.append(h("p", "muted", "Looking it up…"));
+	fetch("/api/family/lookup?" + new URLSearchParams({ q: q, context: context || "" })).then(function (res) {
+		return res.json().catch(function () { return {}; }).then(function (d) { if (!res.ok) throw new Error(d.error || "HTTP " + res.status); return d; });
+	}).then(function (data) {
+		// A guess from the passage is only good for that passage, so it isn't kept.
+		if (!data.ai) lookCache[key] = data;
+		if ($("lookWord").textContent === q && $("look").open) { body.textContent = ""; lookRender(body, data); }
+	}, function (e) {
+		if ($("lookWord").textContent !== q) return;
+		body.textContent = "";
+		body.append(h("p", "muted", "Couldn't look it up: " + e.message));
+	});
+}
+function lookLink(text, href) {
+	var a = h("a", null, text);
+	a.href = href;
+	a.target = "_blank";
+	a.rel = "noopener";
+	return a;
+}
+function lookRender(body, data) {
+	var d = data.dict, w = data.wiki;
+	if (d) {
+		if (d.word && d.word.toLowerCase() !== data.q.toLowerCase() || d.phonetic) body.append(h("p", "lookph", [d.word && d.word.toLowerCase() !== data.q.toLowerCase() ? d.word : "", d.phonetic].filter(Boolean).join(" ")));
+		d.meanings.forEach(function (m) {
+			if (m.pos) body.append(h("p", "lookpos", m.pos));
+			var ol = h("ol", "lookdefs");
+			m.defs.forEach(function (x) {
+				var li = h("li", null, x.d);
+				if (x.ex) li.append(h("span", "lookex", "“" + x.ex + "”"));
+				ol.append(li);
+			});
+			body.append(ol);
+		});
+	}
+	if (w && !(w.disambiguation && d)) {
+		var box = h("div", "lookwiki");
+		box.append(h("p", "lookpos", "Wikipedia" + (w.description ? " · " + w.description : "")));
+		if (w.title.toLowerCase() !== data.q.toLowerCase()) box.append(h("p", "lookt", w.title));
+		box.append(h("p", null, w.disambiguation ? "Several pages go by this name." : w.extract), lookLink(w.disambiguation ? "See them on Wikipedia" : "Read more on Wikipedia", w.url));
+		body.append(box);
+	}
+	if (data.ai) {
+		var g = h("div", "lookwiki");
+		g.append(h("p", "lookpos", "From the passage (a guess by " + data.ai.model + ")"), h("p", null, data.ai.text));
+		body.append(g);
+	}
+	if (!d && !w && !data.ai) {
+		body.append(h("p", "muted", "Nothing found for “" + data.q + "”."), lookLink("Search Wiktionary", "https://en.wiktionary.org/w/index.php?search=" + encodeURIComponent(data.q)));
+	}
+}
+
+// ---------- car mode (audiobooks)
+// The Listen page full screen, as in the app: the chapter's name in big
+// type, the time left in it, and five big buttons (back 30, play, forward
+// 30, previous and next chapter). It runs the same player; Exit, leaving
+// the book, or the player closing ends it. The screen stays on while it
+// shows, whatever Display says.
+var car = { eng: null };
+function carMode(eng) {
+	var on = !!eng, el = $("carMode");
+	car.eng = eng || null;
+	el.hidden = !on;
+	document.body.classList.toggle("car-on", on);
+	var fs = document.documentElement;
+	if (on) {
+		if (fs.requestFullscreen && !document.fullscreenElement) fs.requestFullscreen().catch(function () {});
+		carPaint();
+		$("carPlay").focus();
+	} else if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(function () {});
+	keepAwake();
+}
+function carPaint() {
+	var e = car.eng;
+	if (!e || $("carMode").hidden) return;
+	var t = e.now(), ch = e.chapter(t), n = e.chapters();
+	$("carBook").textContent = e.b.title + (e.b.author ? " · " + e.b.author : "");
+	$("carChap").textContent = e.label(t) || e.b.title;
+	$("carTime").textContent = (n > 1 ? "Chapter " + (ch.i + 1) + " of " + n + " · " : "") + clock(Math.max(0, ch.end - t)) + " left";
+	var playing = !e.paused();
+	$("carPlay").innerHTML = playing ? SVG_PAUSE : SVG_PLAY;
+	$("carPlay").setAttribute("aria-label", playing ? "Pause" : "Play");
+	$("carNext").disabled = !(n > 1 && ch.i + 1 < n);
+	$("carPrev").disabled = n < 2;
+}
+$("carExit").addEventListener("click", function () { carMode(null); });
+$("carPlay").addEventListener("click", function () { if (car.eng) { car.eng.toggle(); carPaint(); } });
+$("carBack").addEventListener("click", function () { if (car.eng) car.eng.skip(-30); });
+$("carFwd").addEventListener("click", function () { if (car.eng) car.eng.skip(30); });
+$("carPrev").addEventListener("click", function () { if (car.eng) car.eng.step(-1); });
+$("carNext").addEventListener("click", function () { if (car.eng) car.eng.step(1); });
+document.addEventListener("keydown", function (e) { if (e.key === "Escape" && car.eng) carMode(null); });
+window.addEventListener("hashchange", function () { if (car.eng && openPreview() !== car.eng.id) carMode(null); });
+
 // The shelf (see "The shelf" in the Worker). A place is kept on the device as
 // before (read:<id>, listen:<id>), with when it changed (at:read:<id>), and
 // also sent to the Worker, at most every 15 seconds and when the page is put
@@ -6416,6 +6905,8 @@ function paintListBox(b) {
 var PDFJS = "__PDFJS__", PDFJS_DATA = "__PDFJS_DATA__";
 var pv = null, pdfjsLoading = null;
 function closePreview() {
+	ttsStop();
+	$("lookBar").hidden = true;
 	if (!pv) return;
 	pv.alive = false;
 	pv.cleanup.forEach(function (f) { try { f(); } catch (e) {} });
@@ -6433,6 +6924,8 @@ function showPreview(b) {
 	$("pvBy").hidden = !b.author;
 	if (pv && pv.id === b.id) return;
 	closePreview();
+	$("pvAloud").hidden = true;
+	keepAwake();
 	var sess = pv = { id: b.id, alive: true, cleanup: [] };
 	$("pvNote").textContent = listen ? "Loading…" : "Loading the book…";
 	$("pvEnd").hidden = true;
@@ -6675,7 +7168,7 @@ function previewAudio(sess, b, d) {
 	// Tell the phone it's playing or paused, so the lock screen and Bluetooth
 	// play/pause follow the player instead of guessing.
 	var msState = function (s) { if (ms && nowPlaying === eng) try { ms.playbackState = s; } catch (e) {} };
-	audio.addEventListener("play", function () { rewind(); voiceWire(audio); playing(); msState("playing"); showPlaying(); position(now()); paintBar(); });
+	audio.addEventListener("play", function () { ttsStop(); rewind(); voiceWire(audio); playing(); msState("playing"); showPlaying(); position(now()); paintBar(); });
 	var pausedAt = null;
 	audio.addEventListener("pause", function () {
 		if (!audio.ended && cur >= 0) store(pauseKey, JSON.stringify({ at: pausedAt || Date.now(), pos: placeNow() }));
@@ -6747,6 +7240,7 @@ function previewAudio(sess, b, d) {
 		var on = !audio.paused && !soft;
 		playBtn.innerHTML = on ? SVG_PAUSE : SVG_PLAY;
 		playBtn.setAttribute("aria-label", on ? "Pause" : "Play");
+		if (car.eng === eng) carPaint();
 	};
 
 	// The slider runs across the chapter playing (the whole book with no chapters).
@@ -6895,8 +7389,10 @@ function previewAudio(sess, b, d) {
 		if (t < c.t - 2 || t > c.end + 2) { clipStop = null; return; }
 		if (t >= c.end - 0.2) { clipStop = null; audio.pause(); }
 	});
+	var carBtn = btn("small", "Car mode", null, function () { carMode(eng); });
+	carBtn.setAttribute("aria-haspopup", "dialog");
 	var info = h("span", "lpinfo"), more = h("div", "lpmore");
-	more.append(rateBtn, chapsBtn, sleepBtn, voiceBtn, markBtn, info);
+	more.append(rateBtn, chapsBtn, sleepBtn, voiceBtn, markBtn, carBtn, info);
 	var sleepOpts = h("div", "lpsleep");
 	sleepOpts.setAttribute("role", "group");
 	sleepOpts.setAttribute("aria-label", "Sleep timer");
@@ -6975,6 +7471,7 @@ function previewAudio(sess, b, d) {
 		seekBar.setAttribute("aria-valuetext", clock(t - ch.start) + " of " + clock(len));
 		next.disabled = !(n && ch.i + 1 < n);
 		info.textContent = (c ? "Chapter " + (ch.i + 1) + " of " + n + " · " : "") + hours(Math.max(0, total - t)) + " left";
+		if (car.eng === eng) carPaint();
 		if (ch.i !== marked) {
 			marked = ch.i;
 			lists.forEach(function (ol) {
@@ -7080,6 +7577,7 @@ function previewAudio(sess, b, d) {
 	};
 	eng.teardown = function () {
 		if (!eng.alive) return;
+		if (car.eng === eng) carMode(null);
 		keep();
 		if (soft) { clearTimeout(soft.timer); soft = null; audio.muted = false; }
 		document.removeEventListener("visibilitychange", softWake);
@@ -7106,6 +7604,8 @@ function previewAudio(sess, b, d) {
 	eng.skip = skip;
 	eng.label = function (t) { var c = chapters[chapterAt(t).i]; return c ? c.title || "Chapter " + (chapterAt(t).i + 1) : ""; };
 	eng.chapter = chapterAt;
+	eng.step = step;
+	eng.chapters = function () { return chapters.length; };
 	sess.cleanup.push(detach);
 	previewEnd(b, "");
 }
@@ -7172,31 +7672,46 @@ function previewText(sess, b, d) {
 			box.append(el);
 		});
 	};
-	// The next piece, once the end of this one is near.
-	var io = new IntersectionObserver(function (entries) {
-		if (!entries[0].isIntersecting || loading || next == null) return;
-		loading = true;
+	// The next piece, once the end of this one is near (or read aloud gets
+	// there). -> a promise of whether there was more.
+	var loadNext = function () {
+		if (next == null) return Promise.resolve(false);
+		if (loading) return loading;
 		more.textContent = "Loading…";
-		previewPiece(b, next).then(function (d) {
-			if (!sess.alive) return;
+		loading = previewPiece(b, next).then(function (d) {
 			loading = false;
+			if (!sess.alive) return false;
 			add(d);
 			next = d.next;
 			more.textContent = "";
-			if (next == null) { io.disconnect(); more.remove(); previewEnd(b, "That's the end."); return; }
+			if (next == null) { io.disconnect(); more.remove(); previewEnd(b, "That's the end."); return true; }
 			// Still in view (a short piece): straight on to the next.
 			io.unobserve(more);
 			io.observe(more);
-		}, function () {
-			if (!sess.alive) return;
+			return true;
+		}, function (e) {
 			loading = false;
+			if (!sess.alive) throw e;
 			more.textContent = "";
 			var again = h("button", "linkbtn", "Couldn't load the rest. Try again");
 			again.type = "button";
 			again.onclick = function () { io.unobserve(more); io.observe(more); };
 			more.append(again);
+			throw e;
 		});
+		return loading;
+	};
+	var io = new IntersectionObserver(function (entries) {
+		if (entries[0].isIntersecting) loadNext().catch(function () {});
 	}, { rootMargin: "0px 0px 150% 0px" });
+	// Read aloud from the paragraph a third of the way down the screen.
+	$("pvAloud").hidden = !ttsOK();
+	$("pvAloud").onclick = function () {
+		if (tts.src) return ttsStop();
+		var els = function () { return box.querySelectorAll("p[data-place], h2[data-place], blockquote[data-place]"); };
+		var here = placeOnScreen(), list = Array.prototype.indexOf.call(els(), here);
+		ttsStart({ els: els, more: loadNext }, list < 0 ? 0 : list);
+	};
 	add(d);
 	$("pvBody").append(box, more);
 	$("pvNote").textContent = "";
@@ -7353,6 +7868,7 @@ async function load() {
 	if (res.status === 401) return landing(used);
 	if (!res.ok) throw new Error("Couldn't reach the library.");
 	me = await res.json();
+	applyTheme();
 	$("head").hidden = false;
 	showSub();
 	$("intro").hidden = false;
