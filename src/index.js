@@ -6484,6 +6484,7 @@ function previewAudio(sess, b, d) {
 	eng.toggle = function () { if (audio.paused) audio.play().catch(function () {}); else audio.pause(); };
 	eng.skip = skip;
 	eng.label = function (t) { var c = chapters[chapterAt(t).i]; return c ? c.title || "Chapter " + (chapterAt(t).i + 1) : ""; };
+	eng.chapter = chapterAt;
 	sess.cleanup.push(detach);
 	previewEnd(b, "");
 }
@@ -6504,8 +6505,11 @@ function paintBar() {
 		$("lbCov").textContent = "";
 		$("lbCov").append(fillCover(h("div", "cover"), e.b));
 	}
-	$("lbTime").textContent = label ? label + " · " + clock(t) : clock(t) + " / " + clock(e.total);
-	$("lbProg").style.width = (e.total ? Math.min(100, t / e.total * 100) : 0) + "%";
+	// Like the player page: the time and the strip are for the chapter playing
+	// (the whole book when it has no chapters).
+	var ch = e.chapter(t), len = Math.max(0, ch.end - ch.start), into = Math.max(0, t - ch.start);
+	$("lbTime").textContent = clock(into) + " / " + clock(len) + (label ? " · " + label : "");
+	$("lbProg").style.width = (len ? Math.min(100, into / len * 100) : 0) + "%";
 	var paused = e.paused();
 	$("lbPlay").innerHTML = paused ? SVG_PLAY : SVG_PAUSE;
 	$("lbPlay").setAttribute("aria-label", paused ? "Play" : "Pause");
@@ -7099,13 +7103,13 @@ const PAGE = String.raw`<!doctype html>
 	.txt mark.hl.noted { text-decoration: underline dotted; text-decoration-thickness: 2px; text-underline-offset: 3px; }
 	.hlbar { position: fixed; z-index: 16; left: 50%; transform: translateX(-50%); bottom: calc(16px + env(safe-area-inset-bottom) + var(--lost, 0px)); display: flex; gap: 8px;
 		background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 8px; box-shadow: 0 6px 20px rgba(0,0,0,.18); font-family: var(--sans); }
-	body.has-pbar .hlbar { bottom: calc(106px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
+	body.has-pbar .hlbar { bottom: calc(118px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
 	.ttsbar { align-items: center; padding: 6px; }
 	.ttsbar .btn { min-width: 44px; min-height: 44px; font-variant-numeric: tabular-nums; }
 	.ttsbar svg { width: 20px; height: 20px; fill: currentColor; display: block; margin: auto; }
 	body.has-tts { padding-bottom: calc(90px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
 	body.has-tts .hlbar:not(.ttsbar) { bottom: calc(84px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
-	body.has-tts.has-pbar .hlbar:not(.ttsbar) { bottom: calc(174px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
+	body.has-tts.has-pbar .hlbar:not(.ttsbar) { bottom: calc(186px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
 	.speaking { background: var(--sel); box-shadow: 0 0 0 6px var(--sel); border-radius: 2px; }
 	#ttsVoice { width: 100%; }
 	.hlpop { font-family: var(--sans); width: min(400px, calc(100vw - 32px)); max-height: calc(100vh - 90px - env(safe-area-inset-top)); overflow: auto; }
@@ -7620,11 +7624,14 @@ const PAGE = String.raw`<!doctype html>
 	.episode .lpsleep { width: 100%; margin-top: 0; }
 	.episode .when { color: var(--muted); font-size: 14px; font-variant-numeric: tabular-nums; }
 	.btn.on { border-color: var(--accent); color: var(--accent); }
-	body.has-pbar { padding-bottom: calc(96px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
-	body.has-pbar .toast { bottom: calc(110px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
+	body.has-pbar { padding-bottom: calc(108px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
+	body.has-pbar .toast { bottom: calc(122px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
 	.pbar { position: fixed; left: 0; right: 0; bottom: var(--lost, 0px); z-index: 15; background: var(--card); border-top: 1px solid var(--line);
 		padding: 4px 12px calc(6px + env(safe-area-inset-bottom)); box-shadow: 0 -4px 16px rgba(0,0,0,.08); }
 	.pbar input[type=range] { display: block; width: 100%; max-width: 1076px; margin: 0 auto; accent-color: var(--accent); }
+	/* A gap between the slider and the buttons, so a tap meant for play doesn't land on the slider.
+	   touch-action: none keeps a sideways drag on the slider from being taken as a scroll. */
+	.pbar .seek { margin-bottom: 12px; touch-action: none; }
 	.prow { display: flex; align-items: center; gap: 2px; max-width: 1076px; margin: 0 auto; }
 	.ptitle { flex: 1; min-width: 0; display: grid; text-align: left; background: none; border: 0; padding: 4px; cursor: pointer; }
 	.ptitle span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -11368,11 +11375,14 @@ function renderPlayer() {
 	document.body.classList.toggle("has-pbar", bar);
 	renderListen();
 	if (!ep) return;
-	var dur = ep.book ? abTotal(ep) : audio.duration || epLen(ep), pos = ep.book ? abNow() : audio.currentTime || 0;
+	var span = barSpan(ep), dur = span.end - span.start, pos = (ep.book ? abNow() : audio.currentTime || 0) - span.start;
 	$("pName").textContent = ep.title;
-	$("pTime").textContent = (ep.feed_title ? ep.feed_title + " · " : "") + clock(pos) + (dur ? " / " + clock(dur) : "");
-	if (!state.seeking) $("pSeek").value = dur ? Math.round(pos / dur * 1000) : 0;
+	if (!state.seeking) {
+		$("pTime").textContent = span.label ? barTime(pos, dur) + " · " + span.label : (ep.feed_title ? ep.feed_title + " · " : "") + barTime(pos, dur);
+		$("pSeek").value = dur ? Math.round(clamp(pos / dur, 0, 1) * 1000) : 0;
+	}
 	seekFill($("pSeek"));
+	$("pSeek").setAttribute("aria-label", span.label ? "Position in chapter" : ep.book ? "Position in book" : "Position in episode");
 	$("pPlay").innerHTML = audio.paused ? "&#9654;" : "&#10074;&#10074;";
 	$("pPlay").setAttribute("aria-label", audio.paused ? "Play" : "Pause");
 	$("pRate").textContent = player.rate + "×";
@@ -11543,15 +11553,48 @@ function smartRewind() {
 		repaintRecord();
 	});
 	$("pTitle").addEventListener("click", function () { if (player.ep) location.hash = player.ep.book ? "#/listen/" + player.ep.book : "#/item/" + player.ep.id; });
+	// The bar's slider seeks on a drag, not a tap: a tap on the track (one
+	// meant for the buttons under it, usually) puts it back where it was.
+	// Keyboard changes have no pointer down, so they still go through.
+	var pGrab = null, pSeekEl = $("pSeek");
+	var pDown = function (x) { pGrab = { x: x, v: pSeekEl.value, moved: false }; };
+	var pMove = function (x) { if (pGrab && Math.abs(x - pGrab.x) > 8) pGrab.moved = true; };
+	pSeekEl.addEventListener("pointerdown", function (e) { pDown(e.clientX); });
+	pSeekEl.addEventListener("pointermove", function (e) { pMove(e.clientX); });
+	// Safari can stop sending pointer moves once the slider takes the touch.
+	pSeekEl.addEventListener("touchmove", function (e) { if (e.touches[0]) pMove(e.touches[0].clientX); }, { passive: true });
+	// A change can come a moment after the finger lifts, so a tap is held a
+	// little before it's forgotten; a drag is cleared by its own change.
+	var pLetGo = function () {
+		var g = pGrab;
+		setTimeout(function () {
+			if (pGrab !== g || !g) return;
+			if (!g.moved) { pSeekEl.value = g.v; seekFill(pSeekEl); }
+			pGrab = null;
+			state.seeking = false;
+		}, 400);
+	};
+	pSeekEl.addEventListener("pointerup", pLetGo);
+	pSeekEl.addEventListener("pointercancel", pLetGo);
+	var pTapped = function (el) {
+		if (!pGrab || pGrab.moved) return false;
+		el.value = pGrab.v;
+		seekFill(el);
+		return true;
+	};
 	$("pSeek").addEventListener("input", function () {
+		if (pTapped(this)) return;
 		state.seeking = true;
 		seekFill(this);
-		var dur = player.ep && player.ep.book ? abTotal(player.ep) : audio.duration || epLen(player.ep || {});
-		if (dur) $("pTime").textContent = clock(this.value / 1000 * dur) + " / " + clock(dur);
+		var span = barSpan(player.ep), dur = span.end - span.start;
+		if (dur) $("pTime").textContent = barTime(this.value / 1000 * dur, dur) + (span.label ? " · " + span.label : "");
 	});
 	$("pSeek").addEventListener("change", function () {
 		state.seeking = false;
-		if (player.ep && player.ep.book) abSeek(this.value / 1000 * abTotal(player.ep), !audio.paused);
+		if (pTapped(this)) return;
+		pGrab = null;
+		var span = barSpan(player.ep);
+		if (player.ep && player.ep.book) abSeek(span.start + this.value / 1000 * (span.end - span.start), !audio.paused);
 		else if (audio.duration) audio.currentTime = this.value / 1000 * audio.duration;
 	});
 	$("epMore").addEventListener("click", function () { loadEpisodes(true).catch(fail); });
@@ -12511,6 +12554,19 @@ function paintMarkDlg() {
 	});
 })();
 
+// What the bar's slider spans: for an audiobook the chapter playing, as on
+// the player page (the whole book when it has no chapters), and for an
+// episode the whole episode. {start, end, label}, in the book's seconds.
+function barSpan(ep) {
+	var audio = $("pAudio");
+	if (!ep) return { start: 0, end: 0, label: "" };
+	if (!ep.book) return { start: 0, end: audio.duration || epLen(ep), label: "" };
+	var total = abTotal(ep), t = abNow(), cs = (listenCache[ep.book] || {}).chapters || [], i = -1;
+	if (cs.length > 1) cs.forEach(function (c, n) { if (c.start <= t + 0.5) i = n; });
+	if (i < 0) return { start: 0, end: total, label: "" };
+	return { start: cs[i].start, end: cs[i + 1] ? cs[i + 1].start : total, label: cs[i].title || "Chapter " + (i + 1) };
+}
+function barTime(pos, dur) { return clock(Math.max(0, pos)) + (dur ? " / " + clock(dur) : ""); }
 // Where the chapter at t ends in the whole book (its end, with no chapters).
 function sleepChapterEnd(t) {
 	var ab = player.ab, cs = (player.ep && listenCache[player.ep.book] || {}).chapters || [];
