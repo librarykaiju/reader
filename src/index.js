@@ -153,6 +153,15 @@
 //                                  {"type": "audiobook", "files", "chapters", "duration"}
 //   GET    /api/family/books/:id/preview/page/:n  a comic's page n (from 0)
 //   GET    /api/family/books/:id/preview/part?at=&len=  len bytes of a PDF from byte at, for pdf.js
+//   GET    /api/family/places  -> {"places": [{book, kind, place, pct, at}]}: where this family member is in the
+//                                  books they read online (kind "read") or listen to ("listen"), newest first.
+//                                  The shelf (see "The shelf") is for family sign-ins only: 403 for the owner
+//   POST   /api/family/places  {book, kind, place, pct?, at?} -> {ok}: keeps a place (the newer one wins; "0" is
+//                                  done with it, which takes it off the shelf on every device)
+//   GET    /api/family/lists   -> {"lists": [{id, name, at, books: [ids, newest first]}]}: their reading lists
+//   POST   /api/family/lists   {name, book?} -> {id, name, at, books}: a new list (up to 50), with a first book if given
+//   PUT    /api/family/lists/:id  {name} renames it; DELETE /api/family/lists/:id deletes it
+//   PUT    /api/family/lists/:id/books/:book  adds a book (up to 500); DELETE takes it off
 //
 // Email (Cloudflare Email Routing -> "Send to a Worker" -> this Worker):
 //   each message sent to the routed address (news@brandonj.ink, say) becomes
@@ -3258,6 +3267,7 @@ async function redeemInvite(request, env) {
 async function familyApi(request, env, url, who) {
 	const m = request.method;
 	const p = url.pathname;
+	if (p.startsWith("/api/family/places") || p.startsWith("/api/family/lists")) return familyShelfApi(request, env, url, who);
 	if (m !== "GET") return null;
 	if (p === "/api/family/me") {
 		const today = who.person ? await downloadedToday(env, who.person.id) : null;
@@ -3285,6 +3295,115 @@ async function familyApi(request, env, url, who) {
 	if (part) return previewPart(env, toId(part[1]), url);
 	const audio = p.match(/^\/api\/family\/books\/(\d+)\/audio\/(\d+)$/);
 	if (audio) return audioFile(request, env, toId(audio[1]), Number(audio[2]));
+	return null;
+}
+
+// The shelf: each family member's places in the books they read online or
+// listen to, and their reading lists (migration 0023). The page keeps a place
+// on the device as before (read:<id>, listen:<id>) and also sends it here, so
+// the shelf on any of their devices can take them back to it. Only a family
+// sign-in has a shelf; the owner looking at /library gets 403 and the page
+// keeps places on the device only, as it did.
+const SHELF_LISTS = 50;
+const SHELF_LIST_BOOKS = 500;
+async function familyShelfApi(request, env, url, who) {
+	const m = request.method, p = url.pathname;
+	if (!who.person) throw new HttpError(403, "Your shelf is for family sign-ins");
+	const pid = who.person.id, now = Date.now();
+	// Writes come from the page itself: JSON (which another site can't send
+	// without asking first) on top of the SameSite cookie.
+	if (m !== "GET" && m !== "DELETE" && !/^application\/json\b/i.test(request.headers.get("Content-Type") || "")) {
+		throw new HttpError(415, "Send JSON");
+	}
+	if (p === "/api/family/places" && m === "GET") {
+		const { results } = await env.DB.prepare(
+			`SELECT f.book_id AS book, f.kind, f.place, f.pct, f.updated_at AS at FROM family_places f JOIN books ON books.id = f.book_id
+			WHERE f.person_id = ? AND books.gone_at IS NULL AND ${NOT_HIDDEN} ORDER BY f.updated_at DESC LIMIT 500`,
+		).bind(pid).all();
+		return json({ places: results });
+	}
+	if (p === "/api/family/places" && m === "POST") {
+		const d = await readJSON(request);
+		const book = toId(d.book), kind = d.kind === "listen" ? "listen" : d.kind === "read" ? "read" : null;
+		const place = str(String(d.place ?? ""), 40);
+		if (!kind || !place || !/^\d+(:\d+)?$/.test(place)) throw new HttpError(400, "kind is read or listen, place like 12 or 3:40");
+		const pct = Number.isFinite(d.pct) ? Math.min(1, Math.max(0, d.pct)) : null;
+		// When the device made the change (a save queued while offline goes later); never in the future.
+		const at = Number.isSafeInteger(d.at) && d.at > 0 ? Math.min(d.at, now) : now;
+		await familyBook(env, book);
+		// The newer place wins, so a phone that was offline doesn't send someone back.
+		await env.DB.prepare(
+			`INSERT INTO family_places (person_id, book_id, kind, place, pct, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT (person_id, book_id, kind) DO UPDATE SET place = excluded.place, pct = excluded.pct, updated_at = excluded.updated_at
+			WHERE excluded.updated_at >= family_places.updated_at`,
+		).bind(pid, book, kind, place, pct, at).run();
+		return json({ ok: true });
+	}
+	if (p === "/api/family/lists" && m === "GET") {
+		const { results } = await env.DB.prepare(
+			`SELECT l.id, l.name, l.updated_at AS at,
+				(SELECT json_group_array(book_id) FROM (SELECT b.book_id FROM family_list_books b WHERE b.list_id = l.id ORDER BY b.added_at DESC)) AS books
+			FROM family_lists l WHERE l.person_id = ? ORDER BY l.updated_at DESC`,
+		).bind(pid).all();
+		for (const l of results) l.books = JSON.parse(l.books || "[]");
+		return json({ lists: results });
+	}
+	if (p === "/api/family/lists" && m === "POST") {
+		const d = await readJSON(request);
+		const name = str(d.name, 80);
+		if (!name) throw new HttpError(400, "Give the list a name");
+		const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM family_lists WHERE person_id = ?").bind(pid).first("n");
+		if (n >= SHELF_LISTS) throw new HttpError(409, `That's ${SHELF_LISTS} lists, the most there can be. Delete one to make another.`);
+		const row = await env.DB.prepare("INSERT INTO family_lists (person_id, name, created_at, updated_at) VALUES (?, ?, ?, ?) RETURNING id")
+			.bind(pid, name, now, now).first();
+		let books = [];
+		if (d.book != null) {
+			const book = toId(d.book);
+			await familyBook(env, book);
+			await env.DB.prepare("INSERT INTO family_list_books (list_id, book_id, added_at) VALUES (?, ?, ?)").bind(row.id, book, now).run();
+			books = [book];
+		}
+		return json({ id: row.id, name, at: now, books });
+	}
+	const list = p.match(/^\/api\/family\/lists\/(\d+)(?:\/books\/(\d+))?$/);
+	if (!list) return null;
+	const lid = toId(list[1]);
+	// Someone else's list answers as if it weren't there.
+	const own = await env.DB.prepare("SELECT id FROM family_lists WHERE id = ? AND person_id = ?").bind(lid, pid).first();
+	if (!own) throw new HttpError(404, "No such list");
+	const touch = env.DB.prepare("UPDATE family_lists SET updated_at = ? WHERE id = ?").bind(now, lid);
+	if (!list[2]) {
+		if (m === "PUT") {
+			const name = str((await readJSON(request)).name, 80);
+			if (!name) throw new HttpError(400, "Give the list a name");
+			await env.DB.prepare("UPDATE family_lists SET name = ?, updated_at = ? WHERE id = ?").bind(name, now, lid).run();
+			return json({ ok: true, name });
+		}
+		if (m === "DELETE") {
+			// The list's books go with it (ON DELETE CASCADE), spelled out in case foreign keys are off.
+			await env.DB.batch([
+				env.DB.prepare("DELETE FROM family_list_books WHERE list_id = ?").bind(lid),
+				env.DB.prepare("DELETE FROM family_lists WHERE id = ?").bind(lid),
+			]);
+			return json({ ok: true });
+		}
+		return null;
+	}
+	const book = toId(list[2]);
+	if (m === "PUT") {
+		await familyBook(env, book);
+		const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM family_list_books WHERE list_id = ?").bind(lid).first("n");
+		if (n >= SHELF_LIST_BOOKS) throw new HttpError(409, `That list has ${SHELF_LIST_BOOKS} books, the most one can hold.`);
+		await env.DB.batch([
+			env.DB.prepare("INSERT OR IGNORE INTO family_list_books (list_id, book_id, added_at) VALUES (?, ?, ?)").bind(lid, book, now),
+			touch,
+		]);
+		return json({ ok: true });
+	}
+	if (m === "DELETE") {
+		await env.DB.batch([env.DB.prepare("DELETE FROM family_list_books WHERE list_id = ? AND book_id = ?").bind(lid, book), touch]);
+		return json({ ok: true });
+	}
 	return null;
 }
 
@@ -5053,6 +5172,51 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.lbar button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 	body.has-lbar { padding-bottom: calc(72px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
 	#lbClose { min-width: 36px; font-size: 20px; }
+	/* The shelf: Pick up where you left off, and reading lists. */
+	.resume { margin: 0 0 22px; }
+	.reshead { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+	.reshead h2, .shelf h2 { font: 600 12px/1.2 var(--sans); letter-spacing: .16em; text-transform: uppercase; color: var(--muted); margin: 0 0 10px; }
+	.reshead a { font-size: 14px; text-decoration: none; white-space: nowrap; }
+	.resrow { list-style: none; margin: 0; padding: 0 0 6px; display: grid; grid-auto-flow: column; grid-auto-columns: 104px; gap: 14px; overflow-x: auto; scrollbar-width: thin; }
+	.resrow a { display: flex; flex-direction: column; gap: 3px; color: inherit; text-decoration: none; min-width: 0; font-size: 13px; }
+	.resrow .ct { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.25; }
+	.bar { display: block; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
+	.bar > span { display: block; height: 100%; background: var(--accent); }
+	.shelf section { border-top: 1px solid var(--line); margin-top: 24px; padding-top: 16px; }
+	.shelf section:first-child { border-top: 0; margin-top: 4px; padding-top: 0; }
+	.reads { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; }
+	.reads li { display: grid; grid-template-columns: 64px 1fr auto; gap: 12px; align-items: center; }
+	.reads .cover { margin: 0; }
+	.reads .gencover, .resrow .gencover { gap: 6px; padding: 12% 9%; }
+	.reads .gencover .gt { font-size: 11px; -webkit-line-clamp: 4; }
+	.resrow .gencover .gt { font-size: 13px; }
+	.reads .gencover .ga, .resrow .gencover .ga { display: none; }
+	.reads .rt { font: 600 17px/1.25 var(--display); margin: 0; }
+	.reads .rt a { color: inherit; text-decoration: none; }
+	.reads .rm { font-size: 14px; margin: 2px 0 6px; }
+	.reads .go { width: auto; min-height: 40px; padding: 0 16px; font-size: 15px; margin: 8px 0 0; display: inline-flex; align-items: center; text-decoration: none; }
+	.xbtn { appearance: none; border: 0; background: none; color: var(--muted); font-size: 22px; line-height: 1; padding: 8px; cursor: pointer; align-self: start; }
+	.xbtn:hover, .xbtn:focus-visible { color: var(--fg); }
+	.lists { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+	.lists a { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); color: inherit; text-decoration: none; }
+	.lists .ln { font-weight: 600; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+	.minis { display: flex; flex: none; }
+	.minis .cover { display: block; width: 26px; margin: 0 0 0 -8px; box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+	.minis .cover:first-child { margin-left: 0; }
+	.minis .gencover .gt, .minis .gencover .ga { display: none; }
+	.newlist { display: flex; gap: 8px; margin-top: 12px; max-width: 520px; }
+	.newlist input { flex: 1; min-width: 0; border: 1px solid var(--line); background: var(--card); border-radius: 10px; padding: 9px 12px; font-size: 16px; min-height: 42px; }
+	.newlist button, .listtools button { appearance: none; border: 1px solid var(--accent); background: none; color: var(--accent); border-radius: 10px; padding: 0 14px; min-height: 42px; font-weight: 600; cursor: pointer; }
+	.newlist button:disabled { opacity: .5; }
+	.listtools { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 6px; }
+	.covers li { position: relative; }
+	.covers .cx { position: absolute; top: -8px; right: -8px; width: 30px; height: 30px; border-radius: 50%; border: 1px solid var(--line); background: var(--card); color: var(--fg); font-size: 18px; line-height: 1; cursor: pointer; box-shadow: 0 1px 3px rgba(0,0,0,.2); }
+	.rlists { margin-top: 12px; max-width: 520px; }
+	.listbox { margin-top: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); }
+	.listbox label { display: flex; align-items: center; gap: 10px; padding: 6px 0; cursor: pointer; }
+	.listbox input[type=checkbox] { width: 20px; height: 20px; accent-color: var(--accent); flex: none; }
+	.listbox .newlist { margin-top: 8px; }
+	.shnote { font-size: 14px; }
 	@media (max-width: 380px) { #lbBack, #lbFwd { display: none; } }
 	@media (max-width: 600px) {
 		.lplay { grid-template-columns: minmax(0, 1fr); gap: 18px; padding: 18px 14px; }
@@ -5104,6 +5268,10 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	</section>
 	<h1 id="head" hidden>The Back Alley Library</h1>
 	<p id="sub" class="sub muted" hidden></p>
+	<section id="resume" class="resume" hidden>
+		<div class="reshead"><h2>Pick up where you left off</h2><a href="#shelf">Your shelf ›</a></div>
+		<ul id="resumeRow" class="resrow"></ul>
+	</section>
 	<div id="intro" class="intro" hidden>
 		<p>Welcome to the Back Alley Library. All of the books in the collection are DRM free and work anywhere. Consolidating the history of my digital purchases is a big job and I add more to the collection when I have time.</p>
 		<p>Nonfiction titles are organized into broad categories that I call the Lazy Classification System (LCS for short).</p>
@@ -5168,6 +5336,10 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 						</div>
 						<p id="rALeft" class="rleft muted"></p>
 					</div>
+					<div id="rLists" class="rlists" hidden>
+						<button id="rList" class="linkbtn" type="button" aria-expanded="false" aria-controls="rListBox">Add to a reading list</button>
+						<div id="rListBox" class="listbox" hidden></div>
+					</div>
 				</div>
 			</div>
 			<section id="rBlurbSec" class="rsec">
@@ -5192,6 +5364,12 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 				<p id="pvLeft" class="rleft muted"></p>
 				<div class="rbtns"><a id="pvDl" class="go rdl" href="#"></a></div>
 			</div>
+		</article>
+		<article id="shelf" class="shelf" hidden>
+			<a id="shBack" class="up" href="/library">‹ All books</a>
+			<p id="shEye" class="eyebrow">Your shelf</p>
+			<h1 id="shTitle" tabindex="-1"></h1>
+			<div id="shBody"></div>
 		</article>
 		<footer><a id="howLink" href="#">How to save this page</a></footer>
 	</div>
@@ -5221,8 +5399,8 @@ function openSeries() { var m = /^#series=(.+)$/.exec(location.hash); return m ?
 function openBook() { var m = /^#book=(\d+)$/.exec(location.hash); return m ? Number(m[1]) : null; }
 // Its preview: #preview=<id>.
 function openPreview() { var m = /^#preview=(\d+)$/.exec(location.hash); return m ? Number(m[1]) : null; }
-var listScroll = 0, viaList = false, viaRecord = false, onRecord = false, onPreview = false, records = {}, common = {};
-function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+var listScroll = 0, viaList = false, viaRecord = false, onRecord = false, onPreview = false, onShelf = false, records = {}, common = {};
+function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} if (PLACE_KEY.test(k)) placeChanged(k, v); }
 function read(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
 
 // 33,120 seconds -> "9 h 12 min"
@@ -5611,15 +5789,21 @@ function render() {
 	// An audiobook paired with its ebook opens the ebook's Record, and plays on its own.
 	var id = openBook(), rb = id && findBook(id), pid = openPreview(), pb = pid && findBook(pid);
 	if (rb && rb.parent) rb = rb.parent;
-	$("browse").hidden = !!(rb || pb);
+	// The shelf (#shelf) and a reading list (#list=<id>), for family sign-ins.
+	var sh = !rb && !pb && shelf.on && (openShelf() || openList() != null);
+	$("browse").hidden = !!(rb || pb || sh);
 	$("record").hidden = !rb;
 	$("preview").hidden = !pb;
-	$("intro").hidden = !!(rb || pb);
+	$("shelf").hidden = !sh;
+	$("intro").hidden = !!(rb || pb || sh);
+	if (rb || pb || sh) $("resume").hidden = true;
 	onRecord = !!rb;
 	onPreview = !!pb;
+	onShelf = sh;
 	if (!pb) closePreview();
 	if (rb) { $("head").hidden = $("sub").hidden = true; showRecord(rb); return; }
 	if (pb) { $("head").hidden = $("sub").hidden = true; showPreview(pb); return; }
+	if (sh) { $("head").hidden = $("sub").hidden = true; showShelf(); return; }
 	document.title = "The Back Alley Library";
 	$("head").hidden = false;
 	var series = openSeries(), words = fold(query).split(/\s+/).filter(Boolean);
@@ -5633,6 +5817,7 @@ function render() {
 	});
 	var ul = $("books");
 	ul.textContent = "";
+	renderResume(series == null && !words.length);
 	$("up").hidden = series == null;
 	$("recs").hidden = series != null || !anyRecs;
 	if ($("welcome").hidden) $("head").textContent = series != null ? (shown[0] ? shown[0].series : series) : "The Back Alley Library";
@@ -5658,7 +5843,10 @@ function showSub() {
 	var audio = books.some(function (b) { return b.type === "audiobook"; }) && me.audio_left != null
 		? ", " + (me.audio_left === 1 ? "1 audiobook" : me.audio_left + " audiobooks") : "";
 	var left = me.left == null ? "" : " · " + (me.left === 1 ? "1 download" : me.left + " downloads") + audio + " left today";
-	$("sub").textContent = "Signed in as " + me.name + left;
+	var link = h("a", null, "Your shelf");
+	link.href = "#shelf";
+	$("sub").textContent = "Signed in as " + me.name + left + " · ";
+	$("sub").append(link);
 	$("sub").hidden = false;
 }
 // The Worker enforces the daily limit; this just says so before the tap
@@ -5700,6 +5888,7 @@ function showRecord(b) {
 		sr.append(link);
 	}
 	recordFacts(b, records[b.id]);
+	recordLists(b);
 	downloadButton($("rDl"), $("rLeft"), b);
 	var pv = $("rPv"), listen = b.type === "audiobook";
 	pv.href = "#preview=" + b.id;
@@ -5837,12 +6026,393 @@ function recordDetails(b, rec) {
 		box.innerHTML = '<p class="muted">Nothing more on this one yet.</p>';
 	}
 }
+// The shelf (see "The shelf" in the Worker). A place is kept on the device as
+// before (read:<id>, listen:<id>), with when it changed (at:read:<id>), and
+// also sent to the Worker, at most every 15 seconds and when the page is put
+// away. Opening the page, or coming back to it, fetches the places from
+// there, and the newer of the two wins, so any device a family member is
+// signed in on opens a book where they left it. A place of "0" means done
+// with it (the end of an audiobook, or Done on the shelf). The owner looking
+// at the page has no shelf on the Worker: places stay on the device, and the
+// row on the front page still shows them.
+var PLACE_KEY = /^(read|listen):(\d+)$/;
+var shelf = { on: false, places: {}, lists: null }, placeQueue = {}, placeTimer = 0;
+function shelfCall(method, path, body, keepalive) {
+	var init = { method: method, keepalive: !!keepalive };
+	if (method !== "GET") { init.headers = { "Content-Type": "application/json" }; init.body = JSON.stringify(body || {}); }
+	return fetch(path, init).then(function (res) {
+		return res.json().catch(function () { return {}; }).then(function (d) {
+			if (!res.ok) throw new Error(d.error || "Couldn't reach the library.");
+			return d;
+		});
+	});
+}
+function pageCount(id) { return Number(read("pages:" + id)) || 0; }
+// How far through, 0 to 1, when that can be told from the place: an
+// audiobook by its length, a comic or PDF by its pages, a text file by its
+// bytes. An EPUB's place is a chapter and paragraph, so it has none.
+function placePct(kind, id, v) {
+	var b = findBook(id);
+	if (!b) return null;
+	if (v === "0") return 1;
+	if (kind === "listen") return b.duration ? Math.min(1, Number(v) / b.duration) : null;
+	var m = /^(\d+):(\d+)$/.exec(v);
+	if (m) return b.type === "txt" && b.size ? Math.min(1, Number(m[1]) / b.size) : null;
+	var n = pageCount(id);
+	return n ? Math.min(1, Number(v) / n) : null;
+}
+function localPlace(k) {
+	var m = PLACE_KEY.exec(k), v = read(k);
+	if (!m || v == null) return null;
+	// A place kept before the shelf has no time; it counts as older than any other.
+	return { book: Number(m[2]), kind: m[1], place: v, pct: placePct(m[1], Number(m[2]), v), at: Number(read("at:" + k)) || 1 };
+}
+function placeChanged(k, v) {
+	try { localStorage.setItem("at:" + k, String(Date.now())); } catch (e) {}
+	var p = shelf.places[k] = localPlace(k);
+	if (!shelf.on || !p) return;
+	placeQueue[k] = p;
+	if (!placeTimer) placeTimer = setTimeout(sendPlaces, 15000);
+}
+function sendPlaces(leaving) {
+	clearTimeout(placeTimer);
+	placeTimer = 0;
+	var q = placeQueue;
+	placeQueue = {};
+	Object.keys(q).forEach(function (k) {
+		shelfCall("POST", "/api/family/places", q[k], leaving === true).catch(function () {
+			// Offline: it goes again later. The server keeps whichever place is newer.
+			if (!placeQueue[k]) placeQueue[k] = q[k];
+			if (!placeTimer) placeTimer = setTimeout(sendPlaces, 60000);
+		});
+	});
+}
+// The server's places, merged with this device's. -> nothing; shelf.places is up to date.
+function mergePlaces(d) {
+	var seen = {}, sent = 0;
+	if (d) (d.places || []).forEach(function (p) {
+		var k = p.kind + ":" + p.book, mine = localPlace(k);
+		seen[k] = 1;
+		if (!mine || p.at > mine.at) {
+			try { localStorage.setItem(k, p.place); localStorage.setItem("at:" + k, String(p.at)); } catch (e) {}
+			shelf.places[k] = p;
+		} else {
+			shelf.places[k] = mine;
+			if (mine.at > p.at && shelf.on) placeQueue[k] = mine;
+		}
+	});
+	// Places only on this device (kept before the shelf, or while offline): to the server with them.
+	var keys = [];
+	try { for (var i = 0; i < localStorage.length; i++) keys.push(localStorage.key(i)); } catch (e) {}
+	keys.forEach(function (k) {
+		if (!PLACE_KEY.test(k) || seen[k]) return;
+		var mine = localPlace(k);
+		if (!mine) return;
+		shelf.places[k] = mine;
+		if (shelf.on && d && mine.place !== "0" && mine.place !== "0:0" && sent < 50) { placeQueue[k] = mine; sent++; }
+	});
+	if (Object.keys(placeQueue).length && !placeTimer) placeTimer = setTimeout(sendPlaces, 2000);
+}
+document.addEventListener("visibilitychange", function () {
+	if (document.visibilityState === "hidden") return sendPlaces(true);
+	if (!shelf.on || !books.length) return;
+	shelfCall("GET", "/api/family/places").then(function (d) {
+		mergePlaces(d);
+		if (!openPreview() && !openBook()) render();
+	}, function () {});
+});
+window.addEventListener("pagehide", function () { sendPlaces(true); });
+
+// Books in progress, newest first: one entry per book (an ebook and its
+// audiobook are one), leaving out ones finished, done with, or not started.
+function shelfReads() {
+	var by = {};
+	Object.keys(shelf.places).forEach(function (k) {
+		var p = shelf.places[k], b = findBook(p.book);
+		if (!b || p.place === "0" || p.place === "0:0" || (p.pct != null && p.pct >= 0.995)) return;
+		var key = (b.parent || b).id;
+		if (!by[key] || by[key].p.at < p.at) by[key] = { p: p, b: b };
+	});
+	return Object.keys(by).map(function (k) { return by[k]; }).sort(function (x, y) { return y.p.at - x.p.at; });
+}
+function ago(t) {
+	var d = Math.floor((new Date().setHours(0, 0, 0, 0) - new Date(t).setHours(0, 0, 0, 0)) / 86400000);
+	return t <= 1 ? "" : d <= 0 ? "today" : d === 1 ? "yesterday" : d < 7 ? d + " days ago" : d < 60 ? Math.round(d / 7) + (d < 11 ? " week ago" : " weeks ago") : "a while ago";
+}
+function progressText(r) {
+	var p = r.p, b = r.b, at = ago(p.at), what;
+	if (p.kind === "listen") what = b.duration ? hours(Math.max(0, b.duration - Number(p.place))) + " left" : clock(Number(p.place)) + " in";
+	else if (/^\d+$/.test(p.place)) what = "Page " + p.place + (pageCount(b.id) ? " of " + pageCount(b.id) : "");
+	else what = p.pct == null ? "Reading" : p.pct < 0.01 ? "Just started" : Math.round(p.pct * 100) + "% through";
+	return what + (at ? " · " + at : "");
+}
+function progressBar(pct) {
+	var bar = h("span", "bar"), fill = h("span");
+	fill.style.width = Math.max(2, Math.round((pct || 0) * 100)) + "%";
+	bar.append(fill);
+	bar.hidden = pct == null;
+	return bar;
+}
+// Done with a book: its place (and its pair's) becomes "0", so it leaves the
+// shelf on every device and opens at the start next time.
+function doneWith(b) {
+	[b, b.parent, b.audio].forEach(function (x) {
+		if (!x) return;
+		["read", "listen"].forEach(function (kind) {
+			var k = kind + ":" + x.id;
+			if (shelf.places[k] || read(k) != null) store(k, "0");
+		});
+	});
+	sendPlaces();
+}
+// The front page's row: the books in progress, each straight to its book.
+function renderResume(show) {
+	var reads = show && $("welcome").hidden ? shelfReads().slice(0, 10) : [], ul = $("resumeRow");
+	$("resume").hidden = !reads.length;
+	$("resume").querySelector("a").hidden = !shelf.on;
+	ul.textContent = "";
+	reads.forEach(function (r) {
+		var b = r.b, li = h("li"), a = h("a");
+		a.href = "#preview=" + b.id;
+		a.setAttribute("aria-label", (r.p.kind === "listen" ? "Keep listening to " : "Keep reading ") + b.title + ", " + progressText(r));
+		a.append(fillCover(h("div", "cover"), b.parent || b), progressBar(r.p.pct), h("span", "ct", b.title));
+		li.append(a);
+		ul.append(li);
+	});
+}
+
+function openShelf() { return location.hash === "#shelf"; }
+function openList() { var m = /^#list=(\d+)$/.exec(location.hash); return m ? Number(m[1]) : null; }
+function loadLists() {
+	return shelfCall("GET", "/api/family/lists").then(function (d) { shelf.lists = d.lists || []; });
+}
+function errorLine(box, msg) {
+	var old = box.querySelector(".err");
+	if (old) old.remove();
+	if (msg) box.append(h("p", "err muted shnote", msg));
+}
+function showShelf() {
+	var lid = openList(), body = $("shBody");
+	if (lid != null) return showList(lid);
+	document.title = "Your shelf · The Back Alley Library";
+	$("shBack").href = "/library";
+	$("shBack").textContent = "‹ All books";
+	$("shEye").textContent = "Your shelf";
+	$("shTitle").textContent = me.name ? me.name + "'s shelf" : "Your shelf";
+	body.textContent = "";
+	var reads = shelfReads(), s1 = h("section"), s2 = h("section"), box = h("div");
+	s1.append(h("h2", null, "Pick up where you left off"));
+	if (!reads.length) s1.append(h("p", "muted shnote", "Books you read online or listen to show up here, so you can go straight back to your place on any device you're signed in on."));
+	else {
+		var ul = h("ul", "reads");
+		reads.forEach(function (r) { ul.append(readRow(r)); });
+		s1.append(ul);
+	}
+	s2.append(h("h2", null, "Reading lists"), box);
+	body.append(s1, s2);
+	if (shelf.lists) return paintLists(box);
+	box.append(h("p", "muted shnote", "Loading…"));
+	loadLists().then(function () { if (openShelf()) paintLists(box); }, function (e) { box.textContent = ""; errorLine(box, e.message); });
+}
+function readRow(r) {
+	var b = r.b, p = r.p, listen = p.kind === "listen", li = h("li"), cov = h("a", "cover"), mid = h("div"), t = h("p", "rt"), tl = h("a", null, b.title);
+	cov.href = tl.href = "#book=" + (b.parent || b).id;
+	cov.setAttribute("aria-hidden", "true");
+	cov.tabIndex = -1;
+	fillCover(cov, b.parent || b);
+	t.append(tl);
+	var go = h("a", "go", listen ? "Keep listening" : "Keep reading");
+	go.href = "#preview=" + b.id;
+	go.setAttribute("aria-label", (listen ? "Keep listening to " : "Keep reading ") + b.title);
+	mid.append(t, h("p", "rm muted", [b.author, progressText(r)].filter(Boolean).join(" · ")), progressBar(p.pct), go);
+	var x = h("button", "xbtn", "×");
+	x.type = "button";
+	x.title = "Done with this book";
+	x.setAttribute("aria-label", "Done with " + b.title + ": take it off this list");
+	x.onclick = function () { doneWith(b); showShelf(); };
+	li.append(cov, mid, x);
+	return li;
+}
+function bookCount(l) { return l.books.filter(function (id) { return findBook(id); }).length; }
+function paintLists(box) {
+	box.textContent = "";
+	if (shelf.lists.length) {
+		var ul = h("ul", "lists");
+		shelf.lists.forEach(function (l) {
+			var li = h("li"), a = h("a"), minis = h("span", "minis"), n = bookCount(l);
+			a.href = "#list=" + l.id;
+			minis.setAttribute("aria-hidden", "true");
+			l.books.map(findBook).filter(Boolean).slice(0, 3).forEach(function (b) { minis.append(fillCover(h("span", "cover"), b.parent || b)); });
+			a.append(minis, h("span", "ln", l.name), h("span", "muted", n === 1 ? "1 book" : n + " books"));
+			li.append(a);
+			ul.append(li);
+		});
+		box.append(ul);
+	} else {
+		box.append(h("p", "muted shnote", "Make a list of books to read next, a series to work through, or picks to share with someone. Add books to one from any book's page."));
+	}
+	box.append(newListForm(null, function () { paintLists(box); }));
+}
+// A name box and Make list. With a book, the new list starts with it.
+function newListForm(book, done) {
+	var f = h("form", "newlist"), inp = h("input"), btn = h("button", null, "Make list");
+	inp.type = "text";
+	inp.maxLength = 80;
+	inp.placeholder = "New list name";
+	inp.setAttribute("aria-label", "New list name");
+	inp.autocomplete = "off";
+	btn.type = "submit";
+	f.append(inp, btn);
+	var wrap = h("div");
+	wrap.append(f);
+	f.addEventListener("submit", function (e) {
+		e.preventDefault();
+		var name = inp.value.trim();
+		if (!name) return inp.focus();
+		btn.disabled = true;
+		errorLine(wrap, "");
+		shelfCall("POST", "/api/family/lists", book ? { name: name, book: book } : { name: name }).then(function (l) {
+			shelf.lists.unshift(l);
+			done(l);
+		}, function (err) {
+			btn.disabled = false;
+			errorLine(wrap, err.message);
+		});
+	});
+	return wrap;
+}
+function showList(lid) {
+	var body = $("shBody");
+	body.textContent = "";
+	$("shBack").href = "#shelf";
+	$("shBack").textContent = "‹ Your shelf";
+	$("shEye").textContent = "Reading list";
+	if (!shelf.lists) {
+		$("shTitle").textContent = "";
+		body.append(h("p", "muted", "Loading…"));
+		loadLists().then(function () { if (openList() === lid) showList(lid); }, function (e) { body.textContent = ""; errorLine(body, e.message); });
+		return;
+	}
+	var l = shelf.lists.filter(function (x) { return x.id === lid; })[0];
+	if (!l) {
+		$("shTitle").textContent = "No such list";
+		body.append(h("p", "muted", "It may have been deleted."));
+		return;
+	}
+	document.title = l.name + " · The Back Alley Library";
+	$("shTitle").textContent = l.name;
+	var tools = h("div", "listtools"), ren = h("button", null, "Rename"), del = h("button", null, "Delete list"), sure = 0;
+	ren.type = del.type = "button";
+	tools.append(ren, del);
+	ren.onclick = function () {
+		var f = h("form", "newlist"), inp = h("input"), save = h("button", null, "Save"), cancel = h("button", null, "Cancel");
+		inp.type = "text";
+		inp.maxLength = 80;
+		inp.value = l.name;
+		inp.setAttribute("aria-label", "List name");
+		save.type = "submit";
+		cancel.type = "button";
+		cancel.onclick = function () { showList(lid); };
+		f.append(inp, save, cancel);
+		f.addEventListener("submit", function (e) {
+			e.preventDefault();
+			var name = inp.value.trim();
+			if (!name) return inp.focus();
+			save.disabled = true;
+			shelfCall("PUT", "/api/family/lists/" + l.id, { name: name }).then(function (d) { l.name = d.name; showList(lid); },
+				function (err) { save.disabled = false; errorLine(body, err.message); });
+		});
+		tools.replaceWith(f);
+		inp.focus();
+		inp.select();
+	};
+	// Two taps, so a stray one doesn't lose the list.
+	del.onclick = function () {
+		if (!sure) {
+			sure = setTimeout(function () { sure = 0; del.textContent = "Delete list"; }, 4000);
+			del.textContent = "Tap again to delete";
+			return;
+		}
+		clearTimeout(sure);
+		del.disabled = true;
+		shelfCall("DELETE", "/api/family/lists/" + l.id).then(function () {
+			shelf.lists = shelf.lists.filter(function (x) { return x !== l; });
+			location.hash = "#shelf";
+		}, function (err) { del.disabled = false; errorLine(body, err.message); });
+	};
+	var bs = l.books.map(findBook).filter(Boolean);
+	body.append(tools, h("p", "count muted", bs.length === 1 ? "1 book" : bs.length + " books"));
+	if (!bs.length) { body.append(h("p", "empty", "Nothing on this list yet. Open any book and tap Add to a reading list.")); return; }
+	var ul = h("ul", "covers");
+	bs.forEach(function (b) {
+		var li = card(b.parent || b), x = h("button", "cx", "×");
+		x.type = "button";
+		x.setAttribute("aria-label", "Take " + b.title + " off this list");
+		x.onclick = function () {
+			x.disabled = true;
+			shelfCall("DELETE", "/api/family/lists/" + l.id + "/books/" + b.id).then(function () {
+				l.books = l.books.filter(function (id) { return id !== b.id; });
+				showList(lid);
+			}, function (err) { x.disabled = false; errorLine(body, err.message); });
+		};
+		li.append(x);
+		ul.append(li);
+	});
+	body.append(ul);
+}
+// The Record's Add to a reading list: a tick box for each list, and a new one.
+function recordLists(b) {
+	$("rLists").hidden = !shelf.on;
+	$("rListBox").hidden = true;
+	$("rList").setAttribute("aria-expanded", "false");
+	listLabel(b);
+	$("rList").onclick = function () {
+		var open = $("rListBox").hidden;
+		$("rListBox").hidden = !open;
+		$("rList").setAttribute("aria-expanded", String(open));
+		if (open) paintListBox(b);
+	};
+	if (shelf.on && !shelf.lists) loadLists().then(function () { if (openBook() === b.id) listLabel(b); }, function () {});
+}
+function listLabel(b) {
+	var n = shelf.lists ? shelf.lists.filter(function (l) { return l.books.indexOf(b.id) >= 0; }).length : 0;
+	$("rList").textContent = n ? "On " + (n === 1 ? "1 reading list" : n + " reading lists") + " · Change" : "Add to a reading list";
+}
+function paintListBox(b) {
+	var box = $("rListBox");
+	box.textContent = "";
+	if (!shelf.lists) {
+		box.append(h("p", "muted shnote", "Loading…"));
+		loadLists().then(function () { if (openBook() === b.id) paintListBox(b); }, function (e) { box.textContent = ""; errorLine(box, e.message); });
+		return;
+	}
+	shelf.lists.forEach(function (l) {
+		var lab = h("label"), cb = h("input");
+		cb.type = "checkbox";
+		cb.checked = l.books.indexOf(b.id) >= 0;
+		cb.onchange = function () {
+			var on = cb.checked;
+			cb.disabled = true;
+			shelfCall(on ? "PUT" : "DELETE", "/api/family/lists/" + l.id + "/books/" + b.id).then(function () {
+				l.books = l.books.filter(function (id) { return id !== b.id; });
+				if (on) l.books.unshift(b.id);
+				cb.disabled = false;
+				listLabel(b);
+			}, function (err) { cb.checked = !on; cb.disabled = false; errorLine(box, err.message); });
+		};
+		lab.append(cb, h("span", null, l.name));
+		box.append(lab);
+	});
+	box.append(newListForm(b.id, function () { paintListBox(b); listLabel(b); }));
+}
+
 // Reading online: the whole book on the page (see "Reading online" in the
 // Worker). EPUB and text as paragraphs laid out here, a piece at a time as
 // the reader nears the end of what's there; a comic's pages as images; a
 // PDF's pages drawn by pdf.js from the pieces of the file it asks for. It
 // isn't a download, so it doesn't count toward the 10 a day. The place is
-// kept on this device (read:<id>), and the book opens there next time.
+// kept on this device (read:<id>) and on the shelf, and the book opens there
+// next time, on any of their devices.
 var PDFJS = "__PDFJS__", PDFJS_DATA = "__PDFJS_DATA__";
 var pv = null, pdfjsLoading = null;
 function closePreview() {
@@ -6655,6 +7225,7 @@ function pagePlace(b, pages) {
 }
 function previewComic(sess, b, d) {
 	var box = h("div", "pvpages"), pages = [];
+	store("pages:" + b.id, String(d.pages));
 	for (var i = 0; i < d.pages; i++) {
 		var img = h("img");
 		img.alt = "Page " + (i + 1);
@@ -6722,6 +7293,7 @@ async function previewPdf(sess, b, d) {
 	var doc = await task.promise;
 	if (!sess.alive) return;
 	var n = doc.numPages;
+	store("pages:" + b.id, String(n));
 	var first = (await doc.getPage(1)).getViewport({ scale: 1 });
 	if (!sess.alive) return;
 	var box = h("div", "pvpages"), pages = [];
@@ -6785,11 +7357,15 @@ async function load() {
 	showSub();
 	$("intro").hidden = false;
 	if (invite || !read("familyWelcomed")) welcome(true);
-	var data = await (await fetch("/api/family/books")).json();
+	shelf.on = !!me.name;
+	var got = await Promise.all([fetch("/api/family/books").then(function (r) { return r.json(); }),
+		shelf.on ? shelfCall("GET", "/api/family/places").catch(function () { return null; }) : null]);
+	var data = got[0];
 	books = pairAudio((data.books || []).slice()).sort(function (a, b) {
 		return fold(a.series || a.title).localeCompare(fold(b.series || b.title)) || (parseFloat(a.volume) || 0) - (parseFloat(b.volume) || 0) || fold(a.title).localeCompare(fold(b.title));
 	});
 	sameSeries(books);
+	mergePlaces(got[1]);
 	say("");
 	if ($("welcome").hidden) $("lib").hidden = false;
 	if (!books.length) $("tools").hidden = true;
@@ -6821,6 +7397,7 @@ window.addEventListener("hashchange", function () {
 	window.scrollTo(0, back ? listScroll : 0);
 	if (onRecord) $("rTitle").focus({ preventScroll: true });
 	if (onPreview) $("pvTitle").focus({ preventScroll: true });
+	if (onShelf) $("shTitle").focus({ preventScroll: true });
 });
 
 // The first time on a device: how to keep the page. The invite link works
@@ -6840,6 +7417,7 @@ function device() {
 function welcome(on) {
 	$("welcome").hidden = !on;
 	$("lib").hidden = on;
+	if (on) $("resume").hidden = true;
 	if (!on) { render(); return; }
 	var mine = device();
 	$("head").textContent = "Welcome to The Back Alley Library" + (me.name ? ", " + me.name + "." : ".");

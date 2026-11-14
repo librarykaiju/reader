@@ -259,3 +259,37 @@ CREATE TABLE IF NOT EXISTS previews (
 	bytes INTEGER NOT NULL,
 	PRIMARY KEY (person_id, book_id)
 );
+
+-- The family library's shelf (migration 0023). Where each family member is
+-- in a book they read online or listen to (kind 'read' or 'listen'; place as
+-- the page keeps it on the device; pct 0 to 1 when known), so their shelf
+-- takes them back to it from any device.
+CREATE TABLE IF NOT EXISTS family_places (
+	person_id INTEGER NOT NULL REFERENCES people (id) ON DELETE CASCADE,
+	book_id INTEGER NOT NULL REFERENCES books (id) ON DELETE CASCADE,
+	kind TEXT NOT NULL,
+	place TEXT NOT NULL,
+	pct REAL,
+	updated_at INTEGER NOT NULL,
+	PRIMARY KEY (person_id, book_id, kind)
+);
+
+CREATE INDEX IF NOT EXISTS family_places_recent ON family_places (person_id, updated_at DESC);
+
+-- Reading lists a family member makes for themselves.
+CREATE TABLE IF NOT EXISTS family_lists (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	person_id INTEGER NOT NULL REFERENCES people (id) ON DELETE CASCADE,
+	name TEXT NOT NULL,
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS family_lists_by_person ON family_lists (person_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS family_list_books (
+	list_id INTEGER NOT NULL REFERENCES family_lists (id) ON DELETE CASCADE,
+	book_id INTEGER NOT NULL REFERENCES books (id) ON DELETE CASCADE,
+	added_at INTEGER NOT NULL,
+	PRIMARY KEY (list_id, book_id)
+);
