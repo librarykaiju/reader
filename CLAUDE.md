@@ -11,7 +11,9 @@ When a change touches how an audiobook plays or looks while it plays, make the s
 
 Some parts are only in one player, and stay that way unless asked:
 
-- **App only:** podcasts and videos in the bar, the place synced across devices through the server (the family keeps it on the device), the Record's Player button, and finishing a book.
+- **App only:** podcasts and videos in the bar, the Record's Player button, and finishing a book.
 - **Family only:** the download limit note and the Download button under the player.
+
+The place syncs across devices in both, separately: the app through `books.position`, the family through their shelf (`family_places`, keyed per person; see "The shelf" in `src/index.js`). The family player still saves to `listen:<id>` with `store()`, which is what sends it to the shelf.
 
 If a change can't fit one of the two players, say so in the PR rather than leaving it out without saying.
