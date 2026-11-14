@@ -5230,9 +5230,8 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.listbox .newlist { margin-top: 8px; }
 	.shnote { font-size: 14px; }
 	/* Pages mode (see "pages" in the script). */
-	/* The page stops scrolling by hand; body must not clip, or it becomes the scroller and sticky headers stop sticking. */
-	html.paged { overflow: hidden; overscroll-behavior: none; }
-	html.paged body { overflow: visible; }
+	/* No scrolling by hand (touchmove and wheel are also stopped in the script). Not overflow: hidden: phones reset its scroll on the next touch. */
+	html.paged { overscroll-behavior: none; touch-action: pinch-zoom; }
 	.pgbox { touch-action: pinch-zoom; cursor: default; }
 	.pgmask { position: fixed; z-index: 4; pointer-events: none; transition: opacity .1s; }
 	.pgmask[hidden], .pgfoot[hidden] { display: none; }
@@ -6315,6 +6314,11 @@ function makePager(o) {
 			if (Math.abs(dx) > 40 && Math.abs(dx) > 1.5 * Math.abs(dy)) turn(dx < 0 ? 1 : -1);
 			else if (Math.abs(dy) > 50 && Math.abs(dy) > 1.5 * Math.abs(dx)) turn(dy < 0 ? 1 : -1);
 		}, { passive: true });
+		// No scrolling by hand. The page stays scrollable for the code (an
+		// overflow: hidden page gets its scroll reset by phones on the next touch).
+		on(document, "touchmove", function (e) {
+			if (e.touches.length === 1 && !(e.target.closest && e.target.closest("dialog"))) e.preventDefault();
+		}, { passive: false });
 		on(window, "wheel", function (e) {
 			if (e.ctrlKey || Math.abs(e.deltaY) < 4 || document.querySelector("dialog[open]")) return;
 			e.preventDefault();
@@ -8475,9 +8479,8 @@ const PAGE = String.raw`<!doctype html>
 	.ttsbar svg { width: 20px; height: 20px; fill: currentColor; display: block; margin: auto; }
 	body.has-tts { padding-bottom: calc(90px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
 	/* Pages mode (see "pages" in the script). */
-	/* The page stops scrolling by hand; body must not clip, or it becomes the scroller and sticky headers stop sticking. */
-	html.paged { overflow: hidden; overscroll-behavior: none; }
-	html.paged body { overflow: visible; }
+	/* No scrolling by hand (touchmove and wheel are also stopped in the script). Not overflow: hidden: phones reset its scroll on the next touch. */
+	html.paged { overscroll-behavior: none; touch-action: pinch-zoom; }
 	.pgbox { touch-action: pinch-zoom; cursor: default; }
 	.pgmask { position: fixed; z-index: 4; pointer-events: none; transition: opacity .1s; }
 	.pgmask[hidden], .pgfoot[hidden] { display: none; }
@@ -15855,6 +15858,11 @@ function makePager(o) {
 			if (Math.abs(dx) > 40 && Math.abs(dx) > 1.5 * Math.abs(dy)) turn(dx < 0 ? 1 : -1);
 			else if (Math.abs(dy) > 50 && Math.abs(dy) > 1.5 * Math.abs(dx)) turn(dy < 0 ? 1 : -1);
 		}, { passive: true });
+		// No scrolling by hand. The page stays scrollable for the code (an
+		// overflow: hidden page gets its scroll reset by phones on the next touch).
+		on(document, "touchmove", function (e) {
+			if (e.touches.length === 1 && !(e.target.closest && e.target.closest("dialog"))) e.preventDefault();
+		}, { passive: false });
 		on(window, "wheel", function (e) {
 			if (e.ctrlKey || Math.abs(e.deltaY) < 4 || document.querySelector("dialog[open]")) return;
 			e.preventDefault();
