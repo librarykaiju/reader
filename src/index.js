@@ -12708,7 +12708,7 @@ function barSpan(ep) {
 	var audio = $("pAudio");
 	if (!ep) return { start: 0, end: 0, label: "" };
 	if (!ep.book) return { start: 0, end: audio.duration || epLen(ep), label: "" };
-	var total = abTotal(ep), t = abNow(), cs = (listenCache[ep.book] || {}).chapters || [], i = -1;
+	var total = abTotal(ep), t = abNow(), cs = ((listenCache || {})[ep.book] || {}).chapters || [], i = -1;
 	if (cs.length > 1) cs.forEach(function (c, n) { if (c.start <= t + 0.5) i = n; });
 	if (i < 0) return { start: 0, end: total, label: "" };
 	return { start: cs[i].start, end: cs[i + 1] ? cs[i + 1].start : total, label: cs[i].title || "Chapter " + (i + 1) };
