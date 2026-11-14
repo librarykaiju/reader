@@ -5220,6 +5220,14 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.listbox input[type=checkbox] { width: 20px; height: 20px; accent-color: var(--accent); flex: none; }
 	.listbox .newlist { margin-top: 8px; }
 	.shnote { font-size: 14px; }
+	/* Pages mode (see "pages" in the script). */
+	/* The page stops scrolling by hand; body must not clip, or it becomes the scroller and sticky headers stop sticking. */
+	html.paged { overflow: hidden; overscroll-behavior: none; }
+	html.paged body { overflow: visible; }
+	.pgbox { touch-action: pinch-zoom; cursor: default; }
+	.pgmask { position: fixed; z-index: 4; pointer-events: none; transition: opacity .1s; }
+	.pgmask[hidden], .pgfoot[hidden] { display: none; }
+	.pgfoot { position: fixed; z-index: 5; transform: translateX(-50%); pointer-events: none; font: 12px/1.4 var(--sans); color: var(--muted); font-variant-numeric: tabular-nums; }
 	/* Light and Dark (Sepia is :root). */
 	:root[data-theme=light] { --bg: #fbfaf7; --fg: #1f1d1a; --muted: #6b665e; --line: #e4e0d8; --card: #ffffff; --sel: #ece8df; --accent: #8a4b14; --on-accent: #fff; }
 	:root[data-theme=dark] { --bg: #1b1814; --fg: #e9e1d3; --muted: #a69a87; --line: #3a332a; --card: #241f1a; --sel: #3a3128; --accent: #e0a066; --on-accent: #1b1814; color-scheme: dark; }
@@ -5438,7 +5446,7 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 			<p id="pvEye" class="eyebrow pveye">Read online</p>
 			<h1 id="pvTitle" tabindex="-1"></h1>
 			<p id="pvBy" class="pvby"></p>
-			<div class="pvtools">
+			<div id="pvTools" class="pvtools">
 				<button id="pvAa" type="button" aria-haspopup="dialog" aria-label="Display: colors, text size and font"><span aria-hidden="true">Aa</span> Display</button>
 				<button id="pvAloud" type="button" aria-pressed="false" hidden>Read aloud</button>
 			</div>
@@ -5473,6 +5481,13 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	<div class="seg" role="group" aria-label="Line spacing"><button type="button" data-k="line" data-v="tight">Tight</button><button type="button" data-k="line" data-v="normal">Normal</button><button type="button" data-k="line" data-v="loose">Loose</button></div>
 	<h3>Margins</h3>
 	<div class="seg" role="group" aria-label="Margins"><button type="button" data-k="margin" data-v="narrow">Narrow</button><button type="button" data-k="margin" data-v="normal">Normal</button><button type="button" data-k="margin" data-v="wide">Wide</button></div>
+	<h3>Reading <span class="muted">(EPUB and text)</span></h3>
+	<div class="seg" role="group" aria-label="Reading"><button type="button" data-k="pages" data-v="scroll">Scroll</button><button type="button" data-k="pages" data-v="pages">Pages</button></div>
+	<div id="dTurnBox">
+		<h3>Page turn</h3>
+		<div class="seg" role="group" aria-label="Page turn"><button type="button" data-k="turn" data-v="slide">Slide</button><button type="button" data-k="turn" data-v="off">Off</button></div>
+		<p class="dhint muted">Tap the right or left side, or swipe, to turn. Off turns at once, and is used anyway when your device is set to reduce motion.</p>
+	</div>
 	<h3>Keep screen on</h3>
 	<div class="seg" role="group" aria-label="Keep screen on"><button type="button" data-k="awake" data-v="on">On</button><button type="button" data-k="awake" data-v="off">Off</button></div>
 	<p class="dhint muted">While a book is open to read or listen to, so it doesn't dim and lock. Car mode always keeps it on.</p>
@@ -6151,6 +6166,188 @@ function recordDetails(b, rec) {
 		box.innerHTML = '<p class="muted">Nothing more on this one yet.</p>';
 	}
 }
+// ---------- pages
+// Pages mode (a setting, per device; Scroll is the default) shows the book a
+// screen at a time instead of as one long scroll. The book is still laid
+// out as one column, and the window still scrolls, so everything that
+// tracks the place by scrolling keeps working; a turn scrolls by exactly a
+// page, cut at a line so no line is split, and a cover the color of the
+// page hides the part of the next line below the cut. Turn by tapping the
+// left or right third, swiping, the wheel, or the arrow, Page Up/Down and
+// space keys. With Slide (the default) the page slides out and the next in;
+// Off turns at once, as it does when the device asks for reduced motion.
+// o: box() the element the book is in, top() where the page starts on screen
+// now, stuckTop() where it starts once scrolled, bottom() where it must end,
+// slide() whether to animate, edge(dir) at the first or last page.
+function makePager(o) {
+	var pg = { active: false, busy: false, offs: [] }, mask = null, foot = null, touch = null, wheelAt = 0;
+	var BLOCKS = "p,h1,h2,h3,h4,h5,h6,blockquote,li,pre,dd,dt,figcaption,td";
+	function blockAt(y) {
+		var b = o.box();
+		if (!b) return null;
+		var r = b.getBoundingClientRect(), xs = [0.5, 0.3, 0.7];
+		for (var i = 0; i < xs.length; i++) {
+			var el = document.elementFromPoint(r.left + r.width * xs[i], y);
+			if (el && b.contains(el) && el !== b) return el.closest(BLOCKS) || el;
+		}
+		return null;
+	}
+	function lines(el) {
+		var rg = document.createRange();
+		rg.selectNodeContents(el);
+		return Array.prototype.filter.call(rg.getClientRects(), function (r) { return r.height > 0 && r.width > 0; });
+	}
+	// Where this page ends: the top of the first line that doesn't fit.
+	function cutAt() {
+		var bottom = o.bottom(), el = blockAt(bottom - 1), cut = bottom;
+		if (el) lines(el).forEach(function (l) { if (l.bottom > bottom + 0.5 && l.top < cut) cut = l.top; });
+		return Math.max(o.top() + 40, Math.min(bottom, cut));
+	}
+	function refresh() {
+		if (!pg.active) return;
+		var b = o.box();
+		if (!b) return;
+		var r = b.getBoundingClientRect(), cut = cutAt(), bg = getComputedStyle(b).backgroundColor;
+		if (!bg || bg === "transparent" || bg === "rgba(0, 0, 0, 0)") bg = getComputedStyle(document.body).backgroundColor;
+		mask.style.cssText = "top:" + cut + "px;height:" + Math.max(0, innerHeight - cut) + "px;left:" + Math.max(0, r.left) + "px;width:" + Math.min(innerWidth, r.width) + "px;background:" + bg;
+		var h = Math.max(1, o.bottom() - o.stuckTop()), all = document.documentElement.scrollHeight - innerHeight;
+		var n = Math.round(window.scrollY / h) + 1, of = Math.max(n, Math.ceil(all / h) + 1);
+		foot.textContent = n + " / " + of;
+		foot.hidden = !!o.noFoot;
+		foot.style.top = (o.bottom() + 4) + "px";
+		foot.style.left = (r.left + r.width / 2) + "px";
+	}
+	function motion() { return o.slide() && !(window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches); }
+	// After turning back: a line cut at the top of the page is shown whole.
+	function alignTop() {
+		var top = o.top(), b = o.box(), el = blockAt(top + 1);
+		if (!el || !b || b.getBoundingClientRect().top >= top) return;
+		lines(el).forEach(function (l) { if (l.top < top - 0.5 && l.bottom > top + 0.5) window.scrollBy(0, l.top - top); });
+	}
+	function go(y, dir, align) {
+		var b = o.box(), jump = function () {
+			window.scrollTo(0, y);
+			if (align) alignTop();
+			refresh();
+		};
+		if (!motion() || !b) return jump();
+		pg.busy = true;
+		b.style.transition = "transform .13s ease-in, opacity .13s ease-in";
+		b.style.transform = "translateX(" + (dir > 0 ? -48 : 48) + "px)";
+		b.style.opacity = "0";
+		mask.style.opacity = "0";
+		setTimeout(function () {
+			b.style.transition = "none";
+			b.style.transform = "translateX(" + (dir > 0 ? 48 : -48) + "px)";
+			jump();
+			void b.offsetWidth;
+			b.style.transition = "transform .17s ease-out, opacity .17s ease-out";
+			b.style.transform = "";
+			b.style.opacity = "";
+			mask.style.opacity = "";
+			setTimeout(function () { b.style.transition = ""; pg.busy = false; refresh(); }, 190);
+		}, 130);
+	}
+	function turn(dir) {
+		if (!pg.active || pg.busy) return;
+		var y0 = window.scrollY, max = document.documentElement.scrollHeight - innerHeight, y;
+		if (dir > 0) y = y0 + cutAt() - o.stuckTop();
+		else y = y0 - (o.bottom() - o.stuckTop());
+		y = Math.max(0, Math.min(max, Math.round(y)));
+		if (Math.abs(y - y0) < 2) { if (o.edge) o.edge(dir); return; }
+		go(y, dir, dir < 0);
+	}
+	// Bring an element onto the page (read aloud moving on): a turn, or a jump if it's further.
+	function reveal(el) {
+		if (!pg.active || pg.busy || !el) return;
+		var r = el.getBoundingClientRect(), cut = cutAt();
+		if (r.top >= o.top() - 1 && r.top < cut - 4) return;
+		if (r.top >= cut - 4 && r.top < cut + (o.bottom() - o.stuckTop())) return turn(1);
+		go(Math.max(0, Math.round(window.scrollY + r.top - o.stuckTop())), r.top > 0 ? 1 : -1, false);
+	}
+	function on(el, type, fn, opts) { el.addEventListener(type, fn, opts); pg.offs.push(function () { el.removeEventListener(type, fn, opts); }); }
+	function skip(target) {
+		var sel = window.getSelection();
+		return (sel && !sel.isCollapsed) || (target.closest && target.closest("a, button, input, textarea, select, mark, summary, label"));
+	}
+	function start() {
+		if (pg.active || !o.box()) return;
+		pg.active = true;
+		if (!mask) {
+			mask = document.createElement("div");
+			mask.className = "pgmask";
+			foot = document.createElement("div");
+			foot.className = "pgfoot";
+			foot.setAttribute("aria-hidden", "true");
+			document.body.append(mask, foot);
+		}
+		mask.hidden = foot.hidden = false;
+		document.documentElement.classList.add("paged");
+		var box = o.box();
+		box.classList.add("pgbox");
+		on(box, "click", function (e) {
+			if (skip(e.target)) return;
+			var r = box.getBoundingClientRect(), x = (e.clientX - r.left) / r.width;
+			if (x < 1 / 3) turn(-1); else if (x > 2 / 3) turn(1);
+		});
+		on(box, "touchstart", function (e) {
+			touch = e.touches.length === 1 ? { x: e.touches[0].clientX, y: e.touches[0].clientY, at: Date.now() } : null;
+		}, { passive: true });
+		on(box, "touchend", function (e) {
+			var t = touch, c = e.changedTouches[0];
+			touch = null;
+			if (!t || !c || Date.now() - t.at > 700 || skip(e.target)) return;
+			var dx = c.clientX - t.x, dy = c.clientY - t.y;
+			if (Math.abs(dx) > 40 && Math.abs(dx) > 1.5 * Math.abs(dy)) turn(dx < 0 ? 1 : -1);
+			else if (Math.abs(dy) > 50 && Math.abs(dy) > 1.5 * Math.abs(dx)) turn(dy < 0 ? 1 : -1);
+		}, { passive: true });
+		on(window, "wheel", function (e) {
+			if (e.ctrlKey || Math.abs(e.deltaY) < 4 || document.querySelector("dialog[open]")) return;
+			e.preventDefault();
+			var now = Date.now();
+			if (now - wheelAt < 450) return;
+			wheelAt = now;
+			turn(e.deltaY > 0 ? 1 : -1);
+		}, { passive: false });
+		on(document, "keydown", function (e) {
+			if (e.altKey || e.ctrlKey || e.metaKey || /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable || document.querySelector("dialog[open]")) return;
+			var k = e.key, dir = k === "ArrowRight" || k === "ArrowDown" || k === "PageDown" || (k === " " && !e.shiftKey) ? 1
+				: k === "ArrowLeft" || k === "ArrowUp" || k === "PageUp" || (k === " " && e.shiftKey) ? -1 : 0;
+			if (!dir || (k === " " && e.target.closest && e.target.closest("button, a"))) return;
+			e.preventDefault();
+			turn(dir);
+		});
+		var later = function () { requestAnimationFrame(refresh); };
+		on(window, "scroll", later, { passive: true });
+		on(window, "resize", later);
+		requestAnimationFrame(function () { alignTop(); refresh(); });
+	}
+	function stop() {
+		if (!pg.active) return;
+		pg.active = false;
+		pg.offs.forEach(function (f) { f(); });
+		pg.offs = [];
+		var box = o.box();
+		if (box) { box.classList.remove("pgbox"); box.style.transform = box.style.opacity = box.style.transition = ""; }
+		document.documentElement.classList.remove("paged");
+		if (mask) mask.hidden = foot.hidden = true;
+		pg.busy = false;
+	}
+	return { start: start, stop: stop, turn: turn, reveal: reveal, refresh: refresh, active: function () { return pg.active; } };
+}
+
+var pager = makePager({
+	box: function () { return document.querySelector("#pvBody .pvtext"); },
+	top: function () { return Math.max(0, $("pvTools").getBoundingClientRect().bottom); },
+	stuckTop: function () { return $("pvTools").offsetHeight; },
+	bottom: function () {
+		var b = window.innerHeight;
+		["lbar", "ttsBar"].forEach(function (id) { if (!$(id).hidden) b = Math.min(b, $(id).getBoundingClientRect().top); });
+		return b - 26;
+	},
+	slide: function () { return disp.turn === "slide"; }
+});
+
 // ---------- display (per device): colors, text and keep screen on
 // Light, Sepia (the library's own colors, and the default) or Dark, on the
 // whole page once signed in. Reading online also takes a text size, a font
@@ -6167,7 +6364,9 @@ var disp = {
 	font: DISP_FONTS[read("dispFont")] ? read("dispFont") : "serif",
 	line: DISP_LINES[read("dispLine")] ? read("dispLine") : "normal",
 	margin: DISP_MARGINS[read("dispMargin")] ? read("dispMargin") : "normal",
-	awake: read("dispAwake") !== "off"
+	awake: read("dispAwake") !== "off",
+	pages: read("dispPages") === "pages" ? "pages" : "scroll",
+	turn: read("dispTurn") === "off" ? "off" : "slide"
 };
 function applyTheme() {
 	var root = document.documentElement;
@@ -6193,14 +6392,17 @@ function applyText() {
 }
 function setDisp(k, v) {
 	disp[k] = v;
-	store({ theme: "dispTheme", size: "dispSize", font: "dispFont", line: "dispLine", margin: "dispMargin", awake: "dispAwake" }[k],
+	store({ theme: "dispTheme", size: "dispSize", font: "dispFont", line: "dispLine", margin: "dispMargin", awake: "dispAwake", pages: "dispPages", turn: "dispTurn" }[k],
 		k === "awake" ? (v ? "on" : "off") : String(v));
 	if (k === "theme") applyTheme();
 	else if (k === "awake") keepAwake();
+	else if (k === "pages") { if (v === "pages") pager.start(); else pager.stop(); }
 	applyText();
 }
 function paintDisp() {
 	$("dSizeVal").textContent = disp.size;
+	$("dTurnBox").hidden = disp.pages !== "pages";
+	pager.refresh();
 	$("dSmaller").disabled = disp.size <= 15;
 	$("dBigger").disabled = disp.size >= 28;
 	document.querySelectorAll("#disp [data-k]").forEach(function (b) {
@@ -6295,6 +6497,7 @@ function ttsStart(src, start) {
 	tts.pieces = null;
 	document.body.classList.add("has-tts");
 	$("ttsBar").hidden = false;
+	pager.refresh();
 	ttsPlay();
 }
 function ttsPlay() {
@@ -6358,7 +6561,8 @@ function ttsMark(el) {
 	if (was) was.classList.remove("speaking");
 	tts.el = el;
 	el.classList.add("speaking");
-	if (follow && !ttsVisible(el, true)) goToPlace(el);
+	if (pager.active()) pager.reveal(el);
+	else if (follow && !ttsVisible(el, true)) goToPlace(el);
 }
 function ttsVisible(el, whole) {
 	var r = el.getBoundingClientRect(), bottom = window.innerHeight - 140;
@@ -6906,6 +7110,7 @@ var PDFJS = "__PDFJS__", PDFJS_DATA = "__PDFJS_DATA__";
 var pv = null, pdfjsLoading = null;
 function closePreview() {
 	ttsStop();
+	pager.stop();
 	$("lookBar").hidden = true;
 	if (!pv) return;
 	pv.alive = false;
@@ -7730,6 +7935,7 @@ function previewText(sess, b, d) {
 	if (place && Number(place[1]) === d.at) goToPlace(box.querySelector('[data-place="' + place[0] + '"]'));
 	keepPlace(sess, b, box);
 	sess.cleanup.push(function () { io.disconnect(); });
+	if (disp.pages === "pages") pager.start();
 	if (next == null) previewEnd(b, "That's the end.");
 	else io.observe(more);
 }
@@ -8253,6 +8459,14 @@ const PAGE = String.raw`<!doctype html>
 	.ttsbar .btn { min-width: 44px; min-height: 44px; font-variant-numeric: tabular-nums; }
 	.ttsbar svg { width: 20px; height: 20px; fill: currentColor; display: block; margin: auto; }
 	body.has-tts { padding-bottom: calc(90px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
+	/* Pages mode (see "pages" in the script). */
+	/* The page stops scrolling by hand; body must not clip, or it becomes the scroller and sticky headers stop sticking. */
+	html.paged { overflow: hidden; overscroll-behavior: none; }
+	html.paged body { overflow: visible; }
+	.pgbox { touch-action: pinch-zoom; cursor: default; }
+	.pgmask { position: fixed; z-index: 4; pointer-events: none; transition: opacity .1s; }
+	.pgmask[hidden], .pgfoot[hidden] { display: none; }
+	.pgfoot { position: fixed; z-index: 5; transform: translateX(-50%); pointer-events: none; font: 12px/1.4 var(--sans); color: var(--muted); font-variant-numeric: tabular-nums; }
 	body.has-tts .hlbar:not(.ttsbar) { bottom: calc(84px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
 	body.has-tts.has-pbar .hlbar:not(.ttsbar) { bottom: calc(186px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
 	.speaking { background: var(--sel); box-shadow: 0 0 0 6px var(--sel); border-radius: 2px; }
@@ -8884,6 +9098,19 @@ const PAGE = String.raw`<!doctype html>
 		<button type="button" data-margin="normal">Normal</button>
 		<button type="button" data-margin="wide">Wide</button>
 	</div>
+	<h2>Reading books</h2>
+	<div class="seg" id="paging">
+		<button type="button" data-paging="scroll">Scroll</button>
+		<button type="button" data-paging="pages">Pages</button>
+	</div>
+	<div id="pageTurnBox" hidden>
+		<h2>Page turn</h2>
+		<div class="seg" id="pageTurn">
+			<button type="button" data-turn="slide">Slide</button>
+			<button type="button" data-turn="off">Off</button>
+		</div>
+		<p class="hint">For .txt and .epub books. Tap the right or left side, or swipe, to turn. Off turns at once, and is used anyway when the device is set to reduce motion.</p>
+	</div>
 	<div id="ttsVoiceBox" hidden>
 		<h2><label for="ttsVoice">Read aloud voice</label></h2>
 		<select id="ttsVoice"></select>
@@ -9412,6 +9639,9 @@ var readFont = READ_FONTS[read("readerFont")] ? read("readerFont") : "serif";
 var LINES = { tight: 1.4, normal: 1.65, loose: 1.95 };
 var MARGINS = { narrow: ["8px", "80ch"], normal: ["16px", "68ch"], wide: ["32px", "56ch"] };
 var lineSpacing = LINES[read("readerLine")] ? read("readerLine") : "normal";
+// Scroll or Pages for .txt and .epub books, and the page turn (see "pages"), per device.
+var paging = read("readerPaging") === "pages" ? "pages" : "scroll";
+var pageTurn = read("readerPageTurn") === "off" ? "off" : "slide";
 var margins = MARGINS[read("readerMargin")] ? read("readerMargin") : "normal";
 
 // Auto follows the system; the rest are set on <html> as data-theme.
@@ -15475,6 +15705,205 @@ function listen(sess, target, type, fn, opts) {
 	sess.cleanup.push(function () { target.removeEventListener(type, fn, opts); });
 }
 
+// ---------- pages
+// Pages mode (a setting, per device; Scroll is the default) shows the book a
+// screen at a time instead of as one long scroll. The book is still laid
+// out as one column, and the window still scrolls, so everything that
+// tracks the place by scrolling keeps working; a turn scrolls by exactly a
+// page, cut at a line so no line is split, and a cover the color of the
+// page hides the part of the next line below the cut. Turn by tapping the
+// left or right third, swiping, the wheel, or the arrow, Page Up/Down and
+// space keys. With Slide (the default) the page slides out and the next in;
+// Off turns at once, as it does when the device asks for reduced motion.
+// o: box() the element the book is in, top() where the page starts on screen
+// now, stuckTop() where it starts once scrolled, bottom() where it must end,
+// slide() whether to animate, edge(dir) at the first or last page.
+function makePager(o) {
+	var pg = { active: false, busy: false, offs: [] }, mask = null, foot = null, touch = null, wheelAt = 0;
+	var BLOCKS = "p,h1,h2,h3,h4,h5,h6,blockquote,li,pre,dd,dt,figcaption,td";
+	function blockAt(y) {
+		var b = o.box();
+		if (!b) return null;
+		var r = b.getBoundingClientRect(), xs = [0.5, 0.3, 0.7];
+		for (var i = 0; i < xs.length; i++) {
+			var el = document.elementFromPoint(r.left + r.width * xs[i], y);
+			if (el && b.contains(el) && el !== b) return el.closest(BLOCKS) || el;
+		}
+		return null;
+	}
+	function lines(el) {
+		var rg = document.createRange();
+		rg.selectNodeContents(el);
+		return Array.prototype.filter.call(rg.getClientRects(), function (r) { return r.height > 0 && r.width > 0; });
+	}
+	// Where this page ends: the top of the first line that doesn't fit.
+	function cutAt() {
+		var bottom = o.bottom(), el = blockAt(bottom - 1), cut = bottom;
+		if (el) lines(el).forEach(function (l) { if (l.bottom > bottom + 0.5 && l.top < cut) cut = l.top; });
+		return Math.max(o.top() + 40, Math.min(bottom, cut));
+	}
+	function refresh() {
+		if (!pg.active) return;
+		var b = o.box();
+		if (!b) return;
+		var r = b.getBoundingClientRect(), cut = cutAt(), bg = getComputedStyle(b).backgroundColor;
+		if (!bg || bg === "transparent" || bg === "rgba(0, 0, 0, 0)") bg = getComputedStyle(document.body).backgroundColor;
+		mask.style.cssText = "top:" + cut + "px;height:" + Math.max(0, innerHeight - cut) + "px;left:" + Math.max(0, r.left) + "px;width:" + Math.min(innerWidth, r.width) + "px;background:" + bg;
+		var h = Math.max(1, o.bottom() - o.stuckTop()), all = document.documentElement.scrollHeight - innerHeight;
+		var n = Math.round(window.scrollY / h) + 1, of = Math.max(n, Math.ceil(all / h) + 1);
+		foot.textContent = n + " / " + of;
+		foot.hidden = !!o.noFoot;
+		foot.style.top = (o.bottom() + 4) + "px";
+		foot.style.left = (r.left + r.width / 2) + "px";
+	}
+	function motion() { return o.slide() && !(window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches); }
+	// After turning back: a line cut at the top of the page is shown whole.
+	function alignTop() {
+		var top = o.top(), b = o.box(), el = blockAt(top + 1);
+		if (!el || !b || b.getBoundingClientRect().top >= top) return;
+		lines(el).forEach(function (l) { if (l.top < top - 0.5 && l.bottom > top + 0.5) window.scrollBy(0, l.top - top); });
+	}
+	function go(y, dir, align) {
+		var b = o.box(), jump = function () {
+			window.scrollTo(0, y);
+			if (align) alignTop();
+			refresh();
+		};
+		if (!motion() || !b) return jump();
+		pg.busy = true;
+		b.style.transition = "transform .13s ease-in, opacity .13s ease-in";
+		b.style.transform = "translateX(" + (dir > 0 ? -48 : 48) + "px)";
+		b.style.opacity = "0";
+		mask.style.opacity = "0";
+		setTimeout(function () {
+			b.style.transition = "none";
+			b.style.transform = "translateX(" + (dir > 0 ? 48 : -48) + "px)";
+			jump();
+			void b.offsetWidth;
+			b.style.transition = "transform .17s ease-out, opacity .17s ease-out";
+			b.style.transform = "";
+			b.style.opacity = "";
+			mask.style.opacity = "";
+			setTimeout(function () { b.style.transition = ""; pg.busy = false; refresh(); }, 190);
+		}, 130);
+	}
+	function turn(dir) {
+		if (!pg.active || pg.busy) return;
+		var y0 = window.scrollY, max = document.documentElement.scrollHeight - innerHeight, y;
+		if (dir > 0) y = y0 + cutAt() - o.stuckTop();
+		else y = y0 - (o.bottom() - o.stuckTop());
+		y = Math.max(0, Math.min(max, Math.round(y)));
+		if (Math.abs(y - y0) < 2) { if (o.edge) o.edge(dir); return; }
+		go(y, dir, dir < 0);
+	}
+	// Bring an element onto the page (read aloud moving on): a turn, or a jump if it's further.
+	function reveal(el) {
+		if (!pg.active || pg.busy || !el) return;
+		var r = el.getBoundingClientRect(), cut = cutAt();
+		if (r.top >= o.top() - 1 && r.top < cut - 4) return;
+		if (r.top >= cut - 4 && r.top < cut + (o.bottom() - o.stuckTop())) return turn(1);
+		go(Math.max(0, Math.round(window.scrollY + r.top - o.stuckTop())), r.top > 0 ? 1 : -1, false);
+	}
+	function on(el, type, fn, opts) { el.addEventListener(type, fn, opts); pg.offs.push(function () { el.removeEventListener(type, fn, opts); }); }
+	function skip(target) {
+		var sel = window.getSelection();
+		return (sel && !sel.isCollapsed) || (target.closest && target.closest("a, button, input, textarea, select, mark, summary, label"));
+	}
+	function start() {
+		if (pg.active || !o.box()) return;
+		pg.active = true;
+		if (!mask) {
+			mask = document.createElement("div");
+			mask.className = "pgmask";
+			foot = document.createElement("div");
+			foot.className = "pgfoot";
+			foot.setAttribute("aria-hidden", "true");
+			document.body.append(mask, foot);
+		}
+		mask.hidden = foot.hidden = false;
+		document.documentElement.classList.add("paged");
+		var box = o.box();
+		box.classList.add("pgbox");
+		on(box, "click", function (e) {
+			if (skip(e.target)) return;
+			var r = box.getBoundingClientRect(), x = (e.clientX - r.left) / r.width;
+			if (x < 1 / 3) turn(-1); else if (x > 2 / 3) turn(1);
+		});
+		on(box, "touchstart", function (e) {
+			touch = e.touches.length === 1 ? { x: e.touches[0].clientX, y: e.touches[0].clientY, at: Date.now() } : null;
+		}, { passive: true });
+		on(box, "touchend", function (e) {
+			var t = touch, c = e.changedTouches[0];
+			touch = null;
+			if (!t || !c || Date.now() - t.at > 700 || skip(e.target)) return;
+			var dx = c.clientX - t.x, dy = c.clientY - t.y;
+			if (Math.abs(dx) > 40 && Math.abs(dx) > 1.5 * Math.abs(dy)) turn(dx < 0 ? 1 : -1);
+			else if (Math.abs(dy) > 50 && Math.abs(dy) > 1.5 * Math.abs(dx)) turn(dy < 0 ? 1 : -1);
+		}, { passive: true });
+		on(window, "wheel", function (e) {
+			if (e.ctrlKey || Math.abs(e.deltaY) < 4 || document.querySelector("dialog[open]")) return;
+			e.preventDefault();
+			var now = Date.now();
+			if (now - wheelAt < 450) return;
+			wheelAt = now;
+			turn(e.deltaY > 0 ? 1 : -1);
+		}, { passive: false });
+		on(document, "keydown", function (e) {
+			if (e.altKey || e.ctrlKey || e.metaKey || /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable || document.querySelector("dialog[open]")) return;
+			var k = e.key, dir = k === "ArrowRight" || k === "ArrowDown" || k === "PageDown" || (k === " " && !e.shiftKey) ? 1
+				: k === "ArrowLeft" || k === "ArrowUp" || k === "PageUp" || (k === " " && e.shiftKey) ? -1 : 0;
+			if (!dir || (k === " " && e.target.closest && e.target.closest("button, a"))) return;
+			e.preventDefault();
+			turn(dir);
+		});
+		var later = function () { requestAnimationFrame(refresh); };
+		on(window, "scroll", later, { passive: true });
+		on(window, "resize", later);
+		requestAnimationFrame(function () { alignTop(); refresh(); });
+	}
+	function stop() {
+		if (!pg.active) return;
+		pg.active = false;
+		pg.offs.forEach(function (f) { f(); });
+		pg.offs = [];
+		var box = o.box();
+		if (box) { box.classList.remove("pgbox"); box.style.transform = box.style.opacity = box.style.transition = ""; }
+		document.documentElement.classList.remove("paged");
+		if (mask) mask.hidden = foot.hidden = true;
+		pg.busy = false;
+	}
+	return { start: start, stop: stop, turn: turn, reveal: reveal, refresh: refresh, active: function () { return pg.active; } };
+}
+
+var pager = makePager({
+	box: function () { return session && session.txt ? $("bookBody") : null; },
+	top: headerBottom,
+	stuckTop: headerBottom,
+	bottom: function () {
+		var b = window.innerHeight;
+		["pbar", "ttsBar"].forEach(function (id) { if (!$(id).hidden) b = Math.min(b, $(id).getBoundingClientRect().top); });
+		return b - 26;
+	},
+	slide: function () { return pageTurn === "slide"; },
+	// The header already says "p. 12 of ~300".
+	noFoot: true
+});
+// The open book in pages, or back to scrolling; stopped when the book closes.
+function pagerFor(sess) {
+	if (!sess || !sess.txt) return;
+	if (paging !== "pages") return pager.stop();
+	pager.start();
+	if (!sess.pagerOff) { sess.pagerOff = true; sess.cleanup.push(pager.stop); }
+}
+function applyPaging(v, turn) {
+	paging = v === "pages" ? "pages" : "scroll";
+	pageTurn = turn === "off" ? "off" : "slide";
+	document.querySelectorAll("#paging button").forEach(function (b) { b.setAttribute("aria-pressed", String(b.dataset.paging === paging)); });
+	document.querySelectorAll("#pageTurn button").forEach(function (b) { b.setAttribute("aria-pressed", String(b.dataset.turn === pageTurn)); });
+	show($("pageTurnBox"), paging === "pages");
+	pagerFor(session);
+}
+
 // ---------- .txt reader
 // Paragraphs are built in slices so a multi-MB book never freezes the page,
 // and grouped into blocks with content-visibility:auto so only the blocks
@@ -15557,6 +15986,7 @@ function startText(sess, t, pos) {
 	sess.jump = function (s) { if (s.f > 0) restoreTxt(sess, s.f); else window.scrollTo(0, 0); };
 	hlStart(sess);
 	restoreTxt(sess, pos.f || 0);
+	pagerFor(sess);
 	listen(sess, window, "scroll", onScrollFrame(track), { passive: true });
 	listen(sess, window, "resize", onScrollFrame(function () { estimateChunks(t); }));
 	setProgress(posLabel(sess, { f: pos.f }));
@@ -16357,6 +16787,7 @@ function readBookAloud() {
 		text: function (i) { return t.paras[i]; },
 		el: function (i) { return paraEl(t, i); },
 		follow: function (el) {
+			if (pager.active()) return pager.reveal(el);
 			aim(sess, function () { return window.scrollY + el.getBoundingClientRect().top - headerBottom() - window.innerHeight * 0.2; }, sess.track);
 		},
 	});
@@ -17776,6 +18207,18 @@ $("margins").addEventListener("click", function (e) {
 	applyMargins(b.dataset.margin);
 	store("readerMargin", margins === "normal" ? null : margins);
 });
+$("paging").addEventListener("click", function (e) {
+	var b = e.target.closest("button");
+	if (!b) return;
+	store("readerPaging", b.dataset.paging === "pages" ? "pages" : null);
+	applyPaging(b.dataset.paging, pageTurn);
+});
+$("pageTurn").addEventListener("click", function (e) {
+	var b = e.target.closest("button");
+	if (!b) return;
+	store("readerPageTurn", b.dataset.turn === "off" ? "off" : null);
+	applyPaging(paging, b.dataset.turn);
+});
 $("scrollRead").addEventListener("click", function (e) {
 	var b = e.target.closest("button");
 	if (!b) return;
@@ -17954,6 +18397,7 @@ applySize(fontSize);
 applyFont(readFont);
 applyLine(lineSpacing);
 applyMargins(margins);
+applyPaging(paging, pageTurn);
 applyScrollRead(scrollRead);
 applyAwake(awake.on);
 if (token()) start(); else askToken();
