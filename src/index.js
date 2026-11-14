@@ -5003,6 +5003,13 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	summary { cursor: pointer; color: var(--accent); }
 	.go { appearance: none; width: 100%; border: 0; border-radius: 10px; background: var(--accent); color: var(--on-accent); font-weight: 600; font-size: 17px; min-height: 48px; margin-top: 10px; cursor: pointer; }
 	.sub { margin: -8px 0 14px; font-size: 14px; }
+	/* The gear beside the heading opens Display; it shows whenever the heading does. */
+	.headrow { display: flex; align-items: flex-start; gap: 12px; }
+	.headrow h1 { flex: 1; min-width: 0; }
+	.gear { flex: none; appearance: none; width: 44px; height: 44px; margin-top: 2px; border: 1px solid var(--line); border-radius: 50%; background: var(--card); color: var(--fg); display: grid; place-items: center; cursor: pointer; }
+	.gear svg { width: 22px; height: 22px; fill: currentColor; }
+	.gear:hover, .gear:focus-visible { border-color: var(--accent); color: var(--accent); }
+	#head[hidden] + .gear { display: none; }
 	.intro { margin: 0 0 20px; font: 400 17px/1.55 var(--display); }
 	.intro p { margin: 0 0 10px; }
 	/* The landing page: the library's sepia, all type. Brown text, red
@@ -5355,7 +5362,10 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 			<button id="lSend" class="stamp" type="submit">Send my request</button>
 		</form>
 	</section>
+	<div class="headrow">
 	<h1 id="head" hidden>The Back Alley Library</h1>
+	<button id="gear" class="gear" type="button" aria-haspopup="dialog" aria-label="Settings: colors, text size, font and page turns" title="Settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.4 13a7.5 7.5 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7.4 7.4 0 0 0-1.7-1L15 3.5h-4L10.7 6a7.4 7.4 0 0 0-1.7 1l-2.4-1-2 3.4 2 1.6a7.5 7.5 0 0 0 0 2l-2 1.6 2 3.4 2.4-1c.5.4 1.1.7 1.7 1l.3 2.5h4l.3-2.5c.6-.3 1.2-.6 1.7-1l2.4 1 2-3.4zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/></svg></button>
+	</div>
 	<p id="sub" class="sub muted" hidden></p>
 	<section id="resume" class="resume" hidden>
 		<div class="reshead"><h2>Pick up where you left off</h2><a href="#shelf">Your shelf ›</a></div>
@@ -6421,6 +6431,7 @@ document.querySelectorAll("#disp [data-k]").forEach(function (b) {
 });
 $("dClose").addEventListener("click", function () { $("disp").close(); });
 $("pvAa").addEventListener("click", openDisp);
+$("gear").addEventListener("click", openDisp);
 $("dispLink").addEventListener("click", function (e) { e.preventDefault(); openDisp(); });
 // A tap on the dimmed page around a panel closes it.
 ["disp", "look"].forEach(function (id) {
