@@ -5010,6 +5010,8 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.gear svg { width: 22px; height: 22px; fill: currentColor; }
 	.gear:hover, .gear:focus-visible { border-color: var(--accent); color: var(--accent); }
 	#head[hidden] + .gear { display: none; }
+	/* "Pick up where you left off" has its own shelf link; don't show it twice. */
+	#sub:has(~ #resume:not([hidden])) .subshelf { display: none; }
 	.intro { margin: 0 0 20px; font: 400 17px/1.55 var(--display); }
 	.intro p { margin: 0 0 10px; }
 	/* The landing page: the library's sepia, all type. Brown text, red
@@ -5995,8 +5997,10 @@ function showSub() {
 	var left = me.left == null ? "" : " · " + (me.left === 1 ? "1 download" : me.left + " downloads") + audio + " left today";
 	var link = h("a", null, "Your shelf");
 	link.href = "#shelf";
-	$("sub").textContent = "Signed in as " + me.name + left + " · ";
-	$("sub").append(link);
+	var tail = h("span", "subshelf", " · ");
+	tail.append(link);
+	$("sub").textContent = "Signed in as " + me.name + left;
+	$("sub").append(tail);
 	$("sub").hidden = false;
 }
 // The Worker enforces the daily limit; this just says so before the tap
