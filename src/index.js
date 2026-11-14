@@ -5935,6 +5935,9 @@ var SVG_PAUSE = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h4v14H
 var VOICE_LEVELS = [null, { eq: 4, thr: -24, ratio: 3, gain: 1.25 }, { eq: 6, thr: -30, ratio: 4, gain: 1.6 }];
 var voice = { level: Number(read("voiceBoost")) || 0, ctx: null, chain: null, wired: [] };
 if (!VOICE_LEVELS[voice.level]) voice.level = 0;
+// iOS: the audiobook is media to play, not background sound, from the start,
+// so a play from the lock screen or Bluetooth is heard and not just run silently.
+try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch (e) {}
 function voiceCtx() {
 	var AC = window.AudioContext || window.webkitAudioContext;
 	if (!voice.ctx && AC) {
@@ -11215,6 +11218,9 @@ async function removeDownload(id) {
 // instead (signed like /listen/), or it would play silent.
 var VOICE_LEVELS = [null, { eq: 4, thr: -24, ratio: 3, gain: 1.25 }, { eq: 6, thr: -30, ratio: 4, gain: 1.6 }];
 var voice = { level: Number(read("readerVoice")) || 0, ctx: null, chain: null, src: null, media: {} };
+// iOS: the audiobook is media to play, not background sound, from the start,
+// so a play from the lock screen or Bluetooth is heard and not just run silently.
+try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch (e) {}
 if (!VOICE_LEVELS[voice.level]) voice.level = 0;
 function voiceCtx() {
 	var AC = window.AudioContext || window.webkitAudioContext;
@@ -11480,7 +11486,7 @@ function findListed(id) { return state.episodes.filter(function (e) { return e.i
 function plog(what) {
 	var audio = $("pAudio"), list = readJSON("readerPlayerLog") || [];
 	var d = new Date(), hh = function (n) { return (n < 10 ? "0" : "") + n; };
-	list.push(hh(d.getHours()) + ":" + hh(d.getMinutes()) + ":" + hh(d.getSeconds()) + "  " + what + "  [" + clock(audio.currentTime || 0) + (audio.paused ? ", paused" : ", playing") + "]");
+	list.push(hh(d.getHours()) + ":" + hh(d.getMinutes()) + ":" + hh(d.getSeconds()) + "  " + what + "  [" + clock(audio.currentTime || 0) + (audio.paused ? ", paused" : ", playing") + (voice.src ? ", voice " + voice.ctx.state : "") + (navigator.audioSession ? ", session " + navigator.audioSession.type + "/" + navigator.audioSession.state : "") + "]");
 	store("readerPlayerLog", JSON.stringify(list.slice(-80)));
 	if ($("lpLog") && $("lpLog").open) paintLog();
 }
