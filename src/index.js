@@ -6039,7 +6039,8 @@ function previewAudio(sess, b, d) {
 		if (i < 0) return { i: -1, start: 0, end: total };
 		return { i: i, start: chapters[i].start, end: chapters[i + 1] ? chapters[i + 1].start : total };
 	};
-	var now = function () { return cur < 0 ? 0 : starts[cur] + (audio.currentTime || 0); };
+	var soft = null;
+	var now = function () { return soft ? soft.t : cur < 0 ? 0 : starts[cur] + (audio.currentTime || 0); };
 	var load = function (n, at, play) {
 		cur = n;
 		pending = at;
@@ -6052,6 +6053,8 @@ function previewAudio(sess, b, d) {
 	// A place in the whole book -> the file it's in, and the time in it.
 	var seek = function (t, play) {
 		t = Math.max(0, Math.min(t, Math.max(0, total - 1)));
+		// Soft paused (below): a skip moves the place it comes back to.
+		if (soft) { soft.t = t; render(t); keep(); position(t); return; }
 		// An end-of-chapter sleep timer follows to the chapter landed in.
 		if (sl.end != null) sl.end = chapterAt(t).end;
 		var n = 0;
@@ -6069,6 +6072,7 @@ function previewAudio(sess, b, d) {
 		pending = null;
 	});
 	audio.addEventListener("ended", function () {
+		if (soft) return softEnd(false);
 		if (cur + 1 < files.length) load(cur + 1, 0, true);
 		else { store("listen:" + b.id, "0"); setSleep("off"); }
 	});
@@ -6097,10 +6101,44 @@ function previewAudio(sess, b, d) {
 	// play/pause follow the player instead of guessing.
 	var msState = function (s) { if (ms && nowPlaying === eng) try { ms.playbackState = s; } catch (e) {} };
 	audio.addEventListener("play", function () { rewind(); voiceWire(audio); playing(); msState("playing"); showPlaying(); position(now()); paintBar(); });
+	var pausedAt = null;
 	audio.addEventListener("pause", function () {
-		if (!audio.ended && cur >= 0) store(pauseKey, JSON.stringify({ at: Date.now(), pos: placeNow() }));
+		if (!audio.ended && cur >= 0) store(pauseKey, JSON.stringify({ at: pausedAt || Date.now(), pos: placeNow() }));
+		pausedAt = null;
 		msState("paused"); showPlaying(); position(now()); paintBar();
 	});
+	// Soft pause. On an iPhone, a home-screen web app whose audio has fully
+	// stopped can't start it again from the lock screen or Bluetooth: it runs
+	// with no sound. So a pause from there while the app is in the background
+	// mutes the book and keeps it going; play goes back to the place and
+	// unmutes. Back in the app, or after 5 minutes, it becomes a real pause.
+	// While soft paused, now() is the place paused at, so it's what's saved.
+	var softStart = function () {
+		var t = now();
+		soft = { t: t, at: Date.now(), timer: setTimeout(function () { softEnd(false); }, 5 * 60 * 1000) };
+		audio.muted = true;
+		keep();
+		msState("paused"); showPlaying(); position(t); paintBar();
+	};
+	var softEnd = function (play) {
+		var sp = soft;
+		if (!sp) return;
+		soft = null;
+		clearTimeout(sp.timer);
+		audio.muted = false;
+		if (play) {
+			seek(Math.max(0, sp.t - rewindFor(Date.now() - sp.at)), true);
+			msState("playing");
+		} else {
+			pausedAt = sp.at;
+			seek(sp.t, false);
+			audio.pause();
+			setTimeout(function () { pausedAt = null; }, 1000);
+		}
+		showPlaying(); position(now()); paintBar();
+	};
+	var softWake = function () { if (document.visibilityState === "visible") softEnd(false); };
+	document.addEventListener("visibilitychange", softWake);
 	audio.addEventListener("pause", keep);
 	audio.addEventListener("error", function () {
 		if (onPage() && audio.error) $("pvNote").textContent = "This audiobook couldn't play just now. The home server may be offline, so try again later.";
@@ -6131,7 +6169,7 @@ function previewAudio(sess, b, d) {
 	ctl.append(prev, btn(null, "&#8634;15", "Back 15 seconds", function () { skip(-15); }), playBtn,
 		btn(null, "30&#8635;", "Forward 30 seconds", function () { skip(30); }), next);
 	var showPlaying = function () {
-		var on = !audio.paused;
+		var on = !audio.paused && !soft;
 		playBtn.innerHTML = on ? SVG_PAUSE : SVG_PLAY;
 		playBtn.setAttribute("aria-label", on ? "Pause" : "Play");
 	};
@@ -6389,7 +6427,7 @@ function previewAudio(sess, b, d) {
 	};
 	var tick = function () {
 		var t = Date.now();
-		if (!audio.paused) sl.left -= (t - sl.last) / 1000;
+		if (!audio.paused && !soft) sl.left -= (t - sl.last) / 1000;
 		sl.last = t;
 		if (sl.left <= 0) return sleepNow();
 		audio.volume = Math.max(0, Math.min(1, sl.left / 10));
@@ -6413,8 +6451,8 @@ function previewAudio(sess, b, d) {
 		try { ms.setPositionState({ duration: total, position: Math.min(total, Math.max(0, t)), playbackRate: rate }); } catch (e) {}
 	};
 	var handlers = eng.handlers = {
-		play: function () { audio.play().catch(function () {}); },
-		pause: function () { audio.pause(); },
+		play: function () { if (soft) softEnd(true); else audio.play().catch(function () {}); },
+		pause: function () { if (document.visibilityState === "hidden" && !audio.paused && !soft) softStart(); else if (!soft) audio.pause(); },
 		seekbackward: function (e) { skip(-((e && e.seekOffset) || 15)); },
 		seekforward: function (e) { skip((e && e.seekOffset) || 30); },
 		seekto: function (e) { if (e && e.seekTime != null) seek(e.seekTime, !audio.paused); },
@@ -6468,6 +6506,8 @@ function previewAudio(sess, b, d) {
 	eng.teardown = function () {
 		if (!eng.alive) return;
 		keep();
+		if (soft) { clearTimeout(soft.timer); soft = null; audio.muted = false; }
+		document.removeEventListener("visibilitychange", softWake);
 		setSleep("off");
 		eng.alive = false;
 		if (dlg && dlg.open) dlg.close();
@@ -6486,8 +6526,8 @@ function previewAudio(sess, b, d) {
 		paintBar();
 	};
 	eng.now = now;
-	eng.paused = function () { return audio.paused; };
-	eng.toggle = function () { if (audio.paused) audio.play().catch(function () {}); else audio.pause(); };
+	eng.paused = function () { return audio.paused || !!soft; };
+	eng.toggle = function () { if (soft) softEnd(true); else if (audio.paused) audio.play().catch(function () {}); else audio.pause(); };
 	eng.skip = skip;
 	eng.label = function (t) { var c = chapters[chapterAt(t).i]; return c ? c.title || "Chapter " + (chapterAt(t).i + 1) : ""; };
 	eng.chapter = chapterAt;
@@ -11393,7 +11433,7 @@ function renderPlayer() {
 	document.body.classList.toggle("has-pbar", bar);
 	renderListen();
 	if (!ep) return;
-	var span = barSpan(ep), dur = span.end - span.start, pos = (ep.book ? abNow() : audio.currentTime || 0) - span.start;
+	var span = barSpan(ep), dur = span.end - span.start, pos = (ep.book ? abNow() : soft ? soft.t : audio.currentTime || 0) - span.start;
 	$("pName").textContent = ep.title;
 	if (!state.seeking) {
 		$("pTime").textContent = span.label ? barTime(pos, dur) + " · " + span.label : (ep.feed_title ? ep.feed_title + " · " : "") + barTime(pos, dur);
@@ -11449,6 +11489,7 @@ async function sessionCover(ep) {
 function skip(by) {
 	var audio = $("pAudio");
 	if (!audio.src) return;
+	if (soft) { soft.t = Math.max(0, soft.t + by); if (player.ep && player.ep.book) player.ep.t = soft.t; renderPlayer(); return; }
 	if (player.ep && player.ep.book) return abSeek(abNow() + by, !audio.paused);
 	audio.currentTime = clamp(audio.currentTime + by, 0, audio.duration || 1e9);
 	renderPlayer();
@@ -11457,6 +11498,9 @@ function skip(by) {
 // pause, end, or leaving the page.
 function saveEpisodePos(now) {
 	var audio = $("pAudio");
+	// Soft paused: the place was saved when it paused, and the muted audio
+	// running on isn't listening.
+	if (soft) return;
 	if (player.ep && player.ep.book) return keepListening(now);
 	if (!player.ep || !audio.src || !(audio.currentTime > 0)) return;
 	keepPos(player, audio.ended ? audio.duration : audio.currentTime, isFinite(audio.duration) ? audio.duration : null, audio.ended, now);
@@ -11502,13 +11546,53 @@ function placeNow() {
 	var audio = $("pAudio"), ep = player.ep;
 	if (!ep) return 0;
 	if (ep.book) return abNow();
+	if (soft) return soft.t;
 	return audio.readyState ? audio.currentTime || 0 : epPos(ep);
 }
 function keepPause() {
-	var audio = $("pAudio");
+	var audio = $("pAudio"), at = softPausedAt;
+	softPausedAt = null;
 	if (!player.ep || audio.ended || !audio.src) return;
-	store("readerPause", JSON.stringify({ id: player.ep.id, at: Date.now(), pos: placeNow() }));
+	store("readerPause", JSON.stringify({ id: player.ep.id, at: at || Date.now(), pos: placeNow() }));
 }
+// Soft pause. On an iPhone, a home-screen web app whose audio has fully
+// stopped can't start it again from the lock screen or Bluetooth: it runs
+// with no sound. So a pause from there while the app is in the background
+// mutes the book or episode and keeps it going; play goes back to the place
+// (with smart rewind) and unmutes. Back in the app, or after 5 minutes, it
+// becomes a real pause. While soft paused, abNow() is the place paused at,
+// and nothing is saved, so the muted audio running on doesn't move the place.
+var soft = null, softPausedAt = null;
+function softStart() {
+	var audio = $("pAudio");
+	saveEpisodePos(true);
+	soft = { t: placeNow(), at: Date.now(), timer: setTimeout(function () { softEnd(false); }, 5 * 60 * 1000) };
+	audio.muted = true;
+	msPlayState("paused");
+	plog("soft pause");
+}
+function softEnd(play) {
+	var sp = soft, audio = $("pAudio");
+	if (!sp) return;
+	soft = null;
+	clearTimeout(sp.timer);
+	audio.muted = false;
+	var t = play ? Math.max(0, sp.t - rewindFor(Date.now() - sp.at)) : sp.t;
+	if (player.ep && player.ep.book) abSeek(t, play);
+	else if (audio.src) audio.currentTime = t;
+	if (play) {
+		if (audio.paused) audio.play().catch(playFailed);
+		msPlayState("playing");
+	} else {
+		softPausedAt = sp.at;
+		audio.pause();
+		setTimeout(function () { softPausedAt = null; }, 1000);
+	}
+	plog(play ? "soft pause: play" : "soft pause: now a real pause");
+	renderPlayer();
+}
+function msPlayState(s) { try { navigator.mediaSession.playbackState = s; } catch (e) {} }
+document.addEventListener("visibilitychange", function () { if (document.visibilityState === "visible") softEnd(false); });
 function smartRewind() {
 	var audio = $("pAudio"), ep = player.ep, p = null;
 	try { p = JSON.parse(read("readerPause") || "null"); } catch (e) {}
@@ -11542,6 +11626,7 @@ function smartRewind() {
 	audio.addEventListener("pause", function () { saveEpisodePos(true); keepPause(); });
 	audio.addEventListener("play", smartRewind);
 	audio.addEventListener("ended", function () {
+		if (soft) return softEnd(false);
 		var ab = player.ab;
 		if (ab && player.ep && player.ep.book) {
 			if (ab.cur + 1 < ab.files.length) abLoad(ab.cur + 1, 0, true);
@@ -11656,8 +11741,10 @@ function smartRewind() {
 		var msState = function (s) { try { navigator.mediaSession.playbackState = s; } catch (e) {} };
 		audio.addEventListener("play", function () { msState("playing"); });
 		audio.addEventListener("pause", function () { msState("paused"); });
-		on("play", function () { audio.play().catch(playFailed); });
+		on("play", function () { if (soft) softEnd(true); else audio.play().catch(playFailed); });
 		on("pause", function () {
+			if (soft) return;
+			if (document.visibilityState === "hidden" && !audio.paused) return softStart();
 			audio.pause();
 			setTimeout(function () { if (!audio.paused) plog("still playing 1 s after pause"); }, 1000);
 		});
@@ -11665,6 +11752,7 @@ function smartRewind() {
 		on("seekforward", function (d) { skip((d && d.seekOffset) || 30); });
 		on("seekto", function (d) {
 			if (!d || d.seekTime == null) return;
+			if (soft) { soft.t = d.seekTime; if (player.ep && player.ep.book) player.ep.t = d.seekTime; renderPlayer(); return; }
 			if (player.ep && player.ep.book) abSeek(d.seekTime, !audio.paused); else audio.currentTime = d.seekTime;
 		});
 	}
@@ -11985,6 +12073,7 @@ function listenTo(au, at) {
 }
 function abNow() {
 	var ab = player.ab, audio = $("pAudio");
+	if (soft) return soft.t;
 	if (ab && ab.cur >= 0 && ab.pending == null) return ab.starts[ab.cur] + (audio.currentTime || 0);
 	if (ab && ab.cur >= 0) return ab.starts[ab.cur] + ab.pending;
 	return (player.ep && player.ep.t) || 0;
@@ -12022,6 +12111,8 @@ function abSeek(t, play) {
 	var ab = player.ab, audio = $("pAudio");
 	if (!ab) return;
 	t = clamp(t, 0, Math.max(0, ab.total - 1));
+	// Soft paused: a skip moves the place it comes back to.
+	if (soft) { soft.t = t; player.ep.t = t; renderPlayer(); return; }
 	var n = 0;
 	while (n + 1 < ab.files.length && ab.starts[n + 1] <= t) n++;
 	if (n !== ab.cur) abLoad(n, t - ab.starts[n], play);
@@ -12684,7 +12775,7 @@ function sleepPicker(btn, opts) {
 }
 function sleepTick() {
 	var audio = $("pAudio"), now = Date.now();
-	if (!audio.paused) sleep.left -= (now - sleep.last) / 1000;
+	if (!audio.paused && !soft) sleep.left -= (now - sleep.last) / 1000;
 	sleep.last = now;
 	if (sleep.left <= 0) return sleepNow();
 	audio.volume = clamp(sleep.left / 10, 0, 1);
