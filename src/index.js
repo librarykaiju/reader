@@ -248,6 +248,11 @@ export default {
 			if (!who) return json({ error: "Unauthorized" }, 401);
 			// The role check: a family sign-in reaches the family routes and nothing else.
 			if (url.pathname.startsWith("/api/family/")) return (await familyApi(request, env, url, who)) || json({ error: "Not found" }, 404);
+			// A Bearer token that isn't the owner's is a wrong token, even when the
+			// browser also carries a family library cookie (same site, same cookie
+			// jar): 401, so the app asks for the token again instead of showing
+			// an empty library.
+			if (who.person && /^Bearer\s+\S/i.test(request.headers.get("Authorization") || "")) return json({ error: "Unauthorized" }, 401);
 			if (who.person) return json({ error: "Only the family library is open to this sign-in" }, 403);
 			return (await api(request, env, url)) || json({ error: "Not found" }, 404);
 		} catch (err) {
