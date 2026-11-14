@@ -6090,10 +6090,13 @@ function previewAudio(sess, b, d) {
 		if (pending != null && pending >= by) pending -= by;
 		else seek(t - by, true);
 	};
-	audio.addEventListener("play", function () { rewind(); voiceWire(audio); playing(); showPlaying(); position(now()); paintBar(); });
+	// Tell the phone it's playing or paused, so the lock screen and Bluetooth
+	// play/pause follow the player instead of guessing.
+	var msState = function (s) { if (ms && nowPlaying === eng) try { ms.playbackState = s; } catch (e) {} };
+	audio.addEventListener("play", function () { rewind(); voiceWire(audio); playing(); msState("playing"); showPlaying(); position(now()); paintBar(); });
 	audio.addEventListener("pause", function () {
 		if (!audio.ended && cur >= 0) store(pauseKey, JSON.stringify({ at: Date.now(), pos: placeNow() }));
-		showPlaying(); position(now()); paintBar();
+		msState("paused"); showPlaying(); position(now()); paintBar();
 	});
 	audio.addEventListener("pause", keep);
 	audio.addEventListener("error", function () {
@@ -6473,7 +6476,7 @@ function previewAudio(sess, b, d) {
 		if (nowPlaying === eng) {
 			nowPlaying = null;
 			if (ms) {
-				try { ms.metadata = null; } catch (e) {}
+				try { ms.metadata = null; ms.playbackState = "none"; } catch (e) {}
 				Object.keys(handlers).forEach(function (k) { try { ms.setActionHandler(k, null); } catch (e) {} });
 			}
 		}
@@ -7363,6 +7366,9 @@ const PAGE = String.raw`<!doctype html>
 	.lpctl .btn { min-width: 48px; min-height: 48px; padding-inline: 6px; font-variant-numeric: tabular-nums; }
 	.lpctl svg { width: 22px; height: 22px; fill: currentColor; display: block; margin: auto; }
 	#lpPlay { flex: none; width: 68px; height: 68px; min-width: 0; padding: 0; border-radius: 50%; font-size: 22px; }
+	.lplog { margin: 18px 0 0; font-size: 14px; color: var(--muted); }
+	.lplog summary { cursor: pointer; }
+	.lplog pre { max-height: 40vh; overflow: auto; margin: 8px 0; padding: 8px; background: var(--card); border: 1px solid var(--line); border-radius: 8px; font-size: 12px; white-space: pre-wrap; }
 	.lpmore { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-top: 14px; font-size: 14px; color: var(--muted); }
 	.lpmore #lpRate, .sleepbtn { font-variant-numeric: tabular-nums; }
 	.sleepbtn.on, .voicebtn.on { border-color: var(--accent); color: var(--accent); }
@@ -7978,6 +7984,12 @@ const PAGE = String.raw`<!doctype html>
 			</div>
 		</div>
 	</div>
+	<details id="lpLog" class="lplog">
+		<summary>Player log</summary>
+		<pre id="lpLogText"></pre>
+		<button id="lpLogCopy" class="btn small" type="button">Copy</button>
+		<button id="lpLogClear" class="btn small ghost" type="button">Clear</button>
+	</details>
 	<section id="lpMarkSec" class="rsec" hidden>
 		<h3>Bookmarks</h3>
 		<ol id="lpMarks" class="chapters marks"></ol>
@@ -11452,6 +11464,17 @@ function keepPos(who, pos, len, ended, now) {
 	api("/api/items/" + ep.id, { method: "PATCH", json: patch, keepalive: true }).catch(function () {});
 }
 function findListed(id) { return state.episodes.filter(function (e) { return e.id === id; })[0] || null; }
+// The player log (for now, while chasing Bluetooth pause on iPhone): the last
+// 80 things the player did or was told, with the time and where it was, on
+// this device only. Shown at the bottom of the player page.
+function plog(what) {
+	var audio = $("pAudio"), list = readJSON("readerPlayerLog") || [];
+	var d = new Date(), hh = function (n) { return (n < 10 ? "0" : "") + n; };
+	list.push(hh(d.getHours()) + ":" + hh(d.getMinutes()) + ":" + hh(d.getSeconds()) + "  " + what + "  [" + clock(audio.currentTime || 0) + (audio.paused ? ", paused" : ", playing") + "]");
+	store("readerPlayerLog", JSON.stringify(list.slice(-80)));
+	if ($("lpLog") && $("lpLog").open) paintLog();
+}
+function paintLog() { $("lpLogText").textContent = (readJSON("readerPlayerLog") || []).slice().reverse().join("\n") || "Nothing yet."; }
 // Smart rewind, for audiobooks and podcasts: play after a pause backs up a
 // little, more the longer it was paused (none under a minute, 10 seconds up
 // to 10 minutes, 20 up to an hour, 30 after that), so the sentence that was
@@ -11575,9 +11598,20 @@ function smartRewind() {
 		} catch (e) { fail(e); }
 	});
 	if ("mediaSession" in navigator) {
-		var on = function (name, fn) { try { navigator.mediaSession.setActionHandler(name, fn); } catch (e) {} };
+		var on = function (name, fn) {
+			var logged = function (d) { plog("lock screen/Bluetooth: " + name); return fn(d); };
+			try { navigator.mediaSession.setActionHandler(name, logged); } catch (e) {}
+		};
+		// Tell the phone it's playing or paused, so the lock screen and Bluetooth
+		// play/pause follow the player instead of guessing.
+		var msState = function (s) { try { navigator.mediaSession.playbackState = s; } catch (e) {} };
+		audio.addEventListener("play", function () { msState("playing"); });
+		audio.addEventListener("pause", function () { msState("paused"); });
 		on("play", function () { audio.play().catch(playFailed); });
-		on("pause", function () { audio.pause(); });
+		on("pause", function () {
+			audio.pause();
+			setTimeout(function () { if (!audio.paused) plog("still playing 1 s after pause"); }, 1000);
+		});
 		on("seekbackward", function (d) { skip(-((d && d.seekOffset) || 15)); });
 		on("seekforward", function (d) { skip((d && d.seekOffset) || 30); });
 		on("seekto", function (d) {
@@ -11586,6 +11620,12 @@ function smartRewind() {
 		});
 	}
 	window.addEventListener("pagehide", function () { saveEpisodePos(true); videoBox.close(); });
+	["play", "pause", "playing", "waiting", "stalled", "ended", "error", "emptied"].forEach(function (k) {
+		audio.addEventListener(k, function () { plog("audio " + k + (k === "error" && audio.error ? " " + audio.error.code : "")); });
+	});
+	audio.addEventListener("volumechange", function () { plog("audio volume " + audio.volume.toFixed(2) + (audio.muted ? " muted" : "")); });
+	document.addEventListener("visibilitychange", function () { plog("app " + document.visibilityState); });
+	window.addEventListener("pageshow", function (e) { plog("page shown" + (e.persisted ? " (from cache)" : "")); });
 	// Back where you left off: the last episode, paused.
 	var last = readJSON("readerNowPlaying");
 	if (last && (last.book || (last.id && last.media_url))) { player.ep = last; renderPlayer(); }
@@ -12337,6 +12377,11 @@ document.addEventListener("visibilitychange", keepAwake);
 (function () {
 	var audio = $("pAudio");
 	$("lpCar").addEventListener("click", function () { carMode(true); });
+	$("lpLog").addEventListener("toggle", function () { if (this.open) paintLog(); });
+	$("lpLogCopy").addEventListener("click", function () {
+		navigator.clipboard.writeText($("lpLogText").textContent).then(function () { toast("Copied the player log."); }, function () { toast("Couldn't copy. Select the text instead."); });
+	});
+	$("lpLogClear").addEventListener("click", function () { store("readerPlayerLog", null); paintLog(); });
 	$("carExit").addEventListener("click", function () { carMode(false); });
 	$("carPlay").addEventListener("click", function () { $("lpPlay").click(); });
 	$("carBack").addEventListener("click", function () { if (state.listen) listenGo(audioPos(state.listen.au) - 30); });
