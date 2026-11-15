@@ -8473,7 +8473,7 @@ const PAGE = String.raw`<!doctype html>
 	.txt mark.hl.noted { text-decoration: underline dotted; text-decoration-thickness: 2px; text-underline-offset: 3px; }
 	.hlbar { position: fixed; z-index: 16; left: 50%; transform: translateX(-50%); bottom: calc(16px + env(safe-area-inset-bottom) + var(--lost, 0px)); display: flex; gap: 8px;
 		background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 8px; box-shadow: 0 6px 20px rgba(0,0,0,.18); font-family: var(--sans); }
-	body.has-pbar .hlbar { bottom: calc(118px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
+	body.has-pbar .hlbar { bottom: calc(130px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
 	.ttsbar { align-items: center; padding: 6px; }
 	.ttsbar .btn { min-width: 44px; min-height: 44px; font-variant-numeric: tabular-nums; }
 	.ttsbar svg { width: 20px; height: 20px; fill: currentColor; display: block; margin: auto; }
@@ -8486,7 +8486,7 @@ const PAGE = String.raw`<!doctype html>
 	.pgmask[hidden], .pgfoot[hidden] { display: none; }
 	.pgfoot { position: fixed; z-index: 5; transform: translateX(-50%); pointer-events: none; font: 12px/1.4 var(--sans); color: var(--muted); font-variant-numeric: tabular-nums; }
 	body.has-tts .hlbar:not(.ttsbar) { bottom: calc(84px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
-	body.has-tts.has-pbar .hlbar:not(.ttsbar) { bottom: calc(186px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
+	body.has-tts.has-pbar .hlbar:not(.ttsbar) { bottom: calc(198px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
 	.speaking { background: var(--sel); box-shadow: 0 0 0 6px var(--sel); border-radius: 2px; }
 	#ttsVoice { width: 100%; }
 	.hlpop { font-family: var(--sans); width: min(400px, calc(100vw - 32px)); max-height: calc(100vh - 90px - env(safe-area-inset-top)); overflow: auto; }
@@ -9004,14 +9004,14 @@ const PAGE = String.raw`<!doctype html>
 	.episode .lpsleep { width: 100%; margin-top: 0; }
 	.episode .when { color: var(--muted); font-size: 14px; font-variant-numeric: tabular-nums; }
 	.btn.on { border-color: var(--accent); color: var(--accent); }
-	body.has-pbar { padding-bottom: calc(108px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
-	body.has-pbar .toast { bottom: calc(122px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
+	body.has-pbar { padding-bottom: calc(120px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
+	body.has-pbar .toast { bottom: calc(134px + env(safe-area-inset-bottom) + var(--lost, 0px)); }
 	.pbar { position: fixed; left: 0; right: 0; bottom: var(--lost, 0px); z-index: 15; background: var(--card); border-top: 1px solid var(--line);
 		padding: 4px 12px calc(6px + env(safe-area-inset-bottom)); box-shadow: 0 -4px 16px rgba(0,0,0,.08); }
-	.pbar input[type=range] { display: block; width: 100%; max-width: 1076px; margin: 0 auto; accent-color: var(--accent); }
-	/* A gap between the slider and the buttons, so a tap meant for play doesn't land on the slider.
+	.pbar input[type=range] { display: block; width: 100%; max-width: 1076px; margin: 4px auto 20px; accent-color: var(--accent); }
+	/* The gap between the slider and the buttons (the margin above), so a tap meant for play doesn't land on the slider.
 	   touch-action: none keeps a sideways drag on the slider from being taken as a scroll. */
-	.pbar .seek { margin-bottom: 12px; touch-action: none; }
+	.pbar .seek { touch-action: none; }
 	.prow { display: flex; align-items: center; gap: 2px; max-width: 1076px; margin: 0 auto; }
 	.ptitle { flex: 1; min-width: 0; display: grid; text-align: left; background: none; border: 0; padding: 4px; cursor: pointer; }
 	.ptitle span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
