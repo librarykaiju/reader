@@ -8817,7 +8817,8 @@ const PAGE = String.raw`<!doctype html>
 	.gencover .gt { font-weight: 600; font-size: 15px; line-height: 1.2; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 6; overflow: hidden; }
 	.gencover .ga { font-size: 12px; font-style: italic; opacity: .85; overflow-wrap: anywhere; }
 	.gencover .gk { position: absolute; bottom: 12px; left: 0; right: 0; font: 600 10px/1 var(--sans); letter-spacing: .08em; opacity: .6; }
-	.cover .cdone { position: absolute; top: 6px; right: 6px; margin: 0; }
+	/* Above the real cover, which arrives after the badge when it isn't loaded yet. */
+	.cover .cdone { position: absolute; top: 6px; right: 6px; margin: 0; z-index: 1; }
 	.covers .ct { font-weight: 600; font-size: 14px; line-height: 1.25; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
 	.covers .ca { font-size: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 	.covers .bar-prog { margin-top: 3px; }
