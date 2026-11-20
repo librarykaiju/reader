@@ -13,6 +13,10 @@
 //                        the family library's appeal terms (Workers AI does without it; see "Book records")
 //   CATALOG_TOKEN        secret, optional; a read-only token for GET /api/catalog, which the site's build
 //                        uses to fill its book logs' catalog details (any long random string)
+//   NOTES_TOKEN          secret, optional; a read-only token for GET /api/export, for wr1t3r's Pull notes from
+//                        Reader (any long random string)
+//   NOTES_ORIGINS        optional; sites whose pages may call GET /api/export from the browser, comma separated
+//                        (default https://wr1t3r.brandonj.ink; http://localhost always)
 //   OWNER_NAME           optional; your name on the family welcome page ("Welcome to Brandon's library")
 //   TURNSTILE_SITE_KEY   optional; with TURNSTILE_SECRET (a secret), a Cloudflare Turnstile check on the
 //                        library card request form (docs/setup.md, "Family library")
@@ -117,8 +121,9 @@
 //   POST   /api/books/:id/marks    {t, end_t?, note?} -> {"mark"} (t: seconds into the whole book; end_t: a clip's end)
 //   PATCH  /api/marks/:id          {note?, t?, end_t?}
 //   DELETE /api/marks/:id
-//   GET    /api/export             -> {"books": [...each book with highlights or bookmarks, with its highlights, marks
-//                                  and chapters]}: what "Export notes" makes its Markdown from
+//   GET    /api/export             -> {"books": [...each book with highlights or bookmarks, with its entry (the Library
+//                                  entry id: an audiobook paired with an ebook gives the ebook's), highlights, marks
+//                                  and chapters]}: what "Export notes" makes its Markdown from; takes NOTES_TOKEN (read-only) as well as READER_TOKEN
 //   GET    /api/people             -> {"people": [...each with signed_in, invite_expires_at, last_seen_at, downloads,
 //                                  requested_at, request_note and request_email (a library card request not yet answered)]}
 //   POST   /api/people             {name} -> {"person", "code"}: a new family member and their invite code
@@ -229,6 +234,8 @@ class HttpError extends Error {
 export default {
 	async fetch(request, env) {
 		const url = new URL(request.url);
+		const from = request.headers.get("Origin");
+		if (url.pathname === "/api/export" && from && from !== url.origin) return exportAcross(request, env, from).catch(errorJSON);
 		if (url.pathname === "/" && (request.method === "GET" || request.method === "HEAD")) return page();
 		if (url.pathname === "/library" && (request.method === "GET" || request.method === "HEAD")) return familyPage(env);
 		// Browsers keep the #invite=... part across a redirect, so old links still sign in.
@@ -254,6 +261,8 @@ export default {
 				if (!(await tokenIs(request, env.CATALOG_TOKEN)) && !(await isOwner(request, env))) return json({ error: "Unauthorized" }, 401);
 				return await catalogFeed(env);
 			}
+			// wr1t3r's Worker pulls highlights and bookmarks with its own read-only token.
+			if (url.pathname === "/api/export" && request.method === "GET" && (await tokenIs(request, env.NOTES_TOKEN))) return await exportNotes(env);
 			const who = await signedIn(request, env);
 			if (!who) return json({ error: "Unauthorized" }, 401);
 			// The role check: a family sign-in reaches the family routes and nothing else.
@@ -3186,21 +3195,72 @@ async function deleteMark(env, id) {
 // (the page turns it into Markdown files): the book's details, its
 // highlights in the order they come, and its bookmarks with the chapter
 // each is in (from the chapters kept once it's been played).
+// Each book's entry is the Library entry it's in, as the page's libEntries
+// pairs them: an audiobook joined to an ebook of the same title (before any
+// subtitle) and author is in the ebook's. It's the id in an exported file's
+// reader: link, so wr1t3r's pull and the zip name a book the same way.
 async function exportNotes(env) {
-	const [books, hls, marks] = await env.DB.batch([
+	const [books, hls, marks, all] = await env.DB.batch([
 		env.DB.prepare(`SELECT ${BOOK_COLUMNS}, abs_media FROM books WHERE id IN (SELECT book_id FROM highlights UNION SELECT book_id FROM audio_marks)`),
 		env.DB.prepare(`SELECT ${HIGHLIGHT_COLUMNS} FROM highlights ORDER BY book_id, start_pos, id`),
 		env.DB.prepare(`SELECT ${MARK_COLUMNS} FROM audio_marks ORDER BY book_id, t, id`),
+		env.DB.prepare(`SELECT id, title, author, ${BOOK_TYPE} AS type FROM books ORDER BY id`),
 	]);
+	const entryOf = libraryEntries(all.results);
 	const byId = new Map();
 	for (const { abs_media, ...b } of books.results) {
 		let chapters = [];
 		try { chapters = (JSON.parse(abs_media || "null")?.chapters || []).map((c) => ({ start: c.start, title: c.title || "" })); } catch {}
-		byId.set(b.id, { ...b, chapters, highlights: [], marks: [] });
+		byId.set(b.id, { ...b, entry: entryOf.get(b.id) ?? b.id, chapters, highlights: [], marks: [] });
 	}
 	for (const x of hls.results) byId.get(x.book_id)?.highlights.push(x);
 	for (const x of marks.results) byId.get(x.book_id)?.marks.push(x);
 	return json({ books: [...byId.values()] });
+}
+// /api/export from another site: wr1t3r's page, which in its Nextcloud mode
+// has no server of its own, so it pulls straight from the browser with
+// NOTES_TOKEN. Only the addresses in NOTES_ORIGINS (comma separated; default
+// https://wr1t3r.brandonj.ink) and http://localhost or 127.0.0.1 (wr1t3r run
+// locally) are answered, and the token is still needed: the browser sends
+// no cookies, so a family sign-in never counts here.
+const NOTES_ORIGINS = "https://wr1t3r.brandonj.ink";
+function notesOrigin(env, from) {
+	const allowed = String(env.NOTES_ORIGINS || NOTES_ORIGINS).split(",").map((s) => s.trim().replace(/\/+$/, "")).filter(Boolean);
+	return allowed.includes(from) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(from) ? from : null;
+}
+async function exportAcross(request, env, from) {
+	const origin = notesOrigin(env, from);
+	if (!origin) return json({ error: "Not allowed from " + from.slice(0, 100) }, 403);
+	const cors = { "Access-Control-Allow-Origin": origin, Vary: "Origin" };
+	if (request.method === "OPTIONS") {
+		return new Response(null, { status: 204, headers: { ...cors, "Access-Control-Allow-Methods": "GET", "Access-Control-Allow-Headers": "Authorization", "Access-Control-Max-Age": "86400" } });
+	}
+	let res;
+	if (request.method !== "GET") res = json({ error: "Only GET" }, 405);
+	else if ((await tokenIs(request, env.NOTES_TOKEN)) || (await isOwner(request, env))) res = await exportNotes(env);
+	else res = json({ error: "Unauthorized" }, 401);
+	for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
+	return res;
+}
+
+// books: [{id, title, author, type}] -> Map of an audiobook's id to the ebook
+// it's paired with, by the page's own keys (titleKey, authorWords).
+function libraryEntries(books) {
+	const fold = (s) => String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+	const key = (b) => fold(b.title).split(/[:(\[]/)[0].replace(/[^a-z0-9]+/g, " ").trim();
+	const words = (b) => fold(b.author).replace(/[^a-z]+/g, " ").trim().split(" ").filter((w) => w.length > 1);
+	const ebooks = new Map(), out = new Map(), paired = new Set();
+	for (const b of books) if (b.type !== "audiobook" && key(b)) ebooks.set(key(b), [...(ebooks.get(key(b)) || []), b]);
+	for (const b of books) {
+		if (b.type !== "audiobook") continue;
+		const mine = words(b);
+		const e = (ebooks.get(key(b)) || []).find((x) => {
+			const theirs = words(x);
+			return !paired.has(x.id) && (!mine.length && !theirs.length || mine.some((w) => theirs.includes(w)));
+		});
+		if (e) { paired.add(e.id); out.set(b.id, e.id); }
+	}
+	return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -16511,10 +16571,19 @@ function hlJump(sess, x) {
 // Markdown for Obsidian (or anywhere): YAML properties up top (title,
 // author, series, formats, status, a link back), then the highlights as
 // quotes with their notes under them, then an audiobook's bookmarks. The
-// same shape for one book's Export Markdown and for Export notes.
+// same shape for one book's Export Markdown and for Export notes. Each
+// highlight and bookmark also carries a hidden comment with its id and when
+// it was made, "<!-- reader:h:12 2026-11-20T12:00:00.000Z -->" ("m:" for a
+// bookmark), which doesn't show in Markdown: wr1t3r's Import notes from
+// Reader uses it to bring each over once, in the order they were made. One
+// not saved yet (a negative id) has none.
 // parts: [{book, highlights, marks, chapters}], one per format of the book.
 function notesMarkdown(entry, parts) {
 	var yaml = function (v) { return JSON.stringify(String(v)); };
+	var tag = function (kind, x) {
+		// Split up so the page's own <script> never holds a comment opener.
+		return x.id > 0 ? "<!" + "-- reader:" + kind + ":" + x.id + (x.created_at ? " " + new Date(x.created_at).toISOString() : "") + " --" + ">" : "";
+	};
 	var hls = [], marks = [], formats = [];
 	parts.forEach(function (p) {
 		formats.push(p.book.type);
@@ -16537,6 +16606,7 @@ function notesMarkdown(entry, parts) {
 		out.push("## Highlights", "");
 		hls.forEach(function (x, i) {
 			if (i) out.push("---", "");
+			if (tag("h", x)) out.push(tag("h", x));
 			out.push(x.text.split("\n").map(function (l) { return "> " + l; }).join("\n"), "");
 			if (x.note) out.push(x.note, "");
 		});
@@ -16548,6 +16618,7 @@ function notesMarkdown(entry, parts) {
 			o.chapters.forEach(function (c, i) { if (c.start <= at + 0.5) ch = c.title || "Chapter " + (i + 1); });
 			var line = "- **" + (m.end_t != null ? "Clip " + clock(m.t) + "–" + clock(m.end_t) : clock(m.t)) + "**" + (ch ? " · " + ch : "");
 			if (m.note) line += " — " + m.note.replace(/\n+/g, " ");
+			if (tag("m", m)) line += " " + tag("m", m);
 			out.push(line);
 		});
 		out.push("");
