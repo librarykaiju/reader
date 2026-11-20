@@ -119,7 +119,8 @@
 //   POST   /api/books/:id/marks    {t, end_t?, note?} -> {"mark"} (t: seconds into the whole book; end_t: a clip's end)
 //   PATCH  /api/marks/:id          {note?, t?, end_t?}
 //   DELETE /api/marks/:id
-//   GET    /api/export             -> {"books": [...each book with highlights or bookmarks, with its highlights, marks
+//   GET    /api/export             -> {"books": [...each book with highlights or bookmarks, with its entry (the Library
+//                                  entry id: an audiobook paired with an ebook gives the ebook's), highlights, marks
 //                                  and chapters]}: what "Export notes" makes its Markdown from; takes NOTES_TOKEN (read-only) as well as READER_TOKEN
 //   GET    /api/people             -> {"people": [...each with signed_in, invite_expires_at, last_seen_at, downloads,
 //                                  requested_at, request_note and request_email (a library card request not yet answered)]}
@@ -3190,21 +3191,46 @@ async function deleteMark(env, id) {
 // (the page turns it into Markdown files): the book's details, its
 // highlights in the order they come, and its bookmarks with the chapter
 // each is in (from the chapters kept once it's been played).
+// Each book's entry is the Library entry it's in, as the page's libEntries
+// pairs them: an audiobook joined to an ebook of the same title (before any
+// subtitle) and author is in the ebook's. It's the id in an exported file's
+// reader: link, so wr1t3r's pull and the zip name a book the same way.
 async function exportNotes(env) {
-	const [books, hls, marks] = await env.DB.batch([
+	const [books, hls, marks, all] = await env.DB.batch([
 		env.DB.prepare(`SELECT ${BOOK_COLUMNS}, abs_media FROM books WHERE id IN (SELECT book_id FROM highlights UNION SELECT book_id FROM audio_marks)`),
 		env.DB.prepare(`SELECT ${HIGHLIGHT_COLUMNS} FROM highlights ORDER BY book_id, start_pos, id`),
 		env.DB.prepare(`SELECT ${MARK_COLUMNS} FROM audio_marks ORDER BY book_id, t, id`),
+		env.DB.prepare(`SELECT id, title, author, ${BOOK_TYPE} AS type FROM books ORDER BY id`),
 	]);
+	const entryOf = libraryEntries(all.results);
 	const byId = new Map();
 	for (const { abs_media, ...b } of books.results) {
 		let chapters = [];
 		try { chapters = (JSON.parse(abs_media || "null")?.chapters || []).map((c) => ({ start: c.start, title: c.title || "" })); } catch {}
-		byId.set(b.id, { ...b, chapters, highlights: [], marks: [] });
+		byId.set(b.id, { ...b, entry: entryOf.get(b.id) ?? b.id, chapters, highlights: [], marks: [] });
 	}
 	for (const x of hls.results) byId.get(x.book_id)?.highlights.push(x);
 	for (const x of marks.results) byId.get(x.book_id)?.marks.push(x);
 	return json({ books: [...byId.values()] });
+}
+// books: [{id, title, author, type}] -> Map of an audiobook's id to the ebook
+// it's paired with, by the page's own keys (titleKey, authorWords).
+function libraryEntries(books) {
+	const fold = (s) => String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+	const key = (b) => fold(b.title).split(/[:(\[]/)[0].replace(/[^a-z0-9]+/g, " ").trim();
+	const words = (b) => fold(b.author).replace(/[^a-z]+/g, " ").trim().split(" ").filter((w) => w.length > 1);
+	const ebooks = new Map(), out = new Map(), paired = new Set();
+	for (const b of books) if (b.type !== "audiobook" && key(b)) ebooks.set(key(b), [...(ebooks.get(key(b)) || []), b]);
+	for (const b of books) {
+		if (b.type !== "audiobook") continue;
+		const mine = words(b);
+		const e = (ebooks.get(key(b)) || []).find((x) => {
+			const theirs = words(x);
+			return !paired.has(x.id) && (!mine.length && !theirs.length || mine.some((w) => theirs.includes(w)));
+		});
+		if (e) { paired.add(e.id); out.set(b.id, e.id); }
+	}
+	return out;
 }
 
 // ---------------------------------------------------------------------------
