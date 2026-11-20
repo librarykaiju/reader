@@ -16511,10 +16511,19 @@ function hlJump(sess, x) {
 // Markdown for Obsidian (or anywhere): YAML properties up top (title,
 // author, series, formats, status, a link back), then the highlights as
 // quotes with their notes under them, then an audiobook's bookmarks. The
-// same shape for one book's Export Markdown and for Export notes.
+// same shape for one book's Export Markdown and for Export notes. Each
+// highlight and bookmark also carries a hidden comment with its id and when
+// it was made, "<!-- reader:h:12 2026-11-20T12:00:00.000Z -->" ("m:" for a
+// bookmark), which doesn't show in Markdown: wr1t3r's Import notes from
+// Reader uses it to bring each over once, in the order they were made. One
+// not saved yet (a negative id) has none.
 // parts: [{book, highlights, marks, chapters}], one per format of the book.
 function notesMarkdown(entry, parts) {
 	var yaml = function (v) { return JSON.stringify(String(v)); };
+	var tag = function (kind, x) {
+		// Split up so the page's own <script> never holds a comment opener.
+		return x.id > 0 ? "<!" + "-- reader:" + kind + ":" + x.id + (x.created_at ? " " + new Date(x.created_at).toISOString() : "") + " --" + ">" : "";
+	};
 	var hls = [], marks = [], formats = [];
 	parts.forEach(function (p) {
 		formats.push(p.book.type);
@@ -16537,6 +16546,7 @@ function notesMarkdown(entry, parts) {
 		out.push("## Highlights", "");
 		hls.forEach(function (x, i) {
 			if (i) out.push("---", "");
+			if (tag("h", x)) out.push(tag("h", x));
 			out.push(x.text.split("\n").map(function (l) { return "> " + l; }).join("\n"), "");
 			if (x.note) out.push(x.note, "");
 		});
@@ -16548,6 +16558,7 @@ function notesMarkdown(entry, parts) {
 			o.chapters.forEach(function (c, i) { if (c.start <= at + 0.5) ch = c.title || "Chapter " + (i + 1); });
 			var line = "- **" + (m.end_t != null ? "Clip " + clock(m.t) + "–" + clock(m.end_t) : clock(m.t)) + "**" + (ch ? " · " + ch : "");
 			if (m.note) line += " — " + m.note.replace(/\n+/g, " ");
+			if (tag("m", m)) line += " " + tag("m", m);
 			out.push(line);
 		});
 		out.push("");
