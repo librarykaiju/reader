@@ -13,8 +13,10 @@
 //                        the family library's appeal terms (Workers AI does without it; see "Book records")
 //   CATALOG_TOKEN        secret, optional; a read-only token for GET /api/catalog, which the site's build
 //                        uses to fill its book logs' catalog details (any long random string)
-//   NOTES_TOKEN          secret, optional; a read-only token for GET /api/export, which wr1t3r's Worker uses
-//                        for its Pull notes from Reader (any long random string)
+//   NOTES_TOKEN          secret, optional; a read-only token for GET /api/export, for wr1t3r's Pull notes from
+//                        Reader (any long random string)
+//   NOTES_ORIGINS        optional; sites whose pages may call GET /api/export from the browser, comma separated
+//                        (default https://wr1t3r.brandonj.ink; http://localhost always)
 //   OWNER_NAME           optional; your name on the family welcome page ("Welcome to Brandon's library")
 //   TURNSTILE_SITE_KEY   optional; with TURNSTILE_SECRET (a secret), a Cloudflare Turnstile check on the
 //                        library card request form (docs/setup.md, "Family library")
@@ -232,6 +234,8 @@ class HttpError extends Error {
 export default {
 	async fetch(request, env) {
 		const url = new URL(request.url);
+		const from = request.headers.get("Origin");
+		if (url.pathname === "/api/export" && from && from !== url.origin) return exportAcross(request, env, from).catch(errorJSON);
 		if (url.pathname === "/" && (request.method === "GET" || request.method === "HEAD")) return page();
 		if (url.pathname === "/library" && (request.method === "GET" || request.method === "HEAD")) return familyPage(env);
 		// Browsers keep the #invite=... part across a redirect, so old links still sign in.
@@ -3213,6 +3217,32 @@ async function exportNotes(env) {
 	for (const x of marks.results) byId.get(x.book_id)?.marks.push(x);
 	return json({ books: [...byId.values()] });
 }
+// /api/export from another site: wr1t3r's page, which in its Nextcloud mode
+// has no server of its own, so it pulls straight from the browser with
+// NOTES_TOKEN. Only the addresses in NOTES_ORIGINS (comma separated; default
+// https://wr1t3r.brandonj.ink) and http://localhost or 127.0.0.1 (wr1t3r run
+// locally) are answered, and the token is still needed: the browser sends
+// no cookies, so a family sign-in never counts here.
+const NOTES_ORIGINS = "https://wr1t3r.brandonj.ink";
+function notesOrigin(env, from) {
+	const allowed = String(env.NOTES_ORIGINS || NOTES_ORIGINS).split(",").map((s) => s.trim().replace(/\/+$/, "")).filter(Boolean);
+	return allowed.includes(from) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(from) ? from : null;
+}
+async function exportAcross(request, env, from) {
+	const origin = notesOrigin(env, from);
+	if (!origin) return json({ error: "Not allowed from " + from.slice(0, 100) }, 403);
+	const cors = { "Access-Control-Allow-Origin": origin, Vary: "Origin" };
+	if (request.method === "OPTIONS") {
+		return new Response(null, { status: 204, headers: { ...cors, "Access-Control-Allow-Methods": "GET", "Access-Control-Allow-Headers": "Authorization", "Access-Control-Max-Age": "86400" } });
+	}
+	let res;
+	if (request.method !== "GET") res = json({ error: "Only GET" }, 405);
+	else if ((await tokenIs(request, env.NOTES_TOKEN)) || (await isOwner(request, env))) res = await exportNotes(env);
+	else res = json({ error: "Unauthorized" }, 401);
+	for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
+	return res;
+}
+
 // books: [{id, title, author, type}] -> Map of an audiobook's id to the ebook
 // it's paired with, by the page's own keys (titleKey, authorWords).
 function libraryEntries(books) {
