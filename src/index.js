@@ -13,6 +13,8 @@
 //                        the family library's appeal terms (Workers AI does without it; see "Book records")
 //   CATALOG_TOKEN        secret, optional; a read-only token for GET /api/catalog, which the site's build
 //                        uses to fill its book logs' catalog details (any long random string)
+//   NOTES_TOKEN          secret, optional; a read-only token for GET /api/export, which wr1t3r's Worker uses
+//                        for its Pull notes from Reader (any long random string)
 //   OWNER_NAME           optional; your name on the family welcome page ("Welcome to Brandon's library")
 //   TURNSTILE_SITE_KEY   optional; with TURNSTILE_SECRET (a secret), a Cloudflare Turnstile check on the
 //                        library card request form (docs/setup.md, "Family library")
@@ -118,7 +120,7 @@
 //   PATCH  /api/marks/:id          {note?, t?, end_t?}
 //   DELETE /api/marks/:id
 //   GET    /api/export             -> {"books": [...each book with highlights or bookmarks, with its highlights, marks
-//                                  and chapters]}: what "Export notes" makes its Markdown from
+//                                  and chapters]}: what "Export notes" makes its Markdown from; takes NOTES_TOKEN (read-only) as well as READER_TOKEN
 //   GET    /api/people             -> {"people": [...each with signed_in, invite_expires_at, last_seen_at, downloads,
 //                                  requested_at, request_note and request_email (a library card request not yet answered)]}
 //   POST   /api/people             {name} -> {"person", "code"}: a new family member and their invite code
@@ -254,6 +256,8 @@ export default {
 				if (!(await tokenIs(request, env.CATALOG_TOKEN)) && !(await isOwner(request, env))) return json({ error: "Unauthorized" }, 401);
 				return await catalogFeed(env);
 			}
+			// wr1t3r's Worker pulls highlights and bookmarks with its own read-only token.
+			if (url.pathname === "/api/export" && request.method === "GET" && (await tokenIs(request, env.NOTES_TOKEN))) return await exportNotes(env);
 			const who = await signedIn(request, env);
 			if (!who) return json({ error: "Unauthorized" }, 401);
 			// The role check: a family sign-in reaches the family routes and nothing else.
