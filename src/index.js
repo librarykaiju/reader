@@ -8329,6 +8329,30 @@ self.addEventListener("install", function (e) {
 	e.waitUntil(caches.open(SHELL).then(function (c) { return c.add("/"); }).catch(function () {}).then(function () { return self.skipWaiting(); }));
 });
 self.addEventListener("activate", function (e) { e.waitUntil(self.clients.claim()); });
+// An audiobook file kept in pieces (8 MB each, with a manifest at /m):
+// the range asked for, from the one piece it starts in (a shorter answer
+// than asked is fine; the player asks again for the rest).
+function pieces(base, range) {
+	return caches.match(base + "/m").then(function (m) {
+		if (!m) return new Response("Not on this device", { status: 404 });
+		return m.json().then(function (info) {
+			var r = /^bytes=(\\d*)-(\\d*)$/.exec(range || "") || ["", "0", ""], size = info.size, start, end;
+			if (r[1] === "") { start = Math.max(0, size - Number(r[2])); end = size - 1; }
+			else { start = Number(r[1]); end = r[2] ? Math.min(Number(r[2]), size - 1) : size - 1; }
+			if (start >= size || end < start) return new Response("", { status: 416, headers: { "Content-Range": "bytes */" + size } });
+			var k = Math.floor(start / info.chunk), at = k * info.chunk;
+			end = Math.min(end, at + info.chunk - 1);
+			return caches.match(base + "/c" + k).then(function (piece) {
+				if (!piece) return new Response("Not on this device", { status: 404 });
+				return piece.blob().then(function (blob) {
+					return new Response(blob.slice(start - at, end - at + 1), { status: 206, headers: {
+						"Content-Type": info.type || "audio/mp4", "Content-Range": "bytes " + start + "-" + end + "/" + size,
+						"Content-Length": String(end - start + 1), "Accept-Ranges": "bytes" } });
+				});
+			});
+		});
+	});
+}
 self.addEventListener("fetch", function (e) {
 	var req = e.request, url = new URL(req.url);
 	if (req.method === "GET" && (PINNED.some(function (p) { return req.url.indexOf(p) === 0; }) || (url.origin === location.origin && url.pathname.indexOf("/fonts/") === 0))) {
@@ -8347,7 +8371,7 @@ self.addEventListener("fetch", function (e) {
 	// and a long book isn't read into memory whole.
 	if (req.method === "GET" && url.origin === location.origin && /^\\/(abfile|episode)\\//.test(url.pathname)) {
 		e.respondWith(caches.match(url.origin + url.pathname).then(function (hit) {
-			if (!hit) return new Response("Not on this device", { status: 404 });
+			if (!hit) return pieces(url.origin + url.pathname, req.headers.get("Range"));
 			var range = /^bytes=(\\d*)-(\\d*)$/.exec(req.headers.get("Range") || "");
 			if (!range) return hit;
 			return hit.blob().then(function (blob) {
@@ -13621,8 +13645,8 @@ async function listenInfo(id) {
 var abUrl = {};
 async function localAbSrc(id, n) {
 	if (abUrl.id === id && abUrl.n === n) return abUrl.url;
-	var res;
-	try { res = await (await caches.open(BOOK_CACHE)).match(abKey(id, n)); }
+	var res, kept = bookDownloads[id] && bookDownloads[id].ab, pieces = kept && kept.files[n] && kept.files[n].pieces;
+	try { res = await (await caches.open(BOOK_CACHE)).match(abKey(id, n) + (pieces ? "/m" : "")); }
 	catch (e) { return null; }
 	if (!res) {
 		// Really gone (the browser cleared it): forgotten, so it streams.
@@ -13634,6 +13658,8 @@ async function localAbSrc(id, n) {
 	// The service worker plays it straight from storage, a piece at a time
 	// (a whole .m4b read into memory can fail on an iPhone).
 	if (navigator.serviceWorker && navigator.serviceWorker.controller) return abKey(id, n);
+	// In pieces, only the service worker can put them together: it streams.
+	if (pieces) return null;
 	try {
 		var url = URL.createObjectURL(await res.blob());
 		if (abUrl.url) URL.revokeObjectURL(abUrl.url);
@@ -14718,36 +14744,76 @@ function dlFailed(e, auto, what) {
 	if (e.message === UNAUTH || auto) return;
 	toast(full ? "Not enough space on this device for that " + what + "." : "Couldn't download it: " + e.message);
 }
-// An audiobook: each of its files (one .m4b, usually) kept as it is, through
-// the same signed /listen/ addresses the player uses, with its chapters and
-// each file's length, so it plays in the player bar with no connection.
+// An audiobook: each of its files (one .m4b, usually) kept through the same
+// signed /listen/ addresses the player uses, with its chapters and each
+// file's length, so it plays in the player bar with no connection. A file is
+// fetched in 8 MB pieces (ranged reads), each kept as it arrives, so a
+// download cut off (a phone's connection dropping, the app put away and
+// stopped) carries on from the last piece next time instead of starting over.
+// What's done so far is in abPartial. The service worker puts the pieces
+// back together as the player reads them (see SW), from a small manifest kept
+// beside them ({size, chunk, type}).
+var AB_CHUNK = 8 * 1048576;
+var abPartial = readJSON("readerAbPartial") || {};
+function saveAbPartial() { store("readerAbPartial", Object.keys(abPartial).length ? JSON.stringify(abPartial) : null); }
 function abKey(id, n) { return location.origin + "/abfile/" + id + "/" + n; }
+function abPieces(f) { return f.whole ? 0 : Math.ceil(f.size / AB_CHUNK); }
+// Pieces done so far of a part-downloaded audiobook (0 if none).
+function abDone(id) { var x = abPartial[id]; return x ? x.files.reduce(function (n, f) { return n + (f ? f.done || 0 : 0); }, 0) : 0; }
 async function downloadAudiobook(au, auto) {
 	if (!window.caches || !window.ReadableStream) return auto ? null : toast("This browser can't keep downloads.");
 	if (bookDl[au.id]) return;
 	if (!auto) autoUnskip("b" + au.id);
-	var p = bookDl[au.id] = { got: 0, total: au.size || 0 }, kept = 0;
+	var part = abPartial[au.id] || (abPartial[au.id] = { files: [], auto: true });
+	if (!auto) part.auto = false;
+	var p = bookDl[au.id] = { got: 0, total: au.size || 0 };
+	part.files.forEach(function (f) { if (f) p.got += Math.min(f.size || 0, (f.done || 0) * AB_CHUNK); });
 	repaintBook(au.id);
 	dlChanged();
 	try {
 		await askToKeep();
 		delete listenCache[au.id];
-		var d = await listenInfo(au.id), c = await caches.open(BOOK_CACHE);
+		var d = await listenInfo(au.id), c = await caches.open(BOOK_CACHE), tick = function () { repaintBook(au.id); };
 		for (var n = 0; n < d.files.length; n++) {
-			var res = await fetch(d.files[n].url);
-			if (!res.ok) throw new Error(res.status === 502 ? "the home server is offline" : "HTTP " + res.status);
-			if (!au.size && d.files.length === 1) p.total = Number(res.headers.get("Content-Length")) || 0;
-			var counted = counting(res, p, function () { repaintBook(au.id); });
-			await c.put(abKey(au.id, n), new Response(counted, { headers: { "Content-Type": res.headers.get("Content-Type") || "audio/mp4" } }));
-			kept = n + 1;
+			var f = part.files[n] || (part.files[n] = { size: 0, done: 0 });
+			while (!f.whole && (!f.size || f.done * AB_CHUNK < f.size)) {
+				// The addresses last some hours; near the end, fresh ones.
+				if (d.expires - Date.now() < 10 * 60 * 1000) { delete listenCache[au.id]; d = await listenInfo(au.id); }
+				var from = f.done * AB_CHUNK;
+				var to = from + AB_CHUNK - 1;
+				if (f.size) to = Math.min(to, f.size - 1);
+				var res = await fetch(d.files[n].url, { headers: { Range: "bytes=" + from + "-" + to } });
+				f.type = res.headers.get("Content-Type") || f.type || "audio/mp4";
+				if (res.status === 200) {
+					// No ranged reads: the whole file at once, as before.
+					var before = p.got;
+					await c.put(abKey(au.id, n), new Response(counting(res, p, tick), { headers: { "Content-Type": f.type } }));
+					f.whole = true;
+					f.size = p.got - before;
+					break;
+				}
+				if (res.status !== 206) throw new Error(res.status === 502 ? "the home server is offline" : "HTTP " + res.status);
+				f.size = Number((res.headers.get("Content-Range") || "").split("/")[1]) || f.size;
+				if (!f.size) throw new Error("no file size");
+				if (!au.size && d.files.length === 1) p.total = f.size;
+				await c.put(abKey(au.id, n) + "/c" + f.done, new Response(counting(res, p, tick), { headers: { "Content-Type": f.type } }));
+				f.done++;
+				saveAbPartial();
+			}
+			if (!f.whole) await c.put(abKey(au.id, n) + "/m", new Response(JSON.stringify({ size: f.size, chunk: AB_CHUNK, type: f.type }), { headers: { "Content-Type": "application/json" } }));
 		}
-		bookDownloads[au.id] = Object.assign({}, au, { saved_at: Date.now(), auto: auto ? 1 : 0, dlsize: p.got,
-			ab: { duration: d.duration, chapters: d.chapters || [], files: d.files.map(function (f) { return { duration: f.duration }; }) } });
+		var size = part.files.reduce(function (t, f) { return t + f.size; }, 0);
+		bookDownloads[au.id] = Object.assign({}, au, { saved_at: Date.now(), auto: auto ? 1 : 0, dlsize: size,
+			ab: { duration: d.duration, chapters: d.chapters || [], files: d.files.map(function (x, i) {
+				var f = part.files[i];
+				return { duration: x.duration, size: f.size, pieces: abPieces(f) };
+			}) } });
+		delete abPartial[au.id];
+		saveAbPartial();
 		saveBookDownloads();
 	} catch (e) {
-		var gone = [];
-		for (var i = 0; i <= kept; i++) gone.push(abKey(au.id, i));
-		caches.open(BOOK_CACHE).then(function (c) { return Promise.all(gone.map(function (k) { return c.delete(k); })); }).catch(function () {});
+		// What came is kept, for next time.
+		saveAbPartial();
 		dlFailed(e, auto, "audiobook");
 	} finally {
 		delete bookDl[au.id];
@@ -14755,13 +14821,26 @@ async function downloadAudiobook(au, auto) {
 		dlChanged();
 	}
 }
+// An audiobook's files and pieces in Cache Storage, for removing them.
+function abKeys(id, files) {
+	var keys = [];
+	(files || []).forEach(function (f, n) {
+		if (!f) return;
+		var base = abKey(id, n), pieces = f.pieces != null ? f.pieces : f.done || 0;
+		keys.push(base, base + "/m");
+		for (var k = 0; k < pieces; k++) keys.push(base + "/c" + k);
+	});
+	return keys;
+}
 async function keepPdfViewer() {
 	var c = await caches.open(LIBS_CACHE);
 	await Promise.all(PDF_FILES.map(async function (u) { if (!(await c.match(u))) await c.add(u); }));
 }
 function forgetBookDownload(id) {
 	var was = bookDownloads[id], keys = [bookKey(id)];
-	if (was && was.ab) was.ab.files.forEach(function (f, n) { keys.push(abKey(id, n)); });
+	if (was && was.ab) keys = keys.concat(abKeys(id, was.ab.files));
+	// A part-downloaded one too.
+	if (abPartial[id]) { keys = keys.concat(abKeys(id, abPartial[id].files)); delete abPartial[id]; saveAbPartial(); }
 	delete bookDownloads[id];
 	if (listenCache[id] && listenCache[id].local) delete listenCache[id];
 	// Not the one playing now: it plays on to the end of the file.
@@ -18787,16 +18866,27 @@ var autoCfg = Object.assign({}, AUTO_DEFAULT, readJSON("readerAuto") || {});
 var autoState = { running: false, full: false, last: 0, timer: 0, note: "" };
 var autoSkips = readJSON("readerAutoSkip") || {};
 // Downloads auto-download tried and didn't finish (a phone's connection
-// dropping, the app put away): {key: {n, at}}. Each waits before trying
-// again, 30 minutes after the first failure, then twice as long each time,
-// up to 12 hours; so one that keeps failing isn't started over and over.
+// dropping, the app put away and stopped mid-download): {key: {n, at, done}}.
+// A try counts from when it starts, so one cut off by the app being stopped
+// counts too. Each waits before trying again, 30 minutes after the first,
+// then twice as long each time, up to 12 hours; so one that keeps failing
+// isn't started over and over. An audiobook that got further last time
+// (more pieces done than when that try started) carries on at once.
 var autoFails = readJSON("readerAutoFails") || {};
+function saveAutoFails() { store("readerAutoFails", Object.keys(autoFails).length ? JSON.stringify(autoFails) : null); }
 function autoFailWait(f) { return Math.min(12 * 3600e3, 30 * 60e3 * Math.pow(2, f.n - 1)); }
-function autoResting(key) { var f = autoFails[key]; return !!f && Date.now() - f.at < autoFailWait(f); }
+function wantDone(w) { return w.kind === "book" ? abDone(w.item.id) : 0; }
+function autoResting(w) {
+	var f = autoFails[w.key];
+	return !!f && Date.now() - f.at < autoFailWait(f) && wantDone(w) <= (f.done || 0);
+}
+function autoTry(w) {
+	var f = autoFails[w.key], done = wantDone(w);
+	autoFails[w.key] = { n: f && done <= (f.done || 0) ? f.n + 1 : 1, at: Date.now(), done: done };
+	saveAutoFails();
+}
 function autoFailed(key, ok) {
-	if (ok) delete autoFails[key];
-	else autoFails[key] = { n: ((autoFails[key] || {}).n || 0) + 1, at: Date.now() };
-	store("readerAutoFails", Object.keys(autoFails).length ? JSON.stringify(autoFails) : null);
+	if (ok) { delete autoFails[key]; saveAutoFails(); }
 }
 var MB = 1048576;
 function saveAutoCfg() { store("readerAuto", JSON.stringify(autoCfg)); }
@@ -18880,6 +18970,9 @@ async function autoDownload() {
 		Object.keys(bookDownloads).forEach(function (id) {
 			if (bookDownloads[id].auto && !keys["b" + id] && playing !== "b" + id && !bookDl[id]) { forgetBookDownload(id); repaintBook(id); }
 		});
+		Object.keys(abPartial).forEach(function (id) {
+			if (abPartial[id].auto && !keys["b" + id] && !bookDl[id]) forgetBookDownload(id);
+		});
 		saveBookDownloads();
 		var used = dlUsed(), cap = autoCfg.cap * MB, room = Infinity;
 		try {
@@ -18890,11 +18983,12 @@ async function autoDownload() {
 		for (var i = 0; i < want.length; i++) {
 			var w = want[i];
 			if (w.kind === "ep" ? downloads[w.item.id] : bookDownloads[w.item.id]) { if (autoFails[w.key]) autoFailed(w.key, true); continue; }
-			if (autoResting(w.key)) { resting++; continue; }
+			if (autoResting(w)) { resting++; continue; }
 			if (used + w.size > cap || w.size > room) { skipped++; continue; }
 			if (autoBlocked()) break;
 			used += w.size;
 			room -= w.size;
+			autoTry(w);
 			if (w.kind === "ep") await downloadEpisode(w.item, true); else await downloadBook(w.item, true);
 			var got = !!(w.kind === "ep" ? downloads[w.item.id] : bookDownloads[w.item.id]);
 			autoFailed(w.key, got);
@@ -19024,9 +19118,11 @@ function renderDownloads() {
 	$("dlStatus").textContent = why;
 	$("dlNow").disabled = autoState.running || !autoCfg.on;
 	list.textContent = "";
-	if (act.length) {
+	var paused = Object.keys(abPartial).filter(function (id) { return !bookDl[id]; });
+	if (act.length || paused.length) {
 		var ul = h("ul", "dlrows");
 		act.forEach(function (a) { busy[a.key] = true; ul.append(dlRow(a.key, a.kind, a.item)); });
+		paused.forEach(function (id) { ul.append(pausedRow(Number(id))); });
 		list.append(h("h3", "dlgroup", "Downloading"), ul);
 	}
 	var groups = { audiobook: [], book: [], podcast: [], video: [] };
@@ -19053,6 +19149,19 @@ async function paintDlStorage() {
 	$("dlDevice").textContent = (dlStorage.free > 0 ? gb(dlStorage.free) + " more available to Reader on this device. " : "") +
 		(dlStorage.kept ? "Downloads are kept until you remove them." : "This browser may clear downloads when it's low on space" +
 			(navigator.standalone === false ? ", or after a week unused. Add Reader to your Home Screen to keep them." : "."));
+}
+// An audiobook part-downloaded: how far, and that it carries on next time.
+function pausedRow(id) {
+	var li = h("li"), main = h("div", "dlmain"), au = libBook(id) || { id: id, title: "Audiobook" }, x = abPartial[id];
+	var got = x.files.reduce(function (t, f) { return t + (f ? Math.min(f.size || 0, (f.done || 0) * AB_CHUNK) : 0); }, 0);
+	var total = au.size || x.files.reduce(function (t, f) { return t + (f ? f.size || 0 : 0); }, 0);
+	var title = h("a", "dlt", au.title);
+	title.href = "#/record/" + ((state.books && libEntry(id)) || au).id;
+	main.append(title, h("span", "dlsub", ["Paused", total ? Math.min(99, Math.floor(got / total * 100)) + "% of " + gb(total) : gb(got),
+		"carries on next time"].join(" · ")));
+	li.dataset.dlrow = "b" + id;
+	li.append(main, button("Remove", "btn small", function () { forgetBookDownload(id); repaintBook(id); dlChanged(); }));
+	return li;
 }
 function dlRow(key, kind, x) {
 	var li = h("li"), main = h("div", "dlmain"), id = Number(key.slice(1)), p = kind === "ep" ? dlProgress[id] : bookDl[id];
