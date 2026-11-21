@@ -9106,6 +9106,49 @@ const PAGE = String.raw`<!doctype html>
 		background: var(--fg); color: var(--bg); padding: 10px 14px; border-radius: 10px; font-size: 14px; max-width: calc(100vw - 32px); }
 	.toast.act { display: flex; align-items: center; width: max-content; }
 	.toast button { flex: none; white-space: nowrap; margin-left: 12px; border: 0; border-radius: 8px; padding: 6px 10px; background: var(--bg); color: var(--fg); font-weight: 600; font-size: 14px; cursor: pointer; }
+
+	/* Offline: the bar under the header, what isn't here greyed out, the
+	   download mark on covers, the header's ring, and the Downloads page. */
+	.offbar { display: flex; flex-wrap: wrap; gap: 4px 10px; justify-content: center; align-items: baseline; padding: 7px 16px; font-size: 14px; line-height: 1.35;
+		background: var(--sel); color: var(--fg); border-top: 1px solid var(--line); text-align: center; }
+	.offbar[hidden] { display: none; }
+	.offbar a { font-weight: 600; white-space: nowrap; }
+	html.offline .books li.child:not(.have):not(.series), html.offline .covers > li:not(.have):not(.series),
+	html.offline .shelf li:not(.have), html.offline #episodes li:not(.have), html.offline .shows li:not(.have) { opacity: .42; filter: grayscale(.6); }
+	.dlmark { position: absolute; left: 6px; bottom: 6px; z-index: 1; width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center;
+		background: var(--accent); color: var(--on-accent); box-shadow: 0 0 0 2px var(--card), 0 1px 4px rgba(0,0,0,.35); }
+	.dlmark[hidden] { display: none; }
+	.dlmark svg { position: relative; width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2.6; stroke-linecap: round; stroke-linejoin: round; }
+	.dlmark.ring { background: conic-gradient(var(--accent) var(--p, 0%), color-mix(in srgb, var(--fg) 25%, transparent) 0); color: var(--accent); }
+	.dlmark.ring::before { content: ""; position: absolute; inset: 3px; border-radius: 50%; background: var(--card); }
+	.shelf .dlmark { width: 20px; height: 20px; left: 4px; bottom: 4px; }
+	.shelf .dlmark svg { width: 12px; height: 12px; }
+	.dlbtn { display: inline-grid; place-items: center; min-width: 40px; padding: 0 8px; }
+	.dlbtn[hidden] { display: none; }
+	.dlring { position: relative; width: 20px; height: 20px; border-radius: 50%; background: conic-gradient(var(--accent) var(--p, 0%), var(--line) 0); }
+	.dlring::after { content: ""; position: absolute; inset: 3px; border-radius: 50%; background: var(--bg); }
+	.dlring svg { position: absolute; inset: 3px; z-index: 1; width: 16px; height: 16px; fill: none; stroke: var(--accent); stroke-width: 2.6; stroke-linecap: round; stroke-linejoin: round; }
+	.dlring { width: 22px; height: 22px; }
+	.dlmeter { margin-top: 10px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); }
+	.dlnums { margin-bottom: 8px; font-variant-numeric: tabular-nums; }
+	.dlnums b { font-size: 20px; }
+	.dlnums span { color: var(--muted); }
+	.dlmeter .bar-prog { height: 8px; border-radius: 4px; }
+	.dlmeter .bar-prog span { border-radius: 4px; }
+	.dlmeter .bar-prog span.over { background: var(--bad); }
+	#downloadsView { max-width: 760px; }
+	#downloadsView .rsec > h2 { font-size: 18px; margin: 0 0 10px; }
+	#dlAuto h3 { font-size: 15px; margin: 18px 0 8px; }
+	.dlnowrow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin-top: 18px; }
+	.dlnowrow .hint { margin: 0; }
+	.dlgroup { font-size: 15px; margin: 18px 0 4px; color: var(--muted); font-weight: 600; }
+	.dlgroup:first-child { margin-top: 0; }
+	.dlrows { list-style: none; margin: 0; padding: 0; }
+	.dlrows li { display: flex; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+	.dlmain { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+	.dlt { color: inherit; text-decoration: none; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.dlsub { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	#dlClear { margin-top: 16px; color: var(--bad); }
 </style>
 </head>
 <body>
@@ -9128,6 +9171,7 @@ const PAGE = String.raw`<!doctype html>
 		<button id="markBtn" class="btn" type="button" aria-label="Bookmark this place" aria-pressed="false" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg></button>
 		<button id="refresh" class="btn" type="button">Refresh</button>
 		<button id="bookMenuBtn" class="btn" type="button" aria-label="Book options" aria-expanded="false" aria-controls="bookMenu" hidden>&#8943;</button>
+		<a id="dlBtn" class="btn dlbtn" href="#/downloads" hidden><span class="dlring" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 6v10M8 12.5l4 4 4-4"/></svg></span></a>
 		<button id="settingsBtn" class="btn" type="button" aria-label="Display settings" aria-expanded="false" aria-controls="settings"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span class="reqdot" hidden></span></button>
 	</div>
 	<nav id="tabs" class="tabs" aria-label="Views">
@@ -9138,6 +9182,7 @@ const PAGE = String.raw`<!doctype html>
 		<a href="#/videos" data-view="videos" class="icon" aria-label="Videos" title="Videos"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="5" width="20" height="14" rx="3"/><path d="M10 9.5v5l4.5-2.5z"/></svg></a>
 		<a href="#/library" data-view="library" class="icon" aria-label="Library" title="Library"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 4h6a4 4 0 0 1 4 4v13a3 3 0 0 0-3-3H2z"/><path d="M22 4h-6a4 4 0 0 0-4 4v13a3 3 0 0 1 3-3h7z"/></svg></a>
 	</nav>
+	<div id="offBar" class="offbar" role="status" hidden><span id="offText"></span> <a href="#/downloads">Downloads</a></div>
 </header>
 
 <div id="settings" class="pop" hidden>
@@ -9208,6 +9253,9 @@ const PAGE = String.raw`<!doctype html>
 	<h2>Notes</h2>
 	<button id="exportNotes" class="btn small" type="button">Export notes</button>
 	<p class="hint">Every book's highlights and audiobook bookmarks, one Markdown file per book, in a zip for an Obsidian vault.</p>
+	<h2>Offline</h2>
+	<a href="#/downloads" id="downloadsLink" class="btn small">Downloads</a>
+	<p class="hint">What's on this device, the space it takes, and auto-download.</p>
 	<a href="#/family" id="familyLink" class="btn small">Family library<span class="reqn" hidden></span></a>
 	<button id="forget" class="btn ghost small" type="button">Forget token on this device</button>
 </div>
@@ -9497,6 +9545,41 @@ const PAGE = String.raw`<!doctype html>
 	<div id="famLink" class="famlink" hidden></div>
 	<ul id="people" class="items people"></ul>
 	<p id="famEmpty" class="empty" hidden>No one yet.</p>
+</section>
+
+<section id="downloadsView" class="wrap" hidden>
+	<div class="listhead"><h2>Downloads</h2></div>
+	<div class="dlmeter">
+		<div class="dlnums"><b id="dlUsed"></b> <span id="dlCap"></span></div>
+		<div class="bar-prog"><span id="dlFill"></span></div>
+		<p id="dlDevice" class="hint"></p>
+	</div>
+	<section class="rsec">
+		<h2>On this device</h2>
+		<div id="dlList"></div>
+		<p id="dlEmpty" class="empty" hidden>Nothing downloaded yet. Tap ⤓ on a book or an episode, or turn on auto-download.</p>
+		<button id="dlClear" class="btn ghost small danger" type="button" hidden>Remove all downloads</button>
+	</section>
+	<section id="dlAuto" class="rsec">
+		<h2>Auto-download</h2>
+		<div class="seg"><button type="button" data-k="on" data-v="0">Off</button><button type="button" data-k="on" data-v="1">On</button></div>
+		<p class="hint">Keeps what's next on this device while Reader is open: the audiobook in the player, the books you're reading, and new episodes. Each is removed again once it's played or finished. Ones you download yourself stay until you remove them.</p>
+		<div id="dlAutoMore">
+			<h3>New episodes of each show</h3>
+			<div class="seg"><button type="button" data-k="eps" data-v="0">None</button><button type="button" data-k="eps" data-v="1">1</button><button type="button" data-k="eps" data-v="2">2</button><button type="button" data-k="eps" data-v="3">3</button></div>
+			<h3>Books you're reading</h3>
+			<div class="seg"><button type="button" data-k="books" data-v="0">None</button><button type="button" data-k="books" data-v="1">1</button><button type="button" data-k="books" data-v="3">3</button><button type="button" data-k="books" data-v="5">5</button></div>
+			<h3>Audiobooks</h3>
+			<div class="seg"><button type="button" data-k="audio" data-v="0">Off</button><button type="button" data-k="audio" data-v="1">On</button></div>
+			<p class="hint">The one in the player, and any on the shelf you're listening to rather than reading.</p>
+			<h3>Space for downloads</h3>
+			<div class="seg"><button type="button" data-k="cap" data-v="1024">1 GB</button><button type="button" data-k="cap" data-v="2048">2 GB</button><button type="button" data-k="cap" data-v="5120">5 GB</button><button type="button" data-k="cap" data-v="10240">10 GB</button></div>
+			<h3>Only on Wi-Fi</h3>
+			<div class="seg"><button type="button" data-k="wifi" data-v="0">Off</button><button type="button" data-k="wifi" data-v="1">On</button></div>
+			<p class="hint">Works on Android. iPhones don't tell web apps whether they're on Wi-Fi, so there it downloads either way.</p>
+			<div class="dlnowrow"><button id="dlNow" class="btn small" type="button">Check now</button> <span id="dlStatus" class="hint" role="status"></span></div>
+		</div>
+	</section>
 </section>
 </main>
 <div id="pbar" class="pbar" hidden>
@@ -9791,7 +9874,11 @@ async function api(path, opts) {
 	var headers = { Authorization: "Bearer " + token() };
 	var body = opts.body;
 	if (opts.json !== undefined) { headers["Content-Type"] = "application/json"; body = JSON.stringify(opts.json); }
-	var res = await fetch(path, { method: opts.method || "GET", headers: headers, body: body, keepalive: !!opts.keepalive });
+	var res;
+	try { res = await fetch(path, { method: opts.method || "GET", headers: headers, body: body, keepalive: !!opts.keepalive }); }
+	catch (e) { if (e instanceof TypeError) seenOffline(); throw e; }
+	// 502-504 are Cloudflare's: the Worker's still there, so this is online.
+	seenOnline();
 	if (res.status === 401) {
 		store("readerToken", null);
 		askToken("That token didn't work.");
@@ -11239,7 +11326,7 @@ function parseHash() {
 	};
 }
 function showView(name) {
-	["list", "article", "podcasts", "library", "book", "record", "listen", "family"].forEach(function (v) { show($(v + "View"), v === name); });
+	["list", "article", "podcasts", "library", "book", "record", "listen", "family", "downloads"].forEach(function (v) { show($(v + "View"), v === name); });
 	if (name !== "listen") carMode(false);
 	if ($("lpChapDlg").open) $("lpChapDlg").close();
 	var top = name === "list" || name === "podcasts" || name === "library";
@@ -11283,6 +11370,7 @@ async function route() {
 		if (r.name === "record" && r.id) return await showRecord(r.id);
 		if (r.name === "listen" && r.id) return await showListen(r.id);
 		if (r.name === "family") return await showFamily();
+		if (r.name === "downloads") return await showDownloads();
 		location.replace("#/unread");
 	} catch (e) { fail(e); }
 }
@@ -11362,8 +11450,11 @@ function shelfCard(x) {
 	var bar = h("div", "bar-prog"), fill = h("span");
 	fill.style.width = (x.next ? 0 : pct) + "%";
 	bar.append(fill);
-	a.append(coverBox(b), h("span", "ct", b.title), h("span", "ca", where), bar);
+	var cov = coverBox(b);
+	cov.append(dlMark(b));
+	a.append(cov, h("span", "ct", b.title), h("span", "ca", where), bar);
 	li.append(a);
+	li.classList.toggle("have", entryHave(b));
 	return li;
 }
 // The shelf into box (#contShelf on Unread and All, #libShelf in the Library); hidden when empty.
@@ -11593,8 +11684,9 @@ $("famForm").addEventListener("submit", function (e) {
 
 function goBack() {
 	// The player page opens from the player bar, over whatever was showing.
-	var listening = state.route && state.route.name === "listen";
+	var listening = state.route && (state.route.name === "listen" || state.route.name === "downloads");
 	if (state.fromList || (listening && state.prev)) history.back();
+	else if (state.route && state.route.name === "downloads") location.hash = state.lastList;
 	else if (listening) location.hash = "#/record/" + state.route.id;
 	else location.hash = state.route && (state.route.name === "book" || state.route.name === "record") ? "#/library" : state.lastList;
 }
@@ -12101,8 +12193,10 @@ function renderShows() {
 		a.setAttribute("aria-label", f.title + (x.unread ? ", " + x.unread + " unread" : ""));
 		showArt(art, f, videos);
 		if (x.unread) art.append(h("span", "unreadn", x.unread > 99 ? "99+" : String(x.unread)));
+		var here = Object.keys(downloads).filter(function (id) { return downloads[id].feed_id === f.id && inTab(downloads[id]); }).length;
+		li.classList.toggle("have", !!here);
 		a.append(art, h("span", "ct", f.title),
-			h("span", "ca", [x.n + (videos ? (x.n === 1 ? " video" : " videos") : x.n === 1 ? " episode" : " episodes"), ago(x.latest)].filter(Boolean).join(" · ")));
+			h("span", "ca", [x.n + (videos ? (x.n === 1 ? " video" : " videos") : x.n === 1 ? " episode" : " episodes"), ago(x.latest), here ? here + " downloaded" : ""].filter(Boolean).join(" · ")));
 		li.append(a);
 		ul.append(li);
 	});
@@ -12114,7 +12208,7 @@ function renderShows() {
 		: "No podcasts yet. Add a podcast's feed to get started.";
 	show($("epEmpty"), !ul.children.length);
 	$("epNote").textContent = "You're offline. The counts are from when you were last online.";
-	show($("epNote"), state.epOffline && !!ul.children.length);
+	show($("epNote"), state.epOffline && !!ul.children.length && !isNetDown());
 	paintEpFilter();
 }
 // + Add on a gallery. Podcasts: words search Apple's podcast directory (no
@@ -12272,6 +12366,7 @@ function renderEpisodes() {
 	state.episodes.forEach(function (ep) {
 		var li = h("li", epPlayed(ep) ? "read" : ""), a = h("a");
 		li.dataset.id = ep.id;
+		li.classList.toggle("have", !!downloads[ep.id]);
 		a.href = "#/item/" + ep.id;
 		var dot = h("span", "dot");
 		a.append(dot, h("span", "t", ep.title));
@@ -12294,7 +12389,7 @@ function renderEpisodes() {
 	show($("epEmpty"), !state.episodes.length);
 	show($("epMore"), !!state.epNext);
 	$("epNote").textContent = state.epOffline ? "You're offline. These are the ones downloaded on this device." : "";
-	show($("epNote"), state.epOffline && !!state.episodes.length);
+	show($("epNote"), state.epOffline && !!state.episodes.length && !isNetDown());
 	paintEpFilter();
 }
 function paintEpFilter() {
@@ -12351,7 +12446,8 @@ function setPlayed(ep, on) {
 	// The bar's own save on pause would put the old spot back.
 	if (mine) { try { audio.currentTime = on && real ? real : 0; } catch (e) {} }
 	repaintEpisode(ep.id);
-	api("/api/items/" + ep.id, { method: "PATCH", json: patch, keepalive: true }).catch(fail);
+	sendEpPatch(ep.id, patch);
+	if (on) autoSoon(5000);
 }
 function playButton(ep, small) {
 	var b = h("button", "btn" + (small ? " small" : " primary"));
@@ -12397,7 +12493,8 @@ function repaintEpisode(id) {
 	document.querySelectorAll("#episodes li[data-id='" + id + "'] .m").forEach(function (m) {
 		m.textContent = epMeta(ep);
 	});
-	document.querySelectorAll("#episodes li[data-id='" + id + "']").forEach(function (li) { li.classList.toggle("read", epPlayed(ep)); });
+	document.querySelectorAll("#episodes li[data-id='" + id + "']").forEach(function (li) { li.classList.toggle("read", epPlayed(ep)); li.classList.toggle("have", !!downloads[id]); });
+	paintDlRow("e" + id);
 	document.querySelectorAll("[data-played='" + id + "']").forEach(function (b) { paintPlayed(b, ep); });
 	var when = document.querySelector("#aEpisode .when");
 	if (when && state.item && state.item.id === id) when.textContent = epStatus(ep);
@@ -12592,10 +12689,13 @@ async function episodeSrc(ep, bar) {
 	// An https page can't play from http (the browser would upgrade it anyway).
 	return ep.media_url.replace(/^http:/, "https:");
 }
-async function downloadEpisode(ep) {
-	if (!window.caches || !window.ReadableStream) return toast("This browser can't keep downloads.");
+async function downloadEpisode(ep, auto) {
+	if (!window.caches || !window.ReadableStream) return auto ? null : toast("This browser can't keep downloads.");
+	if (dlProgress[ep.id]) return;
+	if (!auto) autoUnskip("e" + ep.id);
 	dlProgress[ep.id] = { got: 0, total: 0 };
 	repaintEpisode(ep.id);
+	dlChanged();
 	try {
 		await askToKeep();
 		var res = await api("/api/media?url=" + encodeURIComponent(ep.media_url));
@@ -12611,13 +12711,15 @@ async function downloadEpisode(ep) {
 		var keep = epFields(ep);
 		keep.size = p.got;
 		keep.saved_at = Date.now();
+		keep.auto = auto ? 1 : 0;
 		downloads[ep.id] = keep;
 		saveDownloads();
 	} catch (e) {
-		if (e.message !== UNAUTH) toast(/quota/i.test(e.name + e.message) ? "Not enough space on this device for that episode." : "Couldn't download it: " + e.message);
+		dlFailed(e, auto, "episode");
 	} finally {
 		delete dlProgress[ep.id];
 		repaintEpisode(ep.id);
+		dlChanged();
 	}
 }
 // Asks the browser not to clear downloads when it's low on space.
@@ -12643,11 +12745,13 @@ function counting(res, p, tick) {
 		cancel(why) { reader.cancel(why); }
 	});
 }
-async function removeDownload(id) {
+async function removeDownload(id, quiet) {
 	delete downloads[id];
 	saveDownloads();
+	if (!quiet) autoSkip(id, "ep");
 	try { await (await caches.open(EP_CACHE)).delete(epKey(id)); } catch (e) {}
 	repaintEpisode(id);
+	dlChanged();
 	if (state.epDownloadedOnly && state.route && MEDIA_TABS[state.route.name]) loadEpisodes(false);
 }
 
@@ -12928,8 +13032,33 @@ function keepPos(who, pos, len, ended, now) {
 	who.savedAt = Date.now();
 	var patch = { media_pos: pos };
 	if (len) patch.media_len = len;
-	if (ended) patch.read = 1;
-	api("/api/items/" + ep.id, { method: "PATCH", json: patch, keepalive: true }).catch(function () {});
+	if (ended) { patch.read = 1; autoSoon(5000); }
+	sendEpPatch(ep.id, patch);
+}
+// An episode's place (or played mark): sent now, or kept on this device
+// until there's a connection, so listening on a plane still syncs. A later
+// change to the same episode replaces a waiting one.
+var epPending = readJSON("readerEpPending") || {};
+function saveEpPending() { store("readerEpPending", Object.keys(epPending).length ? JSON.stringify(epPending) : null); offlineBar(); }
+function sendEpPatch(id, patch) {
+	var p = epPending[id] = Object.assign({}, epPending[id], patch);
+	saveEpPending();
+	return api("/api/items/" + id, { method: "PATCH", json: patch, keepalive: true }).then(function (res) {
+		if ((res.ok || res.status === 404) && epPending[id] === p) { delete epPending[id]; saveEpPending(); }
+		if (res.ok) seenOnline();
+	}, function (e) { if (isOffline(e)) seenOffline(); });
+}
+var syncingEps = false;
+async function syncEpisodes() {
+	if (syncingEps) return;
+	syncingEps = true;
+	try {
+		var ids = Object.keys(epPending);
+		for (var i = 0; i < ids.length; i++) {
+			var p = epPending[ids[i]], res = await api("/api/items/" + ids[i], { method: "PATCH", json: p });
+			if ((res.ok || res.status === 404) && epPending[ids[i]] === p) delete epPending[ids[i]];
+		}
+	} catch (e) {} finally { syncingEps = false; saveEpPending(); }
 }
 function findListed(id) { return state.episodes.filter(function (e) { return e.id === id; })[0] || null; }
 // The player log (for now, while chasing Bluetooth pause on iPhone): the last
@@ -13319,16 +13448,17 @@ function renderRecord(b) {
 	if (au) {
 		var listen = button(listenLabel(au), "btn" + (e ? "" : " primary"), function () { listenTo(au); });
 		listen.id = "recListen";
-		if (off) listen.disabled = true;
+		if (off && !bookDownloads[au.id]) listen.disabled = true;
 		acts.append(listen);
 	}
 	var tools = h("div", "rtools");
 	// The click would reach the page and close the box it just opened.
 	if (!off) tools.append(button("Edit details", "btn small", function (e) { e.stopPropagation(); openDetails(b); }));
-	if (e && window.caches) tools.append(bookDlButton(e));
+	if (e && window.caches) tools.append(bookDlButton(e, au ? "ebook" : ""));
 	if (au && !off) tools.append(button("Player", "btn small", function () { location.hash = "#/listen/" + au.id; }));
-	if (au && !off) tools.append(button("Download audiobook", "btn small", function () {
-		listenInfo(au.id).then(function (d) { location.href = d.download; }, fail);
+	if (au && window.caches && (!off || bookDownloads[au.id])) tools.append(bookDlButton(au, "audiobook"));
+	if (au && !off) tools.append(button("Save audiobook file", "btn small", function () {
+		apiJSON("/api/books/" + au.id + "/listen").then(function (d) { location.href = d.download; }, fail);
 	}));
 	if (tools.children.length) acts.append(tools);
 }
@@ -13451,7 +13581,30 @@ var listenCache = {};
 async function listenInfo(id) {
 	var c = listenCache[id];
 	if (c && c.expires - Date.now() > 10 * 60 * 1000) return c;
+	// Downloaded: its files are on this device, so nothing to ask for.
+	var kept = bookDownloads[id] && bookDownloads[id].ab;
+	if (kept && window.caches) return listenCache[id] = { local: true, duration: kept.duration, chapters: kept.chapters, expires: Infinity,
+		files: kept.files.map(function (f) { return { duration: f.duration, local: true }; }) };
 	return listenCache[id] = await apiJSON("/api/books/" + id + "/listen");
+}
+// A downloaded audiobook's file n, as an address the player can play (one
+// at a time, so a long book's file isn't held twice). Null if the browser
+// cleared it, and then it's forgotten, so the book streams again.
+var abUrl = {};
+async function localAbSrc(id, n) {
+	if (abUrl.id === id && abUrl.n === n) return abUrl.url;
+	try {
+		var res = await (await caches.open(BOOK_CACHE)).match(abKey(id, n));
+		if (res) {
+			if (abUrl.url) URL.revokeObjectURL(abUrl.url);
+			abUrl = { id: id, n: n, url: URL.createObjectURL(await res.blob()) };
+			return abUrl.url;
+		}
+	} catch (e) {}
+	forgetBookDownload(id);
+	saveBookDownloads();
+	repaintBook(id);
+	return null;
 }
 function playingBook(au) { return !!(player.ep && player.ep.book === au.id); }
 function audioPos(au) {
@@ -13544,12 +13697,24 @@ async function abLoad(n, at, play) {
 		try {
 			var d = await listenInfo(ab.id);
 			if (player.ab !== ab) return;
-			ab.files.forEach(function (f, i) { if (d.files[i]) f.url = d.files[i].url; });
+			ab.files.forEach(function (f, i) { if (d.files[i]) { f.url = d.files[i].url; f.local = !!d.files[i].local; } });
 		} catch (e) {}
+	}
+	var src = ab.files[n].url;
+	if (ab.files[n].local) {
+		src = await localAbSrc(ab.id, n);
+		if (player.ab !== ab) return;
+		if (!src) {
+			// Cleared from this device: the streamed one instead.
+			try { var on = await listenInfo(ab.id); } catch (e) { return fail(e); }
+			if (player.ab !== ab) return;
+			ab.files.forEach(function (f, i) { if (on.files[i]) { f.url = on.files[i].url; f.local = false; } });
+			src = ab.files[n].url;
+		}
 	}
 	ab.cur = n;
 	ab.pending = at;
-	audio.src = ab.files[n].url;
+	audio.src = src;
 	audio.playbackRate = player.rate;
 	audio.load();
 	if (play) await audio.play().catch(playFailed);
@@ -14368,21 +14533,29 @@ function bookKey(id) { return location.origin + "/bookfile/" + id; }
 function saveBookDownloads() { store("readerBookDownloads", JSON.stringify(bookDownloads)); }
 function saveBookPending() { store("readerBookPending", JSON.stringify(bookPending)); }
 // fetch() fails with a TypeError when there's no connection.
-function isOffline(e) { return navigator.onLine === false || e instanceof TypeError; }
+function isOffline(e) {
+	var off = navigator.onLine === false || e instanceof TypeError;
+	if (off) seenOffline();
+	return off;
+}
 function bookAt(position) { var p = parsePos(position); return (p && p.at) || 0; }
 function downloadedBooks() {
 	return Object.keys(bookDownloads).map(function (id) { return bookDownloads[id]; })
 		.sort(function (a, b) { return (b.last_opened_at || b.created_at) - (a.last_opened_at || a.created_at); });
 }
+// Fresh details over a download's, keeping what's about the download itself.
+function withDl(old, b) {
+	return Object.assign({}, b, { saved_at: old.saved_at, auto: old.auto, ab: old.ab, dlsize: old.dlsize });
+}
 function keepBookDetails(b) {
 	if (!bookDownloads[b.id]) return;
-	bookDownloads[b.id] = Object.assign({}, b, { saved_at: bookDownloads[b.id].saved_at });
+	bookDownloads[b.id] = withDl(bookDownloads[b.id], b);
 	saveBookDownloads();
 }
 // Fresh details for downloaded books; drop the ones deleted elsewhere.
 function refreshBookDownloads(books) {
 	var live = {};
-	books.forEach(function (b) { live[b.id] = true; if (bookDownloads[b.id]) bookDownloads[b.id] = Object.assign({}, b, { saved_at: bookDownloads[b.id].saved_at }); });
+	books.forEach(function (b) { live[b.id] = true; if (bookDownloads[b.id]) bookDownloads[b.id] = withDl(bookDownloads[b.id], b); });
 	Object.keys(bookDownloads).forEach(function (id) { if (!live[id]) forgetBookDownload(id); });
 	Object.keys(bookPending).forEach(function (id) { if (!live[id]) delete bookPending[id]; });
 	saveBookDownloads();
@@ -14470,10 +14643,14 @@ async function bookFileRes(b) {
 	if (!res.ok) throw new Error("Couldn't load the book (HTTP " + res.status + ").");
 	return res;
 }
-async function downloadBook(b) {
-	if (!window.caches || !window.ReadableStream) return toast("This browser can't keep downloads.");
+async function downloadBook(b, auto) {
+	if (isAudiobook(b)) return downloadAudiobook(b, auto);
+	if (!window.caches || !window.ReadableStream) return auto ? null : toast("This browser can't keep downloads.");
+	if (bookDl[b.id]) return;
+	if (!auto) autoUnskip("b" + b.id);
 	var p = bookDl[b.id] = { got: 0, total: b.size || 0 };
 	repaintBook(b.id);
+	dlChanged();
 	try {
 		await askToKeep();
 		var res = await api("/api/books/" + b.id + "/file?dl=1");
@@ -14483,16 +14660,62 @@ async function downloadBook(b) {
 		}
 		var counted = counting(res, p, function () { repaintBook(b.id); });
 		await (await caches.open(BOOK_CACHE)).put(bookKey(b.id), new Response(counted, { headers: { "Content-Type": res.headers.get("Content-Type") || "" } }));
-		bookDownloads[b.id] = Object.assign({}, b, { saved_at: Date.now() });
+		bookDownloads[b.id] = Object.assign({}, b, { saved_at: Date.now(), auto: auto ? 1 : 0, dlsize: p.got });
 		saveBookDownloads();
 		if (b.type === "pdf") await keepPdfViewer().catch(function () {
-			toast("Downloaded, but the PDF viewer couldn't be saved. Open this book once while online.");
+			if (!auto) toast("Downloaded, but the PDF viewer couldn't be saved. Open this book once while online.");
 		});
 	} catch (e) {
-		if (e.message !== UNAUTH) toast(/quota/i.test(e.name + e.message) ? "Not enough space on this device for that book." : "Couldn't download it: " + e.message);
+		dlFailed(e, auto, "book");
 	} finally {
 		delete bookDl[b.id];
 		repaintBook(b.id);
+		dlChanged();
+	}
+}
+// A download that didn't finish: said, unless auto-download was getting it
+// (that tries again next time); out of space stops auto-download's queue.
+function dlFailed(e, auto, what) {
+	var full = /quota/i.test(e.name + e.message);
+	if (full) autoState.full = true;
+	if (e.message === UNAUTH || auto) return;
+	toast(full ? "Not enough space on this device for that " + what + "." : "Couldn't download it: " + e.message);
+}
+// An audiobook: each of its files (one .m4b, usually) kept as it is, through
+// the same signed /listen/ addresses the player uses, with its chapters and
+// each file's length, so it plays in the player bar with no connection.
+function abKey(id, n) { return location.origin + "/abfile/" + id + "/" + n; }
+async function downloadAudiobook(au, auto) {
+	if (!window.caches || !window.ReadableStream) return auto ? null : toast("This browser can't keep downloads.");
+	if (bookDl[au.id]) return;
+	if (!auto) autoUnskip("b" + au.id);
+	var p = bookDl[au.id] = { got: 0, total: au.size || 0 }, kept = 0;
+	repaintBook(au.id);
+	dlChanged();
+	try {
+		await askToKeep();
+		delete listenCache[au.id];
+		var d = await listenInfo(au.id), c = await caches.open(BOOK_CACHE);
+		for (var n = 0; n < d.files.length; n++) {
+			var res = await fetch(d.files[n].url);
+			if (!res.ok) throw new Error(res.status === 502 ? "the home server is offline" : "HTTP " + res.status);
+			if (!au.size && d.files.length === 1) p.total = Number(res.headers.get("Content-Length")) || 0;
+			var counted = counting(res, p, function () { repaintBook(au.id); });
+			await c.put(abKey(au.id, n), new Response(counted, { headers: { "Content-Type": res.headers.get("Content-Type") || "audio/mp4" } }));
+			kept = n + 1;
+		}
+		bookDownloads[au.id] = Object.assign({}, au, { saved_at: Date.now(), auto: auto ? 1 : 0, dlsize: p.got,
+			ab: { duration: d.duration, chapters: d.chapters || [], files: d.files.map(function (f) { return { duration: f.duration }; }) } });
+		saveBookDownloads();
+	} catch (e) {
+		var gone = [];
+		for (var i = 0; i <= kept; i++) gone.push(abKey(au.id, i));
+		caches.open(BOOK_CACHE).then(function (c) { return Promise.all(gone.map(function (k) { return c.delete(k); })); }).catch(function () {});
+		dlFailed(e, auto, "audiobook");
+	} finally {
+		delete bookDl[au.id];
+		repaintBook(au.id);
+		dlChanged();
 	}
 }
 async function keepPdfViewer() {
@@ -14500,12 +14723,20 @@ async function keepPdfViewer() {
 	await Promise.all(PDF_FILES.map(async function (u) { if (!(await c.match(u))) await c.add(u); }));
 }
 function forgetBookDownload(id) {
+	var was = bookDownloads[id], keys = [bookKey(id)];
+	if (was && was.ab) was.ab.files.forEach(function (f, n) { keys.push(abKey(id, n)); });
 	delete bookDownloads[id];
-	if (window.caches) caches.open(BOOK_CACHE).then(function (c) { return c.delete(bookKey(id)); }).catch(function () {});
+	if (listenCache[id] && listenCache[id].local) delete listenCache[id];
+	// Not the one playing now: it plays on to the end of the file.
+	if (abUrl.id === Number(id) && $("pAudio").src !== abUrl.url) { URL.revokeObjectURL(abUrl.url); abUrl = {}; }
+	if (window.caches) caches.open(BOOK_CACHE).then(function (c) { return Promise.all(keys.map(function (k) { return c.delete(k); })); }).catch(function () {});
+	dlChanged();
 }
 async function removeBookDownload(b) {
 	forgetBookDownload(b.id);
 	saveBookDownloads();
+	// Auto-download leaves it be from now on.
+	autoSkip(b.id, "book");
 	if (state.libOffline) await loadBooks().catch(fail);
 	repaintBook(b.id);
 }
@@ -14514,10 +14745,12 @@ function toggleBookDownload(b) {
 	if (!bookDownloads[b.id]) return downloadBook(b);
 	if (confirm("Remove the download of “" + b.title + "” from this device?")) removeBookDownload(b);
 }
-function bookDlButton(b) {
+// what: a word after the mark ("ebook", "audiobook") where a Record has both.
+function bookDlButton(b, what) {
 	var btn = h("button", "btn small dl");
 	btn.type = "button";
 	btn.dataset.bookdl = b.id;
+	if (what) btn.dataset.what = what;
 	paintBookDl(btn, b);
 	btn.addEventListener("click", function (e) { e.preventDefault(); toggleBookDownload(b); });
 	return btn;
@@ -14526,15 +14759,17 @@ function dlLabel(p) { return p.total ? Math.min(99, Math.floor(p.got / p.total *
 function paintBookDl(btn, b) {
 	var p = bookDl[b.id], have = !!bookDownloads[b.id];
 	btn.classList.toggle("on", have);
-	btn.textContent = p ? dlLabel(p) : have ? "✓" : "⤓";
+	btn.textContent = (p ? dlLabel(p) : have ? "✓" : "⤓") + (btn.dataset.what ? " " + (have && !p ? btn.dataset.what[0].toUpperCase() + btn.dataset.what.slice(1) + " downloaded" : "Download " + btn.dataset.what) : "");
 	btn.setAttribute("aria-label", (have ? "Remove download of " : "Download ") + b.title);
-	btn.title = have ? "Downloaded. Tap to remove from this device." : "Download for reading offline";
+	btn.title = have ? "Downloaded. Tap to remove from this device." : isAudiobook(b) ? "Download for listening offline" : "Download for reading offline";
 }
 function repaintBook(id) {
 	var b = (state.books || []).filter(function (x) { return x.id === Number(id); })[0] || bookDownloads[id];
 	if (!b) return;
 	document.querySelectorAll("[data-bookdl='" + id + "']").forEach(function (btn) { paintBookDl(btn, b); });
+	document.querySelectorAll("[data-dlmark='" + id + "'], [data-dlmark-au='" + id + "']").forEach(paintDlMark);
 	if (session && session.id === Number(id)) renderBookMenu();
+	paintDlRow("b" + id);
 }
 // The Library: one list, most recently opened first, narrowed to a tag if
 // one is picked.
@@ -14583,7 +14818,8 @@ function renderBooks() {
 		: fmt && (state.books || []).length ? (state.libFormat === "listen" ? "No audiobooks here yet." : "No ebooks here yet.")
 		: off ? "You're offline, and no books are downloaded on this device." : "No books yet. Upload a .txt, .pdf, .epub or .cbz to start.";
 	show($("booksEmpty"), !books.length);
-	show($("libNote"), off && !!books.length);
+	// The offline bar says it now (offlineBar); this is for when it's not showing.
+	show($("libNote"), off && !!books.length && !isNetDown());
 	show($("libUpload"), !off);
 	show($("editBooks"), !off);
 	$("editBooks").textContent = edit ? "Done" : "Edit";
@@ -14654,8 +14890,9 @@ function bookRow(b) {
 		row.append(pick);
 	}
 	row.append(a);
-	if (!state.editBooks && window.caches && !isAudiobook(b)) row.append(bookDlButton(b));
+	if (!state.editBooks && window.caches) row.append(bookDlButton(b));
 	li.append(row);
+	li.classList.toggle("have", entryHave(b));
 	if (state.editBooks) {
 		var t = h("div", "tools");
 		t.append(
@@ -14687,6 +14924,7 @@ function bookCard(b) {
 	a.href = "#/record/" + b.id;
 	a.setAttribute("aria-label", b.title + (b.author ? ", " + b.author : "") + (b.audio ? ", ebook and audiobook" : isAudiobook(b) ? ", audiobook" : ""));
 	if (b.finished_at) cov.append(h("span", "badge cdone", "Finished"));
+	cov.append(dlMark(b));
 	var pos = parsePos(b.position), pct = bookPct(b, pos);
 	var bar = h("div", "bar-prog"), fill = h("span");
 	fill.style.width = pct + "%";
@@ -14696,7 +14934,30 @@ function bookCard(b) {
 	if (b.audio || isAudiobook(b)) a.append(fmtIcons(b));
 	if (pct) a.append(bar);
 	li.append(a);
+	li.classList.toggle("have", entryHave(b));
 	return li;
+}
+// On this device: the entry's ebook or its audiobook is downloaded (or
+// downloading, with a ring that fills). A mark on the cover's corner.
+function entryHave(b) { return !!(bookDownloads[b.id] || (b.audio && bookDownloads[b.audio.id])); }
+var DL_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11M7 10.5l5 5 5-5M5 20h14"/></svg>';
+function dlMark(b) {
+	var m = h("span", "dlmark");
+	m.dataset.dlmark = b.id;
+	if (b.audio) m.dataset.dlmarkAu = b.audio.id;
+	m.entry = b;
+	m.innerHTML = DL_SVG;
+	paintDlMark(m);
+	return m;
+}
+function paintDlMark(m) {
+	var b = m.entry, p = bookDl[b.id] || (b.audio && bookDl[b.audio.id]), have = entryHave(b);
+	m.hidden = !p && !have;
+	m.classList.toggle("ring", !!p);
+	m.style.setProperty("--p", p && p.total ? Math.min(100, p.got / p.total * 100) + "%" : "8%");
+	m.title = p ? "Downloading " + dlLabel(p) : have ? "Downloaded on this device" : "";
+	var li = m.closest ? m.closest("li") : null;
+	if (li) li.classList.toggle("have", have);
 }
 // A book's cover: drawn at once, its real one loaded as it comes on screen.
 function coverBox(b) {
@@ -15354,7 +15615,8 @@ function openBookCtx(b, x, y) {
 			renderBooks();
 		});
 	}
-	if (window.caches && !isAudiobook(b)) item(bookDownloads[b.id] ? "Remove download" : "Download for offline", function () { toggleBookDownload(b); });
+	if (window.caches) item(bookDownloads[b.id] ? "Remove download" : "Download for offline", function () { toggleBookDownload(b); });
+	if (window.caches && b.audio) item(bookDownloads[b.audio.id] ? "Remove audiobook download" : "Download audiobook for offline", function () { toggleBookDownload(b.audio); });
 	if (!off) {
 		item(state.editBooks && state.libSel[b.id] ? "Deselect" : "Select", function () {
 			if (state.libSel[b.id]) delete state.libSel[b.id]; else state.libSel[b.id] = true;
@@ -15410,6 +15672,7 @@ async function setFinished(b, on) {
 	}
 	keepBookDetails(b);
 	renderBookMenu();
+	if (on) autoSoon(5000);
 }
 function confirmStartOver(b) {
 	return confirm("Start “" + b.title + "” over? Your place goes back to the beginning." +
@@ -18224,6 +18487,15 @@ $("tokenForm").addEventListener("submit", function (e) {
 	start();
 });
 $("back").addEventListener("click", goBack);
+document.querySelectorAll("#dlAuto [data-k]").forEach(function (b) { b.addEventListener("click", function () { dlSet(b.dataset.k, b.dataset.v); }); });
+$("dlNow").addEventListener("click", function () { autoDownload().catch(fail); });
+$("dlClear").addEventListener("click", function () {
+	if (!confirm("Remove every download from this device? Auto-download will get what's next again.")) return;
+	Object.keys(downloads).forEach(function (id) { removeDownload(Number(id), true); });
+	Object.keys(bookDownloads).forEach(function (id) { forgetBookDownload(id); repaintBook(id); });
+	saveBookDownloads();
+	dlChanged();
+});
 $("refresh").addEventListener("click", function () { refreshAll(true); });
 $("settingsBtn").addEventListener("click", function (e) { e.stopPropagation(); openSettings($("settings").hidden); });
 $("bookMenuBtn").addEventListener("click", function (e) { e.stopPropagation(); openBookMenu($("bookMenu").hidden); });
@@ -18442,6 +18714,8 @@ document.addEventListener("visibilitychange", function () {
 	hiddenAt = 0;
 	if (away < 60 * 1000 || !started || !token()) return;
 	resync().catch(function () {});
+	syncEpisodes();
+	if (away > 15 * 60 * 1000) autoSoon(8000);
 });
 async function resync() {
 	await sendPendingReads();
@@ -18453,6 +18727,301 @@ async function resync() {
 	refreshAll(false);
 }
 if ("scrollRestoration" in history) history.scrollRestoration = "manual";
+
+// ---------- offline: auto-download, the Downloads page, the offline bar
+// Auto-download keeps what's next on this device without a tap: the
+// audiobook in the player, the books on the Continue reading shelf (the
+// audiobook where that's what's being listened to), and the newest unplayed
+// episodes of each show. It runs a few seconds after the app opens, when the
+// connection comes back, after an episode is played or a book finished, and
+// every hour while the app is open; one file at a time, quietly (a failure
+// waits for next time). What it got is marked auto, and it's removed again
+// once it isn't wanted (played, finished, or off the shelf); a download made
+// with a tap stays until it's removed. Removing one by hand tells
+// auto-download to leave it be. It stays under the space set on the
+// Downloads page, and leaves room on the device. Files go in Cache Storage
+// through downloadEpisode, downloadBook and downloadAudiobook, the same as a
+// tap; the list of what's here is in localStorage.
+// A web app can't download with the app closed, so this happens while it's
+// open; and Safari only keeps a site's storage for good once it's on the Home
+// Screen (askToKeep asks for that).
+var AUTO_DEFAULT = { on: 1, eps: 1, books: 3, audio: 1, cap: 2048, wifi: 0 };
+var autoCfg = Object.assign({}, AUTO_DEFAULT, readJSON("readerAuto") || {});
+var autoState = { running: false, full: false, last: 0, timer: 0, note: "" };
+var autoSkips = readJSON("readerAutoSkip") || {};
+var MB = 1048576;
+function saveAutoCfg() { store("readerAuto", JSON.stringify(autoCfg)); }
+function autoSkip(id, kind) {
+	autoSkips[(kind === "ep" ? "e" : "b") + id] = Date.now();
+	var keys = Object.keys(autoSkips);
+	if (keys.length > 300) delete autoSkips[keys[0]];
+	store("readerAutoSkip", JSON.stringify(autoSkips));
+}
+function autoUnskip(key) { if (autoSkips[key]) { delete autoSkips[key]; store("readerAutoSkip", JSON.stringify(autoSkips)); } }
+function autoSoon(ms) {
+	clearTimeout(autoState.timer);
+	autoState.timer = setTimeout(function () { autoDownload().catch(function () {}); }, ms == null ? 4000 : ms);
+}
+// Why auto-download can't run just now, or "".
+function autoBlocked() {
+	var c = navigator.connection;
+	if (!autoCfg.on) return "Auto-download is off.";
+	if (!window.caches || !window.ReadableStream) return "This browser can't keep downloads.";
+	if (isNetDown()) return "Waiting for a connection.";
+	if (c && c.saveData) return "Paused while Data Saver is on.";
+	if (autoCfg.wifi && c && c.type === "cellular") return "Paused until you're on Wi-Fi.";
+	return "";
+}
+// Rough sizes before a download says its own: 64 kbps for an audiobook, 128 for an episode.
+function abGuess(au) { return au.size || (au.duration || 36000) * 8000; }
+function epGuess(ep) { return (ep.media_len || 3600) * 16000; }
+function dlSize(x) { return x.dlsize || x.size || 0; }
+function dlUsed() {
+	var n = 0;
+	Object.keys(downloads).forEach(function (id) { n += dlSize(downloads[id]); });
+	Object.keys(bookDownloads).forEach(function (id) { n += dlSize(bookDownloads[id]); });
+	return n;
+}
+// What auto-download wants here, most wanted first: [{key, kind, item, size}].
+async function autoWanted() {
+	var want = [], seen = {};
+	var add = function (kind, item, size) {
+		var key = (kind === "ep" ? "e" : "b") + item.id;
+		if (seen[key] || autoSkips[key]) return;
+		seen[key] = true;
+		want.push({ key: key, kind: kind, item: item, size: size });
+	};
+	var now = player.ep || readJSON("readerNowPlaying");
+	if (!state.books || state.libOffline) await loadBooks();
+	if (now && now.book && autoCfg.audio) {
+		var au = libBook(now.book);
+		if (au && !au.finished_at) add("book", au, abGuess(au));
+	}
+	shelfBooks(libEntries(state.books || [])).filter(function (x) { return !x.next; }).slice(0, autoCfg.books).forEach(function (x) {
+		var b = x.book, lis = shelfListening(b);
+		if (lis) { if (autoCfg.audio) add("book", lis, abGuess(lis)); }
+		else if (!isAudiobook(b)) add("book", b, b.size || 0);
+	});
+	if (autoCfg.eps) {
+		if (now && !now.book && isAudio(now) && !isHosted(now) && !epPlayed(now)) add("ep", now, epGuess(now));
+		var data = await apiJSON("/api/items?view=podcasts&limit=50"), per = {};
+		data.items.map(epFields).forEach(function (ep) {
+			if (!isAudio(ep) || isHosted(ep) || epPlayed(ep)) return;
+			per[ep.feed_id] = (per[ep.feed_id] || 0) + 1;
+			if (per[ep.feed_id] <= autoCfg.eps) add("ep", ep, epGuess(ep));
+		});
+	}
+	return want;
+}
+async function autoDownload() {
+	if (autoState.running || !token()) return;
+	autoState.note = autoBlocked();
+	if (autoState.note) return dlChanged();
+	autoState.running = true;
+	autoState.full = false;
+	dlChanged();
+	try {
+		var want = await autoWanted(), keys = {}, skipped = 0;
+		want.forEach(function (w) { keys[w.key] = true; });
+		var playing = player.ep ? (player.ep.book ? "b" + player.ep.book : "e" + player.ep.id) : "";
+		// No longer wanted: auto ones go (never the one in the player).
+		Object.keys(downloads).forEach(function (id) {
+			if (downloads[id].auto && !keys["e" + id] && playing !== "e" + id && !dlProgress[id]) removeDownload(Number(id), true);
+		});
+		Object.keys(bookDownloads).forEach(function (id) {
+			if (bookDownloads[id].auto && !keys["b" + id] && playing !== "b" + id && !bookDl[id]) { forgetBookDownload(id); repaintBook(id); }
+		});
+		saveBookDownloads();
+		var used = dlUsed(), cap = autoCfg.cap * MB, room = Infinity;
+		try {
+			var est = await navigator.storage.estimate();
+			if (est.quota) room = est.quota - est.usage - 500 * MB;
+		} catch (e) {}
+		for (var i = 0; i < want.length; i++) {
+			var w = want[i];
+			if (w.kind === "ep" ? downloads[w.item.id] : bookDownloads[w.item.id]) continue;
+			if (used + w.size > cap || w.size > room) { skipped++; continue; }
+			if (autoBlocked()) break;
+			used += w.size;
+			room -= w.size;
+			if (w.kind === "ep") await downloadEpisode(w.item, true); else await downloadBook(w.item, true);
+			if (autoState.full) break;
+		}
+		autoState.note = autoState.full ? "Stopped: this device is out of space."
+			: skipped ? skipped + (skipped === 1 ? " item was" : " items were") + " left out to stay under the space for downloads." : "";
+		autoState.last = Date.now();
+	} catch (e) {
+		autoState.note = e.message === UNAUTH ? "" : isOffline(e) ? "Waiting for a connection." : "Couldn't check what to download: " + e.message;
+	} finally {
+		autoState.running = false;
+		dlChanged();
+	}
+}
+
+// Connected or not. navigator.onLine misses a connection that's there but
+// goes nowhere (a plane's Wi-Fi, a dead spot), so a failed request counts
+// too, until one gets through; while it's down, it's tried every 30 seconds.
+var netDown = false, netProbe = 0;
+function isNetDown() { return navigator.onLine === false || netDown; }
+function seenOffline() {
+	if (netDown) return;
+	netDown = true;
+	offlineBar();
+	clearInterval(netProbe);
+	netProbe = setInterval(function () {
+		fetch("/sw.js", { method: "HEAD", cache: "no-store" }).then(function (r) { if (r.ok) seenOnline(); }, function () {});
+	}, 30000);
+}
+function seenOnline() {
+	if (!netDown) return;
+	netDown = false;
+	clearInterval(netProbe);
+	backOnline();
+}
+// Back online: send what was saved while offline, show the whole Library
+// again, and catch up on downloads.
+function backOnline() {
+	offlineBar();
+	if (!token()) return;
+	sendPendingReads();
+	syncEpisodes();
+	loadBooks().catch(function () {});
+	autoSoon(5000);
+}
+window.addEventListener("online", backOnline);
+window.addEventListener("offline", function () { offlineBar(); dlChanged(); });
+// Changes made here that the server hasn't had yet.
+function waitingCount() {
+	return Object.keys(epPending).length + pendingReads().length + Object.keys(bookPending).filter(function (id) {
+		var p = bookPending[id];
+		return p.position !== undefined || p.finished !== undefined || p.layout !== undefined;
+	}).length;
+}
+// The bar under the header while offline; unavailable things are greyed out.
+function offlineBar() {
+	var off = isNetDown(), n = waitingCount();
+	document.documentElement.classList.toggle("offline", off);
+	show($("offBar"), off);
+	if (!off) return;
+	$("offText").textContent = "You're offline. What's downloaded still works" +
+		(n ? "; " + n + (n === 1 ? " change syncs" : " changes sync") + " when you're back." : ", and your place syncs when you're back.");
+}
+
+// Something was downloaded, removed, or started: the header's ring and the
+// Downloads page catch up (once, a moment later).
+var dlChangeTimer = 0;
+function dlChanged() {
+	clearTimeout(dlChangeTimer);
+	dlChangeTimer = setTimeout(function () {
+		paintDlBtn();
+		if (state.route && state.route.name === "downloads") renderDownloads();
+	}, 50);
+}
+// Downloads going now: [{key, kind, item, p}].
+function dlActive() {
+	var out = [];
+	Object.keys(bookDl).forEach(function (id) { out.push({ key: "b" + id, kind: "book", item: libBook(Number(id)) || bookDownloads[id] || { id: Number(id), title: "Book" }, p: bookDl[id] }); });
+	Object.keys(dlProgress).forEach(function (id) { out.push({ key: "e" + id, kind: "ep", item: findEpisode(Number(id)) || { id: Number(id), title: "Episode" }, p: dlProgress[id] }); });
+	return out;
+}
+// The header's ring while anything downloads; it opens the Downloads page.
+function paintDlBtn() {
+	var act = dlActive(), btn = $("dlBtn"), got = 0, total = 0;
+	show(btn, !!act.length);
+	if (!act.length) return;
+	act.forEach(function (a) { got += a.p.got; total += Math.max(a.p.total, a.p.got); });
+	btn.style.setProperty("--p", Math.max(8, total ? Math.min(100, got / total * 100) : 0) + "%");
+	btn.setAttribute("aria-label", "Downloading " + act.length + (act.length === 1 ? " item" : " items") + ". Open Downloads.");
+	btn.title = act.length === 1 ? "Downloading “" + act[0].item.title + "” " + dlLabel(act[0].p) : "Downloading " + act.length + " items";
+}
+// One row's progress, on the Downloads page.
+function paintDlRow(key) {
+	paintDlBtn();
+	var row = document.querySelector("[data-dlrow='" + key + "']");
+	if (!row) return;
+	var id = key.slice(1), p = key[0] === "e" ? dlProgress[id] : bookDl[id], sub = row.querySelector(".dlsub");
+	if (p && sub) sub.textContent = "Downloading · " + dlLabel(p) + (p.total ? " of " + gb(p.total) : "");
+}
+function gb(n) { return n >= 1024 * MB ? (n / 1024 / MB).toFixed(n >= 10240 * MB ? 0 : 1).replace(/\.0$/, "") + " GB" : bytes(n); }
+
+async function showDownloads() {
+	showView("downloads");
+	window.scrollTo(0, 0);
+	document.title = "Downloads — Reader";
+	renderDownloads();
+	if (!state.books && !isNetDown()) loadBooks().then(renderDownloads, function () {});
+}
+var DL_GROUPS = [["audiobook", "Audiobooks"], ["book", "Books"], ["podcast", "Podcasts"], ["video", "Videos"]];
+var dlStorage = null;
+function renderDownloads() {
+	if (!$("downloadsView") || $("downloadsView").hidden) return;
+	var used = dlUsed(), cap = autoCfg.cap * MB, list = $("dlList"), act = dlActive(), busy = {};
+	// The meter: this app's downloads against the space set for them.
+	$("dlUsed").textContent = gb(used);
+	$("dlCap").textContent = "of " + gb(cap) + " used";
+	$("dlFill").style.width = Math.min(100, used / cap * 100) + "%";
+	$("dlFill").classList.toggle("over", used > cap);
+	paintDlStorage();
+	// The settings.
+	document.querySelectorAll("#dlAuto [data-k]").forEach(function (b) { b.setAttribute("aria-pressed", String(String(autoCfg[b.dataset.k]) === b.dataset.v)); });
+	$("dlAutoMore").hidden = !autoCfg.on;
+	var why = autoState.running ? "Checking what to download…" : autoState.note || (autoState.last ? "Up to date as of " + new Date(autoState.last).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) + "." : "");
+	$("dlStatus").textContent = why;
+	$("dlNow").disabled = autoState.running || !autoCfg.on;
+	list.textContent = "";
+	if (act.length) {
+		var ul = h("ul", "dlrows");
+		act.forEach(function (a) { busy[a.key] = true; ul.append(dlRow(a.key, a.kind, a.item)); });
+		list.append(h("h3", "dlgroup", "Downloading"), ul);
+	}
+	var groups = { audiobook: [], book: [], podcast: [], video: [] };
+	Object.keys(bookDownloads).forEach(function (id) { if (!busy["b" + id]) groups[isAudiobook(bookDownloads[id]) ? "audiobook" : "book"].push(bookDownloads[id]); });
+	Object.keys(downloads).forEach(function (id) { if (!busy["e" + id]) groups[isAudio(downloads[id]) ? "podcast" : "video"].push(downloads[id]); });
+	var any = false;
+	DL_GROUPS.forEach(function (g) {
+		var xs = groups[g[0]].sort(function (a, b) { return (b.saved_at || 0) - (a.saved_at || 0); });
+		if (!xs.length) return;
+		any = true;
+		var ul = h("ul", "dlrows"), n = 0;
+		xs.forEach(function (x) { n += dlSize(x); ul.append(dlRow((g[0] === "podcast" || g[0] === "video" ? "e" : "b") + x.id, g[0] === "podcast" || g[0] === "video" ? "ep" : "book", x)); });
+		list.append(h("h3", "dlgroup", g[1] + " · " + gb(n)), ul);
+	});
+	show($("dlEmpty"), !any && !act.length);
+	show($("dlClear"), any);
+}
+async function paintDlStorage() {
+	if (!navigator.storage || !navigator.storage.estimate) return;
+	try {
+		var est = await navigator.storage.estimate(), kept = navigator.storage.persisted ? await navigator.storage.persisted() : false;
+		dlStorage = { free: est.quota - est.usage, kept: kept };
+	} catch (e) { return; }
+	$("dlDevice").textContent = (dlStorage.free > 0 ? gb(dlStorage.free) + " more available to Reader on this device. " : "") +
+		(dlStorage.kept ? "Downloads are kept until you remove them." : "This browser may clear downloads when it's low on space" +
+			(navigator.standalone === false ? ", or after a week unused. Add Reader to your Home Screen to keep them." : "."));
+}
+function dlRow(key, kind, x) {
+	var li = h("li"), main = h("div", "dlmain"), id = Number(key.slice(1)), p = kind === "ep" ? dlProgress[id] : bookDl[id];
+	li.dataset.dlrow = key;
+	var title = h("a", "dlt", x.title || "Untitled");
+	title.href = kind === "ep" ? "#/item/" + id : "#/record/" + ((state.books && libEntry(id)) || x).id;
+	var who = kind === "ep" ? x.feed_title : x.author;
+	var bits = p ? ["Downloading · " + dlLabel(p) + (p.total ? " of " + gb(p.total) : "")]
+		: [who, dlSize(x) ? gb(dlSize(x)) : "", x.auto ? "Auto" : "Kept", kind === "ep" ? epStatus(x) : x.finished_at ? "Finished" : ""];
+	main.append(title, h("span", "dlsub", bits.filter(Boolean).join(" · ")));
+	li.append(main);
+	if (kind === "ep" && !p && isAudio(x)) li.append(playButton(x, true));
+	if (!p) li.append(button("Remove", "btn small", function () {
+		if (kind === "ep") removeDownload(id); else removeBookDownload(x);
+	}));
+	return li;
+}
+function dlSet(k, v) {
+	autoCfg[k] = Number(v);
+	saveAutoCfg();
+	renderDownloads();
+	if (autoCfg.on) autoSoon(800); else clearTimeout(autoState.timer);
+}
+
 
 async function start() {
 	show($("tokenForm"), false);
@@ -18477,9 +19046,12 @@ async function start() {
 	refreshAll(false);
 	checkRequests(true);
 	if (Object.keys(bookPending).length && !state.books) loadBooks().catch(function () {});
+	offlineBar();
+	syncEpisodes();
+	autoSoon(6000);
 }
-// Back online: send places saved while offline, and show the whole Library again.
-window.addEventListener("online", function () { if (token()) loadBooks().catch(function () {}); });
+// Every hour while the app's open, auto-download looks again.
+setInterval(function () { if (document.visibilityState === "visible" && started) autoSoon(0); }, 3600 * 1000);
 
 // The page lives at "/" and routes by the hash. Opened at a path instead
 // (reader.example/book/12), that path is the route: #/book/12.
