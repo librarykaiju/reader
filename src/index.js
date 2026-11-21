@@ -8342,6 +8342,26 @@ self.addEventListener("fetch", function (e) {
 		}));
 		return;
 	}
+	// A downloaded audiobook or episode (the page plays it from here): from
+	// Cache Storage, a range at a time as the player asks, so seeking works
+	// and a long book isn't read into memory whole.
+	if (req.method === "GET" && url.origin === location.origin && /^\\/(abfile|episode)\\//.test(url.pathname)) {
+		e.respondWith(caches.match(url.origin + url.pathname).then(function (hit) {
+			if (!hit) return new Response("Not on this device", { status: 404 });
+			var range = /^bytes=(\\d*)-(\\d*)$/.exec(req.headers.get("Range") || "");
+			if (!range) return hit;
+			return hit.blob().then(function (blob) {
+				var size = blob.size, start, end;
+				if (range[1] === "") { start = Math.max(0, size - Number(range[2])); end = size - 1; }
+				else { start = Number(range[1]); end = range[2] ? Math.min(Number(range[2]), size - 1) : size - 1; }
+				if (start >= size || end < start) return new Response("", { status: 416, headers: { "Content-Range": "bytes */" + size } });
+				return new Response(blob.slice(start, end + 1), { status: 206, headers: {
+					"Content-Type": hit.headers.get("Content-Type") || "audio/mpeg", "Content-Range": "bytes " + start + "-" + end + "/" + size,
+					"Content-Length": String(end - start + 1), "Accept-Ranges": "bytes" } });
+			});
+		}));
+		return;
+	}
 	if (req.method !== "GET" || url.origin !== location.origin || url.pathname !== "/") return;
 	e.respondWith(fetch(req).then(function (res) {
 		if (res.ok) { var copy = res.clone(); caches.open(SHELL).then(function (c) { return c.put("/", copy); }); }
@@ -12673,14 +12693,21 @@ function hostedSrc(ep, at) {
 // Downloads
 async function episodeSrc(ep, bar) {
 	if (downloads[ep.id] && window.caches) {
+		var res, missing = false;
 		try {
-			var res = await (await caches.open(EP_CACHE)).match(epKey(ep.id));
+			res = await (await caches.open(EP_CACHE)).match(epKey(ep.id));
+			missing = !res;
+			// Through the service worker, a piece at a time, when it's there.
+			if (res && navigator.serviceWorker && navigator.serviceWorker.controller) return epKey(ep.id);
 			if (res) return URL.createObjectURL(await res.blob());
 		} catch (e) {}
-		// The browser cleared it (low on space, or unused for a while).
-		delete downloads[ep.id];
-		saveDownloads();
-		repaintEpisode(ep.id);
+		// The browser cleared it (low on space, or unused for a while). Only
+		// then: a read that failed this once doesn't throw the download away.
+		if (missing) {
+			delete downloads[ep.id];
+			saveDownloads();
+			repaintEpisode(ep.id);
+		}
 	}
 	// The player bar's through /media once it goes through Web Audio, or will (voice boost).
 	if (bar && (voice.level || voice.src)) {
@@ -13580,9 +13607,10 @@ function repaintRecord() {
 var listenCache = {};
 async function listenInfo(id) {
 	var c = listenCache[id];
-	if (c && c.expires - Date.now() > 10 * 60 * 1000) return c;
-	// Downloaded: its files are on this device, so nothing to ask for.
+	// Downloaded: its files are on this device, so nothing to ask for (even
+	// if streamed addresses were fetched before the download finished).
 	var kept = bookDownloads[id] && bookDownloads[id].ab;
+	if (c && (c.local || !kept) && c.expires - Date.now() > 10 * 60 * 1000) return c;
 	if (kept && window.caches) return listenCache[id] = { local: true, duration: kept.duration, chapters: kept.chapters, expires: Infinity,
 		files: kept.files.map(function (f) { return { duration: f.duration, local: true }; }) };
 	return listenCache[id] = await apiJSON("/api/books/" + id + "/listen");
@@ -13593,18 +13621,25 @@ async function listenInfo(id) {
 var abUrl = {};
 async function localAbSrc(id, n) {
 	if (abUrl.id === id && abUrl.n === n) return abUrl.url;
+	var res;
+	try { res = await (await caches.open(BOOK_CACHE)).match(abKey(id, n)); }
+	catch (e) { return null; }
+	if (!res) {
+		// Really gone (the browser cleared it): forgotten, so it streams.
+		forgetBookDownload(id);
+		saveBookDownloads();
+		repaintBook(id);
+		return null;
+	}
+	// The service worker plays it straight from storage, a piece at a time
+	// (a whole .m4b read into memory can fail on an iPhone).
+	if (navigator.serviceWorker && navigator.serviceWorker.controller) return abKey(id, n);
 	try {
-		var res = await (await caches.open(BOOK_CACHE)).match(abKey(id, n));
-		if (res) {
-			if (abUrl.url) URL.revokeObjectURL(abUrl.url);
-			abUrl = { id: id, n: n, url: URL.createObjectURL(await res.blob()) };
-			return abUrl.url;
-		}
-	} catch (e) {}
-	forgetBookDownload(id);
-	saveBookDownloads();
-	repaintBook(id);
-	return null;
+		var url = URL.createObjectURL(await res.blob());
+		if (abUrl.url) URL.revokeObjectURL(abUrl.url);
+		abUrl = { id: id, n: n, url: url };
+		return url;
+	} catch (e) { return null; }
 }
 function playingBook(au) { return !!(player.ep && player.ep.book === au.id); }
 function audioPos(au) {
@@ -14625,8 +14660,10 @@ function setPosition(b, value, keepalive) {
 // The file: this device's copy if there is one, else from the Worker.
 async function bookFileRes(b) {
 	if (bookDownloads[b.id] && window.caches) {
+		var missing = false;
 		try {
 			var res = await (await caches.open(BOOK_CACHE)).match(bookKey(b.id));
+			missing = !res;
 			if (res) {
 				b.last_opened_at = Date.now();
 				queueBook(b.id, { opened: 1 });
@@ -14634,9 +14671,9 @@ async function bookFileRes(b) {
 				return res;
 			}
 		} catch (e) {}
-		// The browser cleared it (low on space, or unused for a while).
-		forgetBookDownload(b.id);
-		saveBookDownloads();
+		// The browser cleared it (low on space, or unused for a while). Only
+		// then: a read that failed this once doesn't throw the download away.
+		if (missing) { forgetBookDownload(b.id); saveBookDownloads(); }
 	}
 	try { res = await api("/api/books/" + b.id + "/file"); }
 	catch (e) { throw isOffline(e) ? new Error("You're offline, and this book isn't downloaded on this device.") : e; }
@@ -18749,6 +18786,18 @@ var AUTO_DEFAULT = { on: 1, eps: 1, books: 3, audio: 1, cap: 2048, wifi: 0 };
 var autoCfg = Object.assign({}, AUTO_DEFAULT, readJSON("readerAuto") || {});
 var autoState = { running: false, full: false, last: 0, timer: 0, note: "" };
 var autoSkips = readJSON("readerAutoSkip") || {};
+// Downloads auto-download tried and didn't finish (a phone's connection
+// dropping, the app put away): {key: {n, at}}. Each waits before trying
+// again, 30 minutes after the first failure, then twice as long each time,
+// up to 12 hours; so one that keeps failing isn't started over and over.
+var autoFails = readJSON("readerAutoFails") || {};
+function autoFailWait(f) { return Math.min(12 * 3600e3, 30 * 60e3 * Math.pow(2, f.n - 1)); }
+function autoResting(key) { var f = autoFails[key]; return !!f && Date.now() - f.at < autoFailWait(f); }
+function autoFailed(key, ok) {
+	if (ok) delete autoFails[key];
+	else autoFails[key] = { n: ((autoFails[key] || {}).n || 0) + 1, at: Date.now() };
+	store("readerAutoFails", Object.keys(autoFails).length ? JSON.stringify(autoFails) : null);
+}
 var MB = 1048576;
 function saveAutoCfg() { store("readerAuto", JSON.stringify(autoCfg)); }
 function autoSkip(id, kind) {
@@ -18837,18 +18886,24 @@ async function autoDownload() {
 			var est = await navigator.storage.estimate();
 			if (est.quota) room = est.quota - est.usage - 500 * MB;
 		} catch (e) {}
+		var resting = 0;
 		for (var i = 0; i < want.length; i++) {
 			var w = want[i];
-			if (w.kind === "ep" ? downloads[w.item.id] : bookDownloads[w.item.id]) continue;
+			if (w.kind === "ep" ? downloads[w.item.id] : bookDownloads[w.item.id]) { if (autoFails[w.key]) autoFailed(w.key, true); continue; }
+			if (autoResting(w.key)) { resting++; continue; }
 			if (used + w.size > cap || w.size > room) { skipped++; continue; }
 			if (autoBlocked()) break;
 			used += w.size;
 			room -= w.size;
 			if (w.kind === "ep") await downloadEpisode(w.item, true); else await downloadBook(w.item, true);
+			var got = !!(w.kind === "ep" ? downloads[w.item.id] : bookDownloads[w.item.id]);
+			autoFailed(w.key, got);
+			if (!got) resting++;
 			if (autoState.full) break;
 		}
 		autoState.note = autoState.full ? "Stopped: this device is out of space."
-			: skipped ? skipped + (skipped === 1 ? " item was" : " items were") + " left out to stay under the space for downloads." : "";
+			: [skipped ? skipped + (skipped === 1 ? " item was" : " items were") + " left out to stay under the space for downloads." : "",
+				resting ? resting + (resting === 1 ? " download didn't finish and tries" : " downloads didn't finish and try") + " again later." : ""].filter(Boolean).join(" ");
 		autoState.last = Date.now();
 	} catch (e) {
 		autoState.note = e.message === UNAUTH ? "" : isOffline(e) ? "Waiting for a connection." : "Couldn't check what to download: " + e.message;
