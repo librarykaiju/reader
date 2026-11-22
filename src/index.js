@@ -5220,6 +5220,9 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 	.chapdlg { width: min(480px, calc(100vw - 32px)); max-height: min(560px, calc(100vh - 80px)); padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); color: var(--fg); box-shadow: 0 10px 30px rgba(0,0,0,.25); }
 	.chapdlg[open] { display: flex; flex-direction: column; }
 	.chapdlg::backdrop { background: rgba(0,0,0,.4); }
+	/* Up above the iPhone keyboard while a box in it has the cursor (top and max-height set by the script). */
+	dialog.kbup { margin: 0 auto; bottom: auto; overflow-y: auto; }
+	dialog.kbup > * { flex-shrink: 0; }
 	.chapdlghd { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 	.chapdlghd h2 { font: 600 13px/1.3 var(--sans); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0; }
 	.chapdlghd .x { appearance: none; min-width: 40px; min-height: 40px; border: 0; background: none; color: var(--accent); font-size: 24px; cursor: pointer; }
@@ -5598,6 +5601,34 @@ const FAMILY_PAGE = String.raw`<!doctype html>
 </div>
 <script nonce="__NONCE__">
 var $ = function (id) { return document.getElementById(id); };
+// A panel's text box above the keyboard. An iPhone's keyboard covers the
+// bottom of the screen without making the page any shorter, so a panel
+// centred on the screen (a bookmark's note) ends up under it. While the
+// keyboard is up and a box in an open panel has the cursor, the panel moves
+// to the top of the part still showing and shrinks to fit there, its box
+// scrolled into sight. A computer never has the keyboard up, so nothing
+// changes there.
+(function () {
+	var vv = window.visualViewport, held = null;
+	if (!vv) return;
+	var fit = function () {
+		var f = document.activeElement, dlg = f && /^(TEXTAREA|INPUT)$/.test(f.tagName) ? f.closest("dialog[open]") : null;
+		if (dlg && vv.height * vv.scale > document.documentElement.clientHeight - 80) dlg = null;
+		if (held && held !== dlg) { held.classList.remove("kbup"); held.style.top = held.style.maxHeight = ""; }
+		held = dlg;
+		if (!dlg) return;
+		dlg.classList.add("kbup");
+		dlg.style.top = Math.round(vv.offsetTop + 8) + "px";
+		dlg.style.maxHeight = Math.round(vv.height - 16) + "px";
+		f.scrollIntoView({ block: "nearest" });
+	};
+	var soon = function () { setTimeout(fit, 60); };
+	vv.addEventListener("resize", fit);
+	vv.addEventListener("scroll", fit);
+	document.addEventListener("focusin", soon);
+	document.addEventListener("focusout", soon);
+	document.addEventListener("close", soon, true);
+})();
 function h(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
 function say(msg) { $("note").textContent = msg; $("note").hidden = !msg; }
 var FORMATS = { epub: "EPUB", pdf: "PDF", cbz: "Comics", txt: "Text", audiobook: "Audiobooks" };
@@ -8838,6 +8869,9 @@ const PAGE = String.raw`<!doctype html>
 	.chapdlg { width: min(480px, calc(100vw - 32px)); max-height: min(560px, calc(100vh - 80px)); padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); color: var(--fg); font-family: var(--sans); box-shadow: 0 10px 30px rgba(0,0,0,.25); }
 	.chapdlg[open] { display: flex; flex-direction: column; }
 	.chapdlg::backdrop { background: rgba(0,0,0,.4); }
+	/* Up above the iPhone keyboard while a box in it has the cursor (top and max-height set by the script). */
+	dialog.kbup { margin: 0 auto; bottom: auto; overflow-y: auto; }
+	dialog.kbup > * { flex-shrink: 0; }
 	.chapdlghd { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 	.chapdlghd h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0; }
 	.chapdlghd .btn { min-width: 40px; min-height: 40px; font-size: 20px; }
@@ -9752,6 +9786,34 @@ const PAGE = String.raw`<!doctype html>
 
 <script nonce="__NONCE__">
 var $ = function (id) { return document.getElementById(id); };
+// A panel's text box above the keyboard. An iPhone's keyboard covers the
+// bottom of the screen without making the page any shorter, so a panel
+// centred on the screen (a bookmark's note) ends up under it. While the
+// keyboard is up and a box in an open panel has the cursor, the panel moves
+// to the top of the part still showing and shrinks to fit there, its box
+// scrolled into sight. A computer never has the keyboard up, so nothing
+// changes there.
+(function () {
+	var vv = window.visualViewport, held = null;
+	if (!vv) return;
+	var fit = function () {
+		var f = document.activeElement, dlg = f && /^(TEXTAREA|INPUT)$/.test(f.tagName) ? f.closest("dialog[open]") : null;
+		if (dlg && vv.height * vv.scale > document.documentElement.clientHeight - 80) dlg = null;
+		if (held && held !== dlg) { held.classList.remove("kbup"); held.style.top = held.style.maxHeight = ""; }
+		held = dlg;
+		if (!dlg) return;
+		dlg.classList.add("kbup");
+		dlg.style.top = Math.round(vv.offsetTop + 8) + "px";
+		dlg.style.maxHeight = Math.round(vv.height - 16) + "px";
+		f.scrollIntoView({ block: "nearest" });
+	};
+	var soon = function () { setTimeout(fit, 60); };
+	vv.addEventListener("resize", fit);
+	vv.addEventListener("scroll", fit);
+	document.addEventListener("focusin", soon);
+	document.addEventListener("focusout", soon);
+	document.addEventListener("close", soon, true);
+})();
 var PDFJS = "__PDFJS__";
 // For HLS (.m3u8) video where the browser can't play it itself (everything but Safari).
 var HLSJS = { src: "https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js", integrity: "sha384-cciJ0zi8d1uMKC2zJd7jvPY4HQt7W4ByUI/FlMkltvBi31aW61rcpVBhpmW8/NwX" };
