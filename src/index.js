@@ -12721,8 +12721,6 @@ async function episodeSrc(ep, bar) {
 		try {
 			res = await (await caches.open(EP_CACHE)).match(epKey(ep.id));
 			missing = !res;
-			// Through the service worker, a piece at a time, when it's there.
-			if (res && navigator.serviceWorker && navigator.serviceWorker.controller) return epKey(ep.id);
 			if (res) return URL.createObjectURL(await res.blob());
 		} catch (e) {}
 		// The browser cleared it (low on space, or unused for a while). Only
@@ -13631,13 +13629,19 @@ function repaintRecord() {
 var listenCache = {};
 async function listenInfo(id) {
 	var c = listenCache[id];
-	// Downloaded: its files are on this device, so nothing to ask for (even
-	// if streamed addresses were fetched before the download finished).
-	var kept = bookDownloads[id] && bookDownloads[id].ab;
-	if (c && (c.local || !kept) && c.expires - Date.now() > 10 * 60 * 1000) return c;
-	if (kept && window.caches) return listenCache[id] = { local: true, duration: kept.duration, chapters: kept.chapters, expires: Infinity,
-		files: kept.files.map(function (f) { return { duration: f.duration, local: true }; }) };
-	return listenCache[id] = await apiJSON("/api/books/" + id + "/listen");
+	var kept = window.caches && bookDownloads[id] && bookDownloads[id].ab;
+	var local = function () {
+		return listenCache[id] = { local: true, duration: kept.duration, chapters: kept.chapters, expires: Date.now() + 15 * 60 * 1000,
+			files: kept.files.map(function (f) { return { duration: f.duration, local: true }; }) };
+	};
+	if (c && c.expires - Date.now() > 10 * 60 * 1000 && !(c.local && !isNetDown())) return c;
+	// Online, it streams as it always has, downloaded or not: an iPhone can
+	// play the downloaded copy (served by the service worker) without sound,
+	// so the copy on the device is for when there's no connection, or the
+	// home server is down.
+	if (kept && isNetDown()) return local();
+	try { return listenCache[id] = await apiJSON("/api/books/" + id + "/listen"); }
+	catch (e) { if (kept && e.message !== UNAUTH) return local(); throw e; }
 }
 // A downloaded audiobook's file n, as an address the player can play (one
 // at a time, so a long book's file isn't held twice). Null if the browser
