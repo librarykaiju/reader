@@ -7526,6 +7526,17 @@ function previewAudio(sess, b, d) {
 	audio.addEventListener("error", function () {
 		if (onPage() && audio.error) $("pvNote").textContent = "This audiobook couldn't play just now. The home server may be offline, so try again later.";
 	});
+	// The home server can take the request and never answer, which isn't an
+	// error: playing with nothing loaded after 15 seconds says so too.
+	var stuck = null;
+	audio.addEventListener("play", function () {
+		clearTimeout(stuck);
+		if (audio.readyState >= 1) return;
+		var src = audio.src;
+		stuck = setTimeout(function () {
+			if (audio.src === src && audio.readyState < 1 && !audio.paused && onPage()) $("pvNote").textContent = "The home server isn't answering, so this audiobook can't play just now. Try again later.";
+		}, 15000);
+	});
 
 	var btn = function (cls, html, label, fn) {
 		var x = h("button", cls);
@@ -13276,8 +13287,13 @@ function smartRewind() {
 		if (ab && ab.pending != null) { if (ab.pending > 0) audio.currentTime = ab.pending; ab.pending = null; }
 	});
 	audio.addEventListener("error", function () {
-		if (player.ab && audio.error) playFailed();
+		var ab = player.ab;
+		if (!ab || !audio.error) return;
+		// A streamed file failing: the copy on this device, if there is one.
+		if (ab.cur >= 0 && !ab.files[ab.cur].local && abKept(ab.id)) return abStreamDown(ab, "audio error " + audio.error.code);
+		playFailed();
 	});
+	audio.addEventListener("play", abWatch);
 	audio.addEventListener("timeupdate", function () { renderPlayer(); saveEpisodePos(false); });
 	audio.addEventListener("pause", function () { saveEpisodePos(true); keepPause(); });
 	audio.addEventListener("play", smartRewind);
@@ -13700,10 +13716,7 @@ var listenCache = {};
 async function listenInfo(id) {
 	var c = listenCache[id];
 	var kept = window.caches && bookDownloads[id] && bookDownloads[id].ab;
-	var local = function () {
-		return listenCache[id] = { local: true, duration: kept.duration, chapters: kept.chapters, expires: Date.now() + 15 * 60 * 1000,
-			files: kept.files.map(function (f) { return { duration: f.duration, local: true }; }) };
-	};
+	var local = function () { return abLocalInfo(id, kept); };
 	if (c && c.expires - Date.now() > 10 * 60 * 1000 && !(c.local && !isNetDown())) return c;
 	// Online, it streams as it always has, downloaded or not: an iPhone can
 	// play the downloaded copy (served by the service worker) without sound,
@@ -13712,6 +13725,47 @@ async function listenInfo(id) {
 	if (kept && isNetDown()) return local();
 	try { return listenCache[id] = await apiJSON("/api/books/" + id + "/listen"); }
 	catch (e) { if (kept && e.message !== UNAUTH) return local(); throw e; }
+}
+function abLocalInfo(id, kept) {
+	return listenCache[id] = { local: true, duration: kept.duration, chapters: kept.chapters, expires: Date.now() + 15 * 60 * 1000,
+		files: kept.files.map(function (f) { return { duration: f.duration, local: true }; }) };
+}
+// The stream not starting. The home server (or its tunnel) can take the
+// request and never answer, which the player doesn't count as an error, so
+// it would sit at the start for good while Reader's own server answers fine.
+// Playing with nothing loaded after 15 seconds, or a streamed file failing:
+// a book downloaded on this device plays from there instead, from the same
+// place (for 15 minutes, then the stream is tried again); one that isn't
+// says the home server isn't answering.
+var abWatchTimer = null;
+function abWatch() {
+	clearTimeout(abWatchTimer);
+	var ab = player.ab, audio = $("pAudio");
+	if (!ab || ab.cur < 0 || ab.files[ab.cur].local || audio.readyState >= 1) return;
+	var cur = ab.cur, src = audio.src;
+	abWatchTimer = setTimeout(function () {
+		if (player.ab !== ab || ab.cur !== cur || audio.src !== src || audio.readyState >= 1 || audio.paused || soft) return;
+		abStreamDown(ab, "nothing from the home server in 15 s");
+	}, 15000);
+}
+// The copy on this device, when it can play: the service worker puts a
+// download kept in pieces together, so without it only a whole file can.
+function abKept(id) {
+	var kept = window.caches && bookDownloads[id] && bookDownloads[id].ab;
+	if (!kept) return null;
+	var sw = navigator.serviceWorker && navigator.serviceWorker.controller;
+	return sw || !kept.files.some(function (f) { return f.pieces; }) ? kept : null;
+}
+// -> whether it went to the copy on this device.
+function abStreamDown(ab, why) {
+	var audio = $("pAudio"), kept = abKept(ab.id);
+	clearTimeout(abWatchTimer);
+	plog("stream didn't start (" + why + ")" + (kept ? ", playing the copy on this device" : ""));
+	if (!kept) { toast("The home server isn't answering, so this audiobook can't play just now. Try again later."); return false; }
+	abLocalInfo(ab.id, kept);
+	ab.files.forEach(function (f) { f.local = true; });
+	abLoad(ab.cur, ab.pending != null ? ab.pending : audio.currentTime || 0, true);
+	return true;
 }
 // A downloaded audiobook's file n, as an address the player can play (one
 // at a time, so a long book's file isn't held twice). Null if the browser
@@ -13863,7 +13917,7 @@ async function abLoad(n, at, play) {
 	audio.src = src;
 	audio.playbackRate = player.rate;
 	audio.load();
-	if (play) await audio.play().catch(playFailed);
+	if (play) { abWatch(); await audio.play().catch(playFailed); }
 }
 // Saved like a reading place: here at once, on the book every 15 seconds and
 // on pause, the end, or leaving the page.
