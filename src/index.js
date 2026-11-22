@@ -12980,7 +12980,13 @@ async function playEpisode(ep, start) {
 }
 function playFailed(e) {
 	if (e && e.name === "AbortError") return;
-	if (player.ep && player.ep.book) return toast("Couldn't play this audiobook. The home server may be offline, so try again later.");
+	var audio = $("pAudio"), src = audio.currentSrc || audio.src || "";
+	plog("play failed: " + (e ? e.name + (e.message ? " (" + e.message + ")" : "") : "audio error " + (audio.error ? audio.error.code : "?")) +
+		", from " + (!src ? "nothing" : src.indexOf("/listen/") >= 0 ? "the home server" : src.indexOf("/abfile/") >= 0 ? "this device" : src.indexOf("blob:") === 0 ? "this device (blob)" : "elsewhere"));
+	// The phone not counting it as a tap (the audiobook's details came after
+	// the tap's moment had passed) isn't the home server's doing.
+	if (e && e.name === "NotAllowedError") return toast("Tap play again to start it.");
+	if (player.ep && player.ep.book) return toast(isNetDown() ? "You're offline, and this audiobook isn't downloaded." : "Couldn't play this audiobook. The home server may be offline, so try again later.");
 	toast(navigator.onLine === false && !downloads[player.ep && player.ep.id] ? "You're offline, and this episode isn't downloaded." : "Couldn't play this episode.");
 }
 function renderPlayer() {
@@ -13181,6 +13187,8 @@ function msPlayState(s) { try { navigator.mediaSession.playbackState = s; } catc
 document.addEventListener("visibilitychange", function () { if (document.visibilityState === "visible") softEnd(false); });
 function smartRewind() {
 	var audio = $("pAudio"), ep = player.ep, p = null;
+	// primeAudio's play on the empty player isn't listening yet.
+	if (!audio.src) return;
 	try { p = JSON.parse(read("readerPause") || "null"); } catch (e) {}
 	store("readerPause", null);
 	if (!p || !ep || p.id !== ep.id) return;
@@ -13228,7 +13236,7 @@ function smartRewind() {
 	$("pPlay").addEventListener("click", function () {
 		if (!player.ep) return;
 		if (player.ep.book && audio.paused) { var au = libBook(player.ep.book); if (au && readAhead(au)) return listenTo(au); }
-		if (!audio.src) return playEpisode(player.ep, true).catch(fail);
+		if (!audio.src) { primeAudio(); return playEpisode(player.ep, true).catch(fail); }
 		if (audio.paused) audio.play().catch(playFailed); else audio.pause();
 	});
 	$("pBack").addEventListener("click", function () { skip(-15); });
@@ -13685,9 +13693,20 @@ function listenLabel(au) {
 	if ((au.duration && t >= au.duration - 1) || (au.finished_at && t <= 5)) return "Listen again";
 	return t > 5 ? "Resume listening · " + hours(Math.max(0, (au.duration || 0) - t)) + " left" : "Listen";
 }
+// An iPhone lets a page start audio only inside a tap. An audiobook's
+// details (its addresses) are fetched after the tap, and by the time they
+// come the tap can be spent, and the play is refused. A play started on the
+// empty player during the tap itself lets that player start later, so the
+// fetched book plays. Only with nothing loaded, so nothing is heard.
+function primeAudio() {
+	var audio = $("pAudio");
+	if (audio.src || !audio.paused) return;
+	try { var p = audio.play(); if (p && p.catch) p.catch(function () {}); } catch (e) {}
+}
 function listenTo(au, at) {
 	var audio = $("pAudio");
 	if (voice.level) voiceCtx();
+	primeAudio();
 	var ahead = at == null && (!playingBook(au) || audio.paused) ? readAhead(au) : null;
 	if (ahead) { readAheadToast(au, ahead); at = ahead.t; }
 	if (at == null && playingBook(au) && player.ab && audio.src && !audio.ended) {
