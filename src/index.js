@@ -1031,14 +1031,6 @@ async function addItems(request, env) {
 			).bind(feedId, JSON.stringify(media)),
 		);
 	}
-	// Prune: unsaved items first seen over 90 days ago that the feed no longer
-	// lists. (Ones it still lists would just come back as unread next time.)
-	stmts.push(
-		env.DB.prepare(
-			`DELETE FROM items WHERE feed_id = ? AND saved = 0 AND created_at < ?
-			AND guid NOT IN (SELECT value FROM json_each(?))`,
-		).bind(feedId, now - PRUNE_AFTER_MS, JSON.stringify([...seen])),
-	);
 	// The feed's artwork (a podcast's cover), as the page found it.
 	const image = httpUrl(body.image);
 	stmts.push(
@@ -1048,8 +1040,20 @@ async function addItems(request, env) {
 	);
 	const results = await env.DB.batch(stmts);
 	const inserted = results.slice(0, clean.length).reduce((n, r) => n + (r.meta?.changes || 0), 0);
+	// Most refreshes bring nothing new, and then there's nothing to prune or
+	// group: both read the feed's rows, and every feed is refreshed on each
+	// open, so they wait for a refresh that added something.
+	if (!inserted) return json({ inserted, pruned: 0 });
+	// Prune: unsaved items first seen over 90 days ago that the feed no longer
+	// lists. (Ones it still lists would just come back as unread next time.)
+	const pruned = await env.DB.prepare(
+		`DELETE FROM items WHERE feed_id = ? AND saved = 0 AND created_at < ?
+		AND guid NOT IN (SELECT value FROM json_each(?))`,
+	)
+		.bind(feedId, now - PRUNE_AFTER_MS, JSON.stringify([...seen]))
+		.run();
 	await groupStories(env, feedId, now);
-	return json({ inserted, pruned: results[clean.length + (media.length ? 1 : 0)].meta?.changes || 0 });
+	return json({ inserted, pruned: pruned.meta?.changes || 0 });
 }
 
 // ---------------------------------------------------------------------------
@@ -2790,7 +2794,6 @@ function lazyClassOf(subjects) {
 	const [best] = [...votes].sort((a, b) => b[1].n - a[1].n || b[1].at - a[1].at)[0];
 	return { names: [LAZY_CLASSES[best]], fact };
 }
-const LAZY_TAG = /^[0-9]00 /;
 // The class tags a book should have, given its subjects and genre names:
 // [] for a story, else its class (or classes) plus Nonfiction. Middle Grade and Young Adult
 // books need more than a class to count (a kids' book about animals is

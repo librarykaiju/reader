@@ -78,6 +78,7 @@ CREATE INDEX IF NOT EXISTS items_media ON items (COALESCE(published_at, created_
 CREATE INDEX IF NOT EXISTS items_story ON items (story_id) WHERE story_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS items_unread ON items (COALESCE(published_at, created_at) DESC, id DESC) WHERE read = 0;
 CREATE INDEX IF NOT EXISTS items_articles ON items (feed_id) WHERE media_url IS NULL;
+CREATE INDEX IF NOT EXISTS items_feed_created ON items (feed_id, created_at);
 
 -- position is JSON text: {"f": 0.42} for .txt (fraction of the text),
 -- {"page": 12, "pf": 0.3, "pages": 80, "f": 0.14} for .pdf; NULL = the start.
@@ -130,6 +131,7 @@ CREATE TABLE IF NOT EXISTS books (
 
 CREATE UNIQUE INDEX IF NOT EXISTS books_abs_id ON books (abs_id) WHERE abs_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS books_abs_ebook ON books (abs_ebook) WHERE abs_ebook IS NOT NULL;
+CREATE INDEX IF NOT EXISTS books_opened ON books (last_opened_at DESC, id DESC) WHERE last_opened_at IS NOT NULL;
 
 -- Tags for feeds. A feed can carry any number of them, and the page filters
 -- the feed and item lists by one. Names are unique ignoring case. Removing a
