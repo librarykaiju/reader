@@ -56,6 +56,9 @@
 //   GET    /api/items?view=unread|saved|all|podcasts|videos&feed=&tag=&before=&limit=
 //                                  newest first -> {"items", "next"} (tag=0: untagged feeds);
 //                                  Unread and All list a story once, with its other items in related
+//                                  (view=top&tag=: the stories the most feeds covered in the last day, most first,
+//                                  each its lead article with sources (how many feeds) and the other feeds' articles
+//                                  in related, plus parsed, how many articles it looked at; see "Top stories")
 //   POST   /api/items              {feed_id, items: [...], image?} -- one feed's refresh (image: its artwork)
 //                                  (podcasts/videos: each with notes, a short plain-text preview of its show notes)
 //   GET    /api/items/:id          one item, with its content
@@ -837,7 +840,8 @@ const ITEM_LIST_COLUMNS = `i.id, i.feed_id, f.title AS feed_title, i.title, i.li
 async function listItems(env, url) {
 	const sp = url.searchParams;
 	const view = sp.get("view") || "unread";
-	if (!VIEWS[view]) throw new HttpError(400, "view must be unread, saved, all, podcasts, or videos");
+	if (view === "top") return topStories(env, sp);
+	if (!VIEWS[view]) throw new HttpError(400, "view must be unread, top, saved, all, podcasts, or videos");
 	const where = [VIEWS[view]];
 	const params = [];
 	// Podcast episodes and videos live in their own tabs (and their own feed), not in Unread or All.
@@ -1333,6 +1337,141 @@ function findCoverage(target, pool) {
 		if (!prev || score > prev.score) best.set(it.feed_id, { id: it.id, score });
 	}
 	return [...best.values()].sort((a, b) => b.score - a.score).slice(0, COVERAGE_MAX_SOURCES - 1);
+}
+
+// ---------------------------------------------------------------------------
+// Top stories: the stories the most feeds are covering in the last day, the
+// idea of TopStoryReview (github.com/cjtrowbridge/TopStoryReview), written
+// fresh for Reader. GET /api/items?view=top looks at every article (no
+// episodes or videos) from the last TOP_WINDOW_MS, in one tag if one is
+// picked, and matches them across feeds by the same words and weights as
+// Coverage above. Then, like TopStoryReview's "most popular word, take those
+// headlines out, go again", it takes the article that the most other feeds
+// match, makes a story of it and its best match in each of those feeds,
+// sets them all aside, and goes again. Taking the best match per feed from
+// one article, instead of following match to match, keeps two stories that
+// share a few words from running together. A story needs at least two feeds;
+// the list is the TOP_MAX with the most, then the newest. No AI and nothing
+// stored: it's worked out each time the tab opens.
+
+const TOP_WINDOW_MS = 24 * 60 * 60 * 1000;
+const TOP_POOL = 1500;
+const TOP_MAX = 12;
+
+// Stories from items ({id, feed_id, title, link, excerpt, at}) -> [{lead, members: [ids, lead first], feeds}],
+// most feeds first.
+function findTopStories(items) {
+	const n = items.length;
+	const terms = items.map(coverageTerms);
+	const df = new Map();
+	for (const t of terms) for (const w of t.keys()) df.set(w, (df.get(w) || 0) + 1);
+	// Candidate pairs come from the rarer words (a word in a twentieth of the
+	// day's articles would pair hundreds of them); each candidate is then
+	// scored on every word it shares, as findCoverage does.
+	const common = Math.max(20, Math.ceil(n / 20));
+	const byWord = new Map();
+	terms.forEach((t, i) => {
+		for (const [w, weight] of t) {
+			const d = df.get(w);
+			if (weight >= 0.5 && d > 1 && d <= common) (byWord.get(w) || byWord.set(w, []).get(w)).push(i);
+		}
+	});
+	const seen = new Set();
+	const near = items.map(() => new Map());
+	for (const list of byWord.values())
+		for (let a = 0; a < list.length; a++)
+			for (let b = a + 1; b < list.length; b++) {
+				const i = list[a], j = list[b];
+				if (items[i].feed_id === items[j].feed_id) continue;
+				const key = i < j ? i * n + j : j * n + i;
+				if (seen.has(key)) continue;
+				seen.add(key);
+				let shared = 0, score = 0;
+				for (const [w, x] of terms[i]) {
+					const y = terms[j].get(w);
+					if (y === undefined || df.get(w) >= n) continue;
+					if (Math.max(x, y) >= 0.5) shared++;
+					score += Math.log(n / df.get(w)) * Math.min(x, y);
+				}
+				if (shared < COVERAGE_MIN_WORDS || score < COVERAGE_MIN_SCORE) continue;
+				near[i].set(j, score);
+				near[j].set(i, score);
+			}
+	const taken = new Uint8Array(n);
+	// An article's best match in each other feed, among those not set aside.
+	const reach = (i) => {
+		const best = new Map();
+		for (const [j, s] of near[i]) {
+			if (taken[j]) continue;
+			const f = items[j].feed_id, prev = best.get(f);
+			if (!prev || s > prev.s) best.set(f, { j, s });
+		}
+		let sum = 0;
+		for (const b of best.values()) sum += b.s;
+		return { best, sum };
+	};
+	const stories = [];
+	for (;;) {
+		let seed = -1, top = null;
+		for (let i = 0; i < n; i++) {
+			if (taken[i] || !near[i].size) continue;
+			const r = reach(i);
+			if (!r.best.size) continue;
+			if (!top || r.best.size > top.best.size || (r.best.size === top.best.size && r.sum > top.sum)) [seed, top] = [i, r];
+		}
+		if (seed < 0) break;
+		const members = [seed, ...[...top.best.values()].sort((a, b) => b.s - a.s).map((b) => b.j)];
+		// The seed's other matches are the same story from a feed already in it: set aside too.
+		taken[seed] = 1;
+		for (const j of near[seed].keys()) taken[j] = 1;
+		stories.push({
+			lead: items[seed].id,
+			members: members.map((i) => items[i].id),
+			feeds: members.length,
+			at: Math.max(...members.map((i) => items[i].at || 0)),
+		});
+	}
+	return stories.sort((a, b) => b.feeds - a.feeds || b.at - a.at);
+}
+
+async function topStories(env, sp) {
+	const params = [Date.now() - TOP_WINDOW_MS];
+	let where = "i.media_url IS NULL AND COALESCE(i.published_at, i.created_at) >= ?";
+	const tag = sp.get("tag");
+	if (tag === "0") where += " AND i.feed_id NOT IN (SELECT feed_id FROM feed_tags)";
+	else if (tag) {
+		where += " AND i.feed_id IN (SELECT feed_id FROM feed_tags WHERE tag_id = ?)";
+		params.push(toId(tag));
+	}
+	const { results: pool } = await env.DB.prepare(
+		`SELECT i.id, i.feed_id, i.title, i.link, substr(i.content, 1, 3000) AS excerpt, COALESCE(i.published_at, i.created_at) AS at
+		FROM items i WHERE ${where} ORDER BY at DESC, i.id DESC LIMIT ?`,
+	)
+		.bind(...params, TOP_POOL)
+		.all();
+	const stories = findTopStories(pool).slice(0, TOP_MAX);
+	const ids = stories.flatMap((s) => s.members);
+	if (!ids.length) return json({ items: [], next: null, parsed: pool.length });
+	const { results } = await env.DB.prepare(
+		`SELECT ${ITEM_LIST_COLUMNS}, i.story_id FROM items i JOIN feeds f ON f.id = i.feed_id
+		WHERE i.id IN (SELECT value FROM json_each(?))`,
+	)
+		.bind(JSON.stringify(ids))
+		.all();
+	const byId = new Map(results.map((r) => [r.id, r]));
+	const items = [];
+	for (const s of stories) {
+		const lead = byId.get(s.lead);
+		if (!lead) continue;
+		lead.sources = s.feeds;
+		lead.related = s.members
+			.slice(1)
+			.map((id) => byId.get(id))
+			.filter(Boolean)
+			.map((r) => ({ id: r.id, title: r.title, read: r.read, saved: r.saved, feed_id: r.feed_id, feed_title: r.feed_title, story_id: r.story_id }));
+		items.push(lead);
+	}
+	return json({ items, next: null, parsed: pool.length });
 }
 
 const COVERAGE_SOURCE_COLUMNS = `i.id, i.feed_id, i.story_id, i.read, f.title AS feed_title, i.title, i.link,
@@ -8596,7 +8735,10 @@ const PAGE = String.raw`<!doctype html>
 	.tabs a { flex: 1; text-align: center; padding: 7px 0; border-radius: 9px; color: var(--muted); text-decoration: none; font-weight: 600; font-size: 15px; }
 	.tabs a[aria-current=page] { background: var(--sel); color: var(--fg); }
 	/* Saved, Podcasts, Videos, Library: icons, so the text tabs get the room. */
-	.tabs a.icon { flex: 0 0 52px; display: flex; align-items: center; justify-content: center; }
+	.tabs a.icon { flex: 1 1 0; display: flex; align-items: center; justify-content: center; }
+	.subtabs { display: flex; gap: 4px; margin: 14px 0 0; padding: 3px; border-radius: 11px; background: var(--card); border: 1px solid var(--line); }
+	.subtabs a { flex: 1; text-align: center; padding: 6px 0; border-radius: 8px; color: var(--muted); text-decoration: none; font-weight: 600; font-size: 15px; }
+	.subtabs a[aria-current=page] { background: var(--sel); color: var(--fg); }
 	.tabs a.icon svg { width: 21px; height: 21px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 
 	.pop { position: fixed; z-index: 20; right: 16px; top: calc(env(safe-area-inset-top) + 56px); width: min(320px, calc(100vw - 32px));
@@ -8770,6 +8912,8 @@ const PAGE = String.raw`<!doctype html>
 	.items .rel { list-style: none; margin: 0; padding: 0 0 12px 22px; border-bottom: 1px solid var(--line); }
 	.items .rel a { display: block; padding: 5px 0 5px 10px; border: 0; border-left: 2px solid var(--line); font-size: 15px; line-height: 1.3; overflow-wrap: anywhere; }
 	.items .rel .read a { color: var(--muted); }
+	.items .rel .rf { color: var(--muted); font-size: 13px; }
+	.topnote { color: var(--muted); font-size: 14px; margin: 0 0 4px; }
 	#items > li { position: relative; }
 	#items > li > a { padding-right: 44px; }
 	.items .mark { position: absolute; top: 6px; right: -6px; width: 44px; height: 44px; border: 0; background: none; border-radius: 50%; color: var(--muted); display: flex; align-items: center; justify-content: center; cursor: pointer; }
@@ -9264,8 +9408,7 @@ const PAGE = String.raw`<!doctype html>
 		<button id="settingsBtn" class="btn" type="button" aria-label="Display settings" aria-expanded="false" aria-controls="settings"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span class="reqdot" hidden></span></button>
 	</div>
 	<nav id="tabs" class="tabs" aria-label="Views">
-		<a href="#/unread" data-view="unread">Unread</a>
-		<a href="#/all" data-view="all">All</a>
+		<a href="#/unread" data-view="news" class="icon" aria-label="Feeds" title="Feeds"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg></a>
 		<a href="#/saved" data-view="saved" class="icon" aria-label="Saved" title="Saved"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg></a>
 		<a href="#/podcasts" data-view="podcasts" class="icon" aria-label="Podcasts" title="Podcasts"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></svg></a>
 		<a href="#/videos" data-view="videos" class="icon" aria-label="Videos" title="Videos"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="5" width="20" height="14" rx="3"/><path d="M10 9.5v5l4.5-2.5z"/></svg></a>
@@ -9399,11 +9542,17 @@ const PAGE = String.raw`<!doctype html>
 		</details>
 	</aside>
 	<div>
+		<nav id="newsTabs" class="subtabs" aria-label="Feed views">
+			<a href="#/unread" data-view="unread">Unread</a>
+			<a href="#/all" data-view="all">All</a>
+			<a href="#/top" data-view="top">Top</a>
+		</nav>
 		<div id="cont" class="cont" hidden></div>
 		<div class="listhead">
 			<h2 id="listTitle">Unread</h2>
 			<button id="markAll" class="btn ghost small" type="button">Mark all read</button>
 		</div>
+		<p id="topNote" class="topnote" hidden></p>
 		<ul id="items" class="items"></ul>
 		<p id="empty" class="empty" hidden></p>
 		<button id="more" class="btn wide" type="button" hidden>Load more</button>
@@ -9831,7 +9980,7 @@ var PDFJS = "__PDFJS__";
 // For HLS (.m3u8) video where the browser can't play it itself (everything but Safari).
 var HLSJS = { src: "https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js", integrity: "sha384-cciJ0zi8d1uMKC2zJd7jvPY4HQt7W4ByUI/FlMkltvBi31aW61rcpVBhpmW8/NwX" };
 var PDFJS_DATA = "__PDFJS_DATA__";
-var LIST_VIEWS = { unread: "Unread", saved: "Saved", all: "All" };
+var LIST_VIEWS = { unread: "Unread", saved: "Saved", all: "All", top: "Top stories" };
 // Both share the Podcasts section: same gallery, list, downloads and player.
 var MEDIA_TABS = { podcasts: "Podcasts", videos: "Videos" };
 var STALE_MS = 5 * 60 * 1000; // auto-refresh skips feeds fetched this recently
@@ -11061,7 +11210,8 @@ function renderFeeds() {
 }
 function feedRow(f, view) {
 	var li = h("li", "child"), row = h("div", "row"), a = h("a");
-	a.href = listHash(view, f.id, state.tag);
+	// Top stories are across feeds: a feed opens its Unread.
+	a.href = listHash(view === "top" ? "unread" : view, f.id, state.tag);
 	if (sameId(state.feed, f.id)) a.setAttribute("aria-current", "true");
 	a.append(h("span", "name", f.title || hostOf(f.url)));
 	if (f.email) a.append(h("span", "tag", "email"));
@@ -11231,7 +11381,7 @@ var loadSeq = 0;
 async function loadItems(append, keepScroll) {
 	var seq = ++loadSeq;
 	var q = "view=" + (LIST_VIEWS[state.view] ? state.view : "unread") + "&limit=50";
-	if (state.feed != null) q += "&feed=" + state.feed;
+	if (state.feed != null && state.view !== "top") q += "&feed=" + state.feed;
 	else if (state.tag != null) q += "&tag=" + state.tag;
 	if (append && state.next) q += "&before=" + encodeURIComponent(state.next);
 	var y = window.scrollY;
@@ -11244,6 +11394,7 @@ async function loadItems(append, keepScroll) {
 	}
 	state.items = append ? state.items.concat(data.items) : data.items;
 	state.next = data.next;
+	state.parsed = data.parsed;
 	state.listKey = listKeyNow();
 	state.stale = false;
 	renderItems();
@@ -11299,7 +11450,7 @@ function renderItems() {
 		var dot = h("span", "dot");
 		dot.setAttribute("aria-label", it.read ? "" : "Unread");
 		a.append(dot, h("span", "t", it.title || "Untitled"));
-		var meta = [it.feed_title, ago(it.published_at || it.created_at)].filter(Boolean).join(" · ");
+		var meta = [it.feed_title, it.sources ? it.sources + " feeds" : "", ago(it.published_at || it.created_at)].filter(Boolean).join(" · ");
 		a.append(h("span", "m", meta + (it.saved ? " · ★ Saved" : "")));
 		li.append(a, markButton(it, li));
 		// The rest of the story, under its newest item: one entry, one count.
@@ -11309,6 +11460,8 @@ function renderItems() {
 			it.related.forEach(function (r) {
 				var ra = h("a", "", r.title || "Untitled");
 				ra.href = "#/item/" + r.id;
+				// Top stories: each one is another feed's, so say whose.
+				if (r.feed_title) ra.append(" ", h("span", "rf", "· " + r.feed_title));
 				var rli = h("li", r.read ? "read" : "");
 				rli.append(ra);
 				rel.append(rli);
@@ -11320,11 +11473,15 @@ function renderItems() {
 	ul.append(frag);
 	watchRows();
 	var empty = !state.items.length;
+	var top = state.view === "top";
 	$("empty").textContent = !state.feeds.length ? "Add a website or feed to get started."
+		: top ? "No story is in more than one feed from the last day yet."
 		: state.view === "saved" ? "Nothing saved yet." : state.view === "unread" ? "All caught up." : "No items yet.";
 	show($("empty"), empty);
 	show($("more"), !!state.next);
-	show($("markAll"), state.view !== "saved" && !empty);
+	show($("markAll"), state.view !== "saved" && !top && !empty);
+	$("topNote").textContent = top && state.parsed ? "The stories the most feeds covered, from " + state.parsed + " article" + (state.parsed === 1 ? "" : "s") + " in the last day." : "";
+	show($("topNote"), top && !!state.parsed);
 	renderListTitle();
 }
 // The checkmark beside each item: read or unread without opening it (a
@@ -11342,7 +11499,10 @@ function markButton(it, li) {
 	};
 	paint();
 	b.addEventListener("click", async function () {
-		await setFlags(it, { read: it.read ? 0 : 1 });
+		var patch = { read: it.read ? 0 : 1 };
+		// A top story's other articles are other feeds' stories: each gets the same.
+		if (state.view === "top") (it.related || []).forEach(function (r) { if (!!r.read !== !!patch.read) setFlags(r, patch); });
+		await setFlags(it, patch);
 		paint();
 		renderFeeds();
 	});
@@ -11421,11 +11581,24 @@ async function sendPendingReads(keepalive) {
 		sendingReads = false;
 	}
 }
+// Unread, All and Top share the RSS icon, which goes back to whichever of
+// them was open last; the switcher above the list picks between them.
+var NEWS_VIEWS = { unread: 1, all: 1, top: 1 };
+function newsHref(v) { return "#/" + v + (v === "top" ? listQuery(null, state.tag) : listQuery(state.feed, state.tag)); }
 function renderTabs(name) {
+	if (NEWS_VIEWS[name]) store("readerNewsView", name);
+	var last = read("readerNewsView");
+	if (!NEWS_VIEWS[last]) last = "unread";
 	var sub = listQuery(state.feed, state.tag);
 	document.querySelectorAll("#tabs a").forEach(function (a) {
+		var v = a.dataset.view, on = v === name || (v === "news" && NEWS_VIEWS[name]);
+		a.href = v === "news" ? newsHref(last) : "#/" + v + (LIST_VIEWS[v] ? sub : v === "library" && state.libTags.length ? "?tag=" + state.libTags.join(",") : "");
+		if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
+	});
+	show($("newsTabs"), !!NEWS_VIEWS[name]);
+	document.querySelectorAll("#newsTabs a").forEach(function (a) {
 		var v = a.dataset.view;
-		a.href = "#/" + v + (LIST_VIEWS[v] ? sub : v === "library" && state.libTags.length ? "?tag=" + state.libTags.join(",") : "");
+		a.href = newsHref(v);
 		if (v === name) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
 	});
 }
@@ -11496,7 +11669,7 @@ async function route() {
 async function showList(r, prev) {
 	state.lastList = location.hash || "#/unread";
 	state.view = r.name;
-	state.feed = r.feed;
+	state.feed = r.name === "top" ? null : r.feed;
 	state.tag = r.tag;
 	showView("list");
 	renderTabs(r.name);
