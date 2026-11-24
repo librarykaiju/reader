@@ -289,7 +289,7 @@ export default {
 
 	// Every 30 minutes (wrangler.toml): new and changed audiobooks and ebooks from Audiobookshelf.
 	async scheduled(event, env, ctx) {
-		if (absOn(env)) ctx.waitUntil(absSync(env).then((r) => absWarmCovers(env, r.coverPaths)).catch((err) => console.warn("audiobooks", err)));
+		if (absOn(env)) ctx.waitUntil(absCron(env).catch((err) => console.warn("audiobooks", err)));
 	},
 };
 
@@ -364,7 +364,7 @@ async function api(request, env, url) {
 	}
 
 	if (p === "/api/audiobooks/sync" && m === "POST") {
-		const { coverPaths, ...synced } = await absSync(env);
+		const { coverPaths, mark, ...synced } = await absSync(env);
 		return json({ ...synced, covers: await absWarmCovers(env, coverPaths) });
 	}
 	if (p === "/api/books") {
@@ -719,27 +719,34 @@ function setTags(env, t, ownerId, ids) {
 
 // Every count comes from one pass over items, grouped by feed. D1 bills each
 // row read, and a subquery per count read each feed's items eight times over.
+// The counts come from the unread items and the episodes and videos only,
+// through their partial indexes (migration 0024), never a pass over every
+// item: listing the feeds happens on every open and refresh, and counting all
+// items each time used up D1's daily reads. articles is only needed to tell a
+// show from a site that has a few episodes, so it's counted for feeds with
+// episodes or videos alone.
 async function listFeeds(env) {
-	const article = "i.media_url IS NULL", episode = `(${VIEWS.podcasts})`, video = `(${VIEWS.videos})`;
+	const episode = `(${VIEWS.podcasts})`, video = `(${VIEWS.videos})`;
 	const { results } = await env.DB.prepare(
-		`WITH c AS (
+		`WITH u AS (
+			SELECT i.feed_id, COUNT(DISTINCT CASE WHEN i.media_url IS NULL THEN COALESCE(i.story_id, i.id) END) AS unread,
+				SUM(CASE WHEN ${episode} THEN 1 ELSE 0 END) AS unread_episodes,
+				SUM(CASE WHEN ${video} THEN 1 ELSE 0 END) AS unread_videos
+			FROM items i WHERE i.read = 0 GROUP BY +i.feed_id
+		), m AS (
 			SELECT i.feed_id,
-				COUNT(DISTINCT CASE WHEN ${article} AND i.read = 0 THEN COALESCE(i.story_id, i.id) END) AS unread,
 				SUM(CASE WHEN ${episode} THEN 1 ELSE 0 END) AS episodes,
-				SUM(CASE WHEN ${episode} AND i.read = 0 THEN 1 ELSE 0 END) AS unread_episodes,
 				MAX(CASE WHEN ${episode} THEN COALESCE(i.published_at, i.created_at) END) AS latest_episode,
 				SUM(CASE WHEN ${video} THEN 1 ELSE 0 END) AS videos,
-				SUM(CASE WHEN ${video} AND i.read = 0 THEN 1 ELSE 0 END) AS unread_videos,
-				MAX(CASE WHEN ${video} THEN COALESCE(i.published_at, i.created_at) END) AS latest_video,
-				SUM(CASE WHEN ${article} THEN 1 ELSE 0 END) AS articles
-			FROM items i GROUP BY i.feed_id
+				MAX(CASE WHEN ${video} THEN COALESCE(i.published_at, i.created_at) END) AS latest_video
+			FROM items i WHERE i.media_url IS NOT NULL GROUP BY +i.feed_id
 		)
-		SELECT f.*, COALESCE(c.unread, 0) AS unread, COALESCE(c.episodes, 0) AS episodes,
-			COALESCE(c.unread_episodes, 0) AS unread_episodes, c.latest_episode,
-			COALESCE(c.videos, 0) AS videos, COALESCE(c.unread_videos, 0) AS unread_videos, c.latest_video,
-			COALESCE(c.articles, 0) AS articles,
+		SELECT f.*, COALESCE(u.unread, 0) AS unread, COALESCE(m.episodes, 0) AS episodes,
+			COALESCE(u.unread_episodes, 0) AS unread_episodes, m.latest_episode,
+			COALESCE(m.videos, 0) AS videos, COALESCE(u.unread_videos, 0) AS unread_videos, m.latest_video,
+			CASE WHEN m.feed_id IS NULL THEN 0 ELSE (SELECT COUNT(*) FROM items a WHERE a.feed_id = f.id AND a.media_url IS NULL) END AS articles,
 			(SELECT json_group_array(t.tag_id) FROM feed_tags t WHERE t.feed_id = f.id) AS tags
-		FROM feeds f LEFT JOIN c ON c.feed_id = f.id ORDER BY lower(f.title), f.id`,
+		FROM feeds f LEFT JOIN u ON u.feed_id = f.id LEFT JOIN m ON m.feed_id = f.id ORDER BY lower(f.title), f.id`,
 	).all();
 	for (const f of results) f.tags = JSON.parse(f.tags || "[]");
 	return json({ feeds: results });
@@ -883,16 +890,24 @@ async function listItems(env, url) {
 		if (media) for (const it of results) it.notes = notesPreview(it.notes);
 		return itemPage(results, limit);
 	}
-	const cursor = before ? where.pop() : null;
+	// A story's newest item that fits the view is the one listed: an item is
+	// left out when a newer one on its story fits too. Walking the date index
+	// newest first and stopping at the page's end reads about a page of rows;
+	// numbering every story's items (a window over the whole view) read every
+	// item in the database on each load, which used up D1's daily reads.
+	// The newer item only has to fit the view itself: a story is all in one
+	// feed, so the feed and tag already match, and the cursor only applies to
+	// the item listed.
+	const newer = [VIEWS[view], ...(where.includes("i.media_url IS NULL") ? ["i.media_url IS NULL"] : [])].map((c) => c.replace(/\bi\./g, "j."));
 	const { results } = await env.DB.prepare(
-		`SELECT * FROM (
-			SELECT ${ITEM_LIST_COLUMNS}, COALESCE(i.story_id, i.id) AS story,
-				ROW_NUMBER() OVER (PARTITION BY COALESCE(i.story_id, i.id)
-					ORDER BY COALESCE(i.published_at, i.created_at) DESC, i.id DESC) AS rn
-			FROM items i JOIN feeds f ON f.id = i.feed_id
-			WHERE ${where.join(" AND ")}
-		) i WHERE rn = 1${cursor ? " AND " + cursor.replaceAll("COALESCE(i.published_at, i.created_at)", "i.sort_at") : ""}
-		ORDER BY i.sort_at DESC, i.id DESC LIMIT ?`,
+		`SELECT ${ITEM_LIST_COLUMNS}, COALESCE(i.story_id, i.id) AS story
+		FROM items i JOIN feeds f ON f.id = i.feed_id
+		WHERE ${where.join(" AND ")}
+			AND (i.story_id IS NULL OR NOT EXISTS (
+				SELECT 1 FROM items j WHERE j.story_id = i.story_id AND j.id != i.id AND ${newer.join(" AND ")}
+				AND (COALESCE(j.published_at, j.created_at) > COALESCE(i.published_at, i.created_at)
+					OR (COALESCE(j.published_at, j.created_at) = COALESCE(i.published_at, i.created_at) AND j.id > i.id))))
+		ORDER BY COALESCE(i.published_at, i.created_at) DESC, i.id DESC LIMIT ?`,
 	)
 		.bind(...params, limit + 1)
 		.all();
@@ -912,7 +927,6 @@ async function listItems(env, url) {
 		}
 		for (const it of results) it.related = (byStory.get(it.story) || []).filter((r) => r.id !== it.id).map(({ story, ...r }) => r);
 	}
-	for (const it of results) delete it.rn;
 	return itemPage(results, limit);
 }
 
@@ -1488,7 +1502,7 @@ async function coverageSources(env, id) {
 	const { results: pool } = await env.DB.prepare(
 		`SELECT id, feed_id, title, link, substr(content, 1, 3000) AS excerpt FROM items
 		WHERE media_url IS NULL AND COALESCE(published_at, created_at) BETWEEN ? AND ?
-		ORDER BY id DESC LIMIT ?`,
+		ORDER BY COALESCE(published_at, created_at) DESC, id DESC LIMIT ?`,
 	)
 		.bind(target.at - COVERAGE_WINDOW_MS, target.at + COVERAGE_WINDOW_MS, COVERAGE_POOL)
 		.all();
@@ -3783,7 +3797,37 @@ function absSeries(name) {
 }
 
 // -> {added, updated, gone, total}
-async function absSync(env) {
+// The cron's sync. Comparing every book and tag link reads the whole books
+// and book_tag_links tables, and at every 30 minutes that alone was a large
+// share of D1's free 5 million row reads a day once the Library held a few
+// thousand books. So it first takes a fingerprint of ABS's listing (each
+// item's id, when ABS last changed it, and what the sync looks at), and when
+// that matches the last sync that finished everything, it stops there. A
+// sync with covers or ebook lookups still to do doesn't count as finished,
+// so the next one carries on. Sync now (POST /api/audiobooks/sync) always
+// does the whole thing. The fingerprint lives in sync_state (migration 0024);
+// without that table every run does the whole thing, as before.
+async function absCron(env) {
+	const r = await absSync(env, { cron: true });
+	if (r.same) return;
+	const fetched = await absWarmCovers(env, r.coverPaths);
+	if (fetched || r.ebooks?.waiting) return;
+	await env.DB.prepare("INSERT INTO sync_state (k, v) VALUES ('abs', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v")
+		.bind(r.mark)
+		.run()
+		.catch(() => {});
+}
+async function absMark(items) {
+	const parts = items.map((it) => {
+		const media = it.media || {}, md = media.metadata || {};
+		return [it.id, it.updatedAt, it.isMissing, it.isInvalid, it.size, media.duration, media.ebookFormat, media.coverPath, media.tags, md.genres,
+			md.title, md.authorName, md.seriesName, md.narratorName];
+	});
+	const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(parts)));
+	return Array.from(new Uint8Array(hash), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function absSync(env, { cron = false } = {}) {
 	const { libraries = [] } = await absJSON(env, "/api/libraries");
 	const items = [], ebooks = [];
 	for (const lib of libraries) {
@@ -3794,6 +3838,11 @@ async function absSync(env) {
 			items.push(...got);
 			if (got.length < ABS_PAGE || (page + 1) * ABS_PAGE >= (d.total || 0)) break;
 		}
+	}
+	const mark = await absMark(items);
+	if (cron) {
+		const last = await env.DB.prepare("SELECT v FROM sync_state WHERE k = 'abs'").first("v").catch(() => null);
+		if (last === mark) return { same: true };
 	}
 	const { results } = await env.DB.prepare("SELECT id, abs_id, abs_updated, gone_at FROM books WHERE abs_id IS NOT NULL").all();
 	const have = new Map(results.map((r) => [r.abs_id, r]));
@@ -3834,7 +3883,7 @@ async function absSync(env) {
 	const ebookSync = await absSyncEbooks(env, ebooks);
 	// Each item's cover file in ABS and when ABS last changed it, for absWarmCovers to tell a new or changed cover.
 	const coverPaths = new Map(items.filter((it) => it.id).map((it) => [it.id, { path: String(it.media?.coverPath || ""), at: Number(it.updatedAt) || 0 }]));
-	return { added, updated, gone, total: seen.size, ebooks: ebookSync, genres: await absGenreTags(env, items), coverPaths };
+	return { added, updated, gone, total: seen.size, ebooks: ebookSync, genres: await absGenreTags(env, items), coverPaths, mark };
 }
 
 // Genre tags for ABS books from ABS's own tags (an audiobook's are Audible's
