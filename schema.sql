@@ -76,6 +76,8 @@ CREATE INDEX IF NOT EXISTS items_by_feed ON items (feed_id, read);
 CREATE INDEX IF NOT EXISTS items_saved ON items (saved) WHERE saved = 1;
 CREATE INDEX IF NOT EXISTS items_media ON items (COALESCE(published_at, created_at) DESC, id DESC) WHERE media_url IS NOT NULL;
 CREATE INDEX IF NOT EXISTS items_story ON items (story_id) WHERE story_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS items_unread ON items (COALESCE(published_at, created_at) DESC, id DESC) WHERE read = 0;
+CREATE INDEX IF NOT EXISTS items_articles ON items (feed_id) WHERE media_url IS NULL;
 
 -- position is JSON text: {"f": 0.42} for .txt (fraction of the text),
 -- {"page": 12, "pf": 0.3, "pages": 80, "f": 0.14} for .pdf; NULL = the start.
@@ -292,4 +294,11 @@ CREATE TABLE IF NOT EXISTS family_list_books (
 	book_id INTEGER NOT NULL REFERENCES books (id) ON DELETE CASCADE,
 	added_at INTEGER NOT NULL,
 	PRIMARY KEY (list_id, book_id)
+);
+
+-- Small values kept between runs: 'abs' is the fingerprint of Audiobookshelf's
+-- listing at the last finished sync (the cron stops early when it matches).
+CREATE TABLE IF NOT EXISTS sync_state (
+	k TEXT PRIMARY KEY,
+	v TEXT
 );

@@ -190,6 +190,7 @@ npx wrangler d1 execute reader --remote --file migrations/0020_abs_tags.sql
 npx wrangler d1 execute reader --remote --file migrations/0021_book_tag_drops.sql
 npx wrangler d1 execute reader --remote --file migrations/0022_audio_marks.sql
 npx wrangler d1 execute reader --remote --file migrations/0023_family_shelf.sql
+npx wrangler d1 execute reader --remote --file migrations/0024_fewer_reads.sql
 npx wrangler deploy
 ```
 
