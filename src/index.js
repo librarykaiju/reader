@@ -8735,7 +8735,10 @@ const PAGE = String.raw`<!doctype html>
 	.tabs a { flex: 1; text-align: center; padding: 7px 0; border-radius: 9px; color: var(--muted); text-decoration: none; font-weight: 600; font-size: 15px; }
 	.tabs a[aria-current=page] { background: var(--sel); color: var(--fg); }
 	/* Saved, Podcasts, Videos, Library: icons, so the text tabs get the room. */
-	.tabs a.icon { flex: 0 0 52px; display: flex; align-items: center; justify-content: center; }
+	.tabs a.icon { flex: 1 1 0; display: flex; align-items: center; justify-content: center; }
+	.subtabs { display: flex; gap: 4px; margin: 14px 0 0; padding: 3px; border-radius: 11px; background: var(--card); border: 1px solid var(--line); }
+	.subtabs a { flex: 1; text-align: center; padding: 6px 0; border-radius: 8px; color: var(--muted); text-decoration: none; font-weight: 600; font-size: 15px; }
+	.subtabs a[aria-current=page] { background: var(--sel); color: var(--fg); }
 	.tabs a.icon svg { width: 21px; height: 21px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 
 	.pop { position: fixed; z-index: 20; right: 16px; top: calc(env(safe-area-inset-top) + 56px); width: min(320px, calc(100vw - 32px));
@@ -9405,9 +9408,7 @@ const PAGE = String.raw`<!doctype html>
 		<button id="settingsBtn" class="btn" type="button" aria-label="Display settings" aria-expanded="false" aria-controls="settings"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span class="reqdot" hidden></span></button>
 	</div>
 	<nav id="tabs" class="tabs" aria-label="Views">
-		<a href="#/unread" data-view="unread">Unread</a>
-		<a href="#/all" data-view="all">All</a>
-		<a href="#/top" data-view="top">Top</a>
+		<a href="#/unread" data-view="news" class="icon" aria-label="Feeds" title="Feeds"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg></a>
 		<a href="#/saved" data-view="saved" class="icon" aria-label="Saved" title="Saved"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg></a>
 		<a href="#/podcasts" data-view="podcasts" class="icon" aria-label="Podcasts" title="Podcasts"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></svg></a>
 		<a href="#/videos" data-view="videos" class="icon" aria-label="Videos" title="Videos"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="5" width="20" height="14" rx="3"/><path d="M10 9.5v5l4.5-2.5z"/></svg></a>
@@ -9541,6 +9542,11 @@ const PAGE = String.raw`<!doctype html>
 		</details>
 	</aside>
 	<div>
+		<nav id="newsTabs" class="subtabs" aria-label="Feed views">
+			<a href="#/unread" data-view="unread">Unread</a>
+			<a href="#/all" data-view="all">All</a>
+			<a href="#/top" data-view="top">Top</a>
+		</nav>
 		<div id="cont" class="cont" hidden></div>
 		<div class="listhead">
 			<h2 id="listTitle">Unread</h2>
@@ -11575,11 +11581,24 @@ async function sendPendingReads(keepalive) {
 		sendingReads = false;
 	}
 }
+// Unread, All and Top share the RSS icon, which goes back to whichever of
+// them was open last; the switcher above the list picks between them.
+var NEWS_VIEWS = { unread: 1, all: 1, top: 1 };
+function newsHref(v) { return "#/" + v + (v === "top" ? listQuery(null, state.tag) : listQuery(state.feed, state.tag)); }
 function renderTabs(name) {
+	if (NEWS_VIEWS[name]) store("readerNewsView", name);
+	var last = read("readerNewsView");
+	if (!NEWS_VIEWS[last]) last = "unread";
 	var sub = listQuery(state.feed, state.tag);
 	document.querySelectorAll("#tabs a").forEach(function (a) {
+		var v = a.dataset.view, on = v === name || (v === "news" && NEWS_VIEWS[name]);
+		a.href = v === "news" ? newsHref(last) : "#/" + v + (LIST_VIEWS[v] ? sub : v === "library" && state.libTags.length ? "?tag=" + state.libTags.join(",") : "");
+		if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
+	});
+	show($("newsTabs"), !!NEWS_VIEWS[name]);
+	document.querySelectorAll("#newsTabs a").forEach(function (a) {
 		var v = a.dataset.view;
-		a.href = "#/" + v + (v === "top" ? listQuery(null, state.tag) : LIST_VIEWS[v] ? sub : v === "library" && state.libTags.length ? "?tag=" + state.libTags.join(",") : "");
+		a.href = newsHref(v);
 		if (v === name) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
 	});
 }
