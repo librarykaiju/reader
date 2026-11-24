@@ -9499,6 +9499,8 @@ const PAGE = String.raw`<!doctype html>
 		<span id="libSelN" class="n"></span>
 		<button id="libSelAll" class="btn small" type="button">Select all</button>
 		<button id="libSelNone" class="btn small" type="button">Clear</button>
+		<label class="vh" for="libSelTag">Tag the selected books</label>
+		<select id="libSelTag" class="small"></select>
 		<button id="libSelGenres" class="btn small" type="button">Tag genres</button>
 		<button id="libSelFill" class="btn small" type="button" title="Series, volume and title from each comic's ComicInfo.xml">Fill in details</button>
 		<button id="libSelRecord" class="btn small" type="button" title="Jacket copy, pages and appeal terms for the family library's Record page">Look up records</button>
@@ -15710,6 +15712,7 @@ function renderLibSel() {
 	show($("libSelAll"), n < all);
 	$("libSelDel").disabled = !n;
 	$("libSelGenres").disabled = !n;
+	fillSelTag();
 	$("libSelFill").disabled = !n;
 	$("libSelRecord").disabled = !n;
 	$("libSelDel").textContent = n ? "Delete " + n : "Delete";
@@ -15732,6 +15735,64 @@ async function deleteSelected() {
 	await loadBooks();
 	if (failed.length) fail(new Error("Couldn't delete " + failed.join(", ") + "."));
 	else toast(books.length === 1 ? "Deleted 1 book." : "Deleted " + books.length + " books.");
+}
+
+// Tag several books at once: the picker in the selection bar puts one tag
+// on every selected book, or takes one off them (listed only when a
+// selected book has it). Books that already have it (or don't) are skipped.
+function fillSelTag() {
+	var sel = $("libSelTag"), books = selectedBooks(), n = books.length;
+	sel.textContent = "";
+	sel.add(new Option("Tag…", ""));
+	var add = document.createElement("optgroup");
+	add.label = n ? "Add to " + n + (n === 1 ? " book" : " books") : "Add";
+	state.bookTags.forEach(function (t) { add.append(new Option(t.name, "+" + t.id)); });
+	add.append(new Option("New tag…", "new"));
+	sel.add(add);
+	var had = state.bookTags.filter(function (t) { return books.some(function (b) { return hasBookTag(b, t.id); }); });
+	if (had.length) {
+		var off = document.createElement("optgroup");
+		off.label = "Take off";
+		had.forEach(function (t) { off.append(new Option(t.name, "-" + t.id)); });
+		sel.add(off);
+	}
+	sel.value = "";
+	sel.disabled = !n;
+}
+async function tagSelected() {
+	var sel = $("libSelTag"), v = sel.value, books = selectedBooks();
+	sel.value = "";
+	if (!v || !books.length) return;
+	var adding = v[0] !== "-", id;
+	if (v === "new") {
+		try { var t = await promptBookTag(); } catch (e) { renderBooks(); return fail(e); }
+		if (!t) return renderBooks();
+		id = t.id;
+	} else id = Number(v.slice(1));
+	var tag = bookTagById(id);
+	if (!tag) return renderBooks();
+	var todo = books.filter(function (b) { return hasBookTag(b, id) !== adding; });
+	if (!todo.length) { renderBooks(); return toast((books.length === 1 ? "It " + (adding ? "already has" : "doesn't have") : (adding ? "They all have" : "None of them have")) + " “" + tag.name + "”."); }
+	sel.disabled = true;
+	var done = 0, failed = [];
+	for (var i = 0; i < todo.length; i++) {
+		var b = todo[i], next = adding ? (b.tags || []).concat(id) : (b.tags || []).filter(function (x) { return x !== id; });
+		$("libSelN").textContent = (adding ? "Tagging " : "Untagging ") + (i + 1) + " of " + todo.length + "…";
+		try {
+			var data = await apiJSON("/api/books/" + b.id, { method: "PATCH", json: { tags: next } });
+			b.tags = data.book.tags;
+			keepBookDetails(b);
+			done++;
+		} catch (e) {
+			if (e.message === UNAUTH) return;
+			failed.push(b.title);
+		}
+	}
+	renderBooks();
+	var count = function (n) { return n + (n === 1 ? " book" : " books"); };
+	var msg = done ? (adding ? "Tagged " + count(done) + " “" + tag.name + "”." : "Took “" + tag.name + "” off " + count(done) + ".") : "";
+	if (failed.length) fail(new Error((msg ? msg + " " : "") + "Couldn't " + (adding ? "tag " : "untag ") + failed.join(", ") + "."));
+	else toast(msg);
 }
 
 // Tag genres: the server adds genre tags from the book's own file, or else
@@ -18877,6 +18938,7 @@ $("libSelAll").addEventListener("click", function () { (state.libShown || []).fo
 $("libSelNone").addEventListener("click", function () { state.libSel = {}; renderBooks(); });
 $("libSelDel").addEventListener("click", deleteSelected);
 $("libSelGenres").addEventListener("click", tagGenresSelected);
+$("libSelTag").addEventListener("change", tagSelected);
 $("libSelFill").addEventListener("click", fillSelected);
 $("libSelRecord").addEventListener("click", recordSelected);
 function libCtx(e) {
